@@ -1,0 +1,18 @@
+--- a/KubeArmor/BPF/shared.h
++++ b/KubeArmor/BPF/shared.h
+@@ -245,13 +245,14 @@
+ 
+ struct kaconfig kubearmor_config SEC(".maps");
+ 
++struct corpus_inner_hash { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1024); __uint(key_size, sizeof(bufs_k)); __uint(value_size, sizeof(struct data_t)); };
+ struct outer_hash
+ {
+   __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+   __uint(max_entries, 256);
+   __uint(key_size, sizeof(struct outer_key));
+   __uint(value_size, sizeof(u32));
+-  __uint(pinning, LIBBPF_PIN_BY_NAME);
++  __uint(pinning, LIBBPF_PIN_BY_NAME); __array(values, struct corpus_inner_hash);
+ };
+ 
+ struct outer_hash kubearmor_containers SEC(".maps");

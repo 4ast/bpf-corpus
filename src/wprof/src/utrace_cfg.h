@@ -1,0 +1,433 @@
+/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
+/* Copyright (c) 2025 Meta Platforms, Inc. */
+#ifndef __UTRACE_CFG_H_
+#define __UTRACE_CFG_H_
+
+#ifndef __bpf__
+#include <stdbool.h>
+#include <stddef.h>
+#include <linux/bpf.h>
+#include "elf_utils.h"
+#include "strs.h"
+#include "utils.h"
+#endif
+
+#define MAX_UTRACE_READ_OPS 8
+
+/*
+ * Positional args readable from registers by utrace_read_arg_pt_regs
+ * (kprobe/uprobe). x86-64 passes 6 in registers, arm64 8. Other targets
+ * cap at 5 (PARM1..PARM5), the widest set libbpf's bpf_tracing.h backs
+ * with a real PT_REGS_PARM* helper on every 64-bit arch, so wprof still
+ * builds there instead of failing on a missing PT_REGS_PARM* helper.
+ */
+#if defined(__TARGET_ARCH_arm64) || defined(__aarch64__)
+#define UTRACE_MAX_REG_ARGS 8
+#elif defined(__TARGET_ARCH_x86) || defined(__x86_64__)
+#define UTRACE_MAX_REG_ARGS 6
+#else
+#define UTRACE_MAX_REG_ARGS 5
+#endif
+
+enum utrace_read_op_kind {
+	UTRACE_READ_INVALID,
+	UTRACE_READ_CTX,
+	UTRACE_READ_ARG,
+	UTRACE_READ_VAL,
+	UTRACE_READ_STR,
+};
+
+enum utrace_read_op_flags {
+	UTRACE_READ_F_SIGNED = 1 << 0,
+	UTRACE_READ_F_KERNEL = 1 << 1,
+	UTRACE_READ_F_TP_DATA_LOC = 1 << 2,
+};
+
+struct utrace_read_op {
+	union {
+		long long offset;	/* READ_VAL/READ_STR address delta */
+		int arg_idx;		/* READ_ARG index, return marker, or TP byte offset */
+	};
+	unsigned short size;		/* scalar width or concrete string limit */
+	unsigned char kind;		/* enum utrace_read_op_kind */
+	unsigned char flags;		/* enum utrace_read_op_flags */
+};
+
+enum utrace_type {
+	UTRACE_INVALID,
+	UTRACE_UPROBE,		/* u:func */
+	UTRACE_URETPROBE,	/* uret:func */
+	UTRACE_USDT,		/* usdt:provider:name */
+	UTRACE_KPROBE,		/* k:func */
+	UTRACE_KRETPROBE,	/* kret:func */
+	UTRACE_TRACEPOINT,	/* tp:category:name */
+	UTRACE_RAW_TRACEPOINT,	/* raw_tp:name */
+	UTRACE_UPROBE_SPAN,	/* uspan:func */
+	UTRACE_KPROBE_SPAN,	/* kspan:func */
+	UTRACE_BPF_PROBE,	/* bpf:prog_name */
+	UTRACE_BPF_RETPROBE,	/* bpfret:prog_name */
+	UTRACE_BPF_SPAN,	/* bpfspan:prog_name */
+	UTRACE_SPAN,		/* two non-span probes joined by + */
+};
+
+enum utrace_arg_type {
+	UTRACE_ARG_UNKNOWN,
+	UTRACE_ARG_U8,
+	UTRACE_ARG_U16,
+	UTRACE_ARG_U32,
+	UTRACE_ARG_U64,
+	UTRACE_ARG_S8,
+	UTRACE_ARG_S16,
+	UTRACE_ARG_S32,
+	UTRACE_ARG_S64,
+	UTRACE_ARG_STR,
+	UTRACE_ARG_PTR,
+};
+
+static inline int utrace_arg_size(enum utrace_arg_type t)
+{
+	switch (t) {
+	case UTRACE_ARG_U8:  case UTRACE_ARG_S8:  return 1;
+	case UTRACE_ARG_U16: case UTRACE_ARG_S16: return 2;
+	case UTRACE_ARG_U32: case UTRACE_ARG_S32: return 4;
+	case UTRACE_ARG_U64: case UTRACE_ARG_S64: case UTRACE_ARG_PTR: return 8;
+	default: return 0;
+	}
+}
+
+enum utrace_param_type {
+	UTRACE_PARAM_INVALID = 0,
+	UTRACE_PARAM_ARG = 1,
+	UTRACE_PARAM_CAPTURE_STACK = 1000,
+	UTRACE_PARAM_BINARY_PATH,
+	UTRACE_PARAM_PID,
+	UTRACE_PARAM_NV_SMI,
+	UTRACE_PARAM_COMM,
+};
+
+/*
+ * Which specifiers a probe uses to pick processes. A set, not a choice: the
+ * candidate PIDs are the intersection of everything specified, so comm: can
+ * narrow either an explicit pid: or the nv-smi set.
+ */
+enum utrace_pid_spec {
+	UTRACE_PID_SPEC_NONE = 0,
+	UTRACE_PID_SPEC_PID = 1 << 0,		/* pid:<N> */
+	UTRACE_PID_SPEC_NV_SMI = 1 << 1,	/* pid:nv-smi */
+	UTRACE_PID_SPEC_COMM = 1 << 2,		/* comm:<glob> */
+
+	/* specifiers that expand one probe into per-PID clones, resolved best-effort */
+	UTRACE_PID_SPEC_DISCOVERED = UTRACE_PID_SPEC_NV_SMI | UTRACE_PID_SPEC_COMM,
+};
+
+#define UTRACE_ARG_RET (-1)
+#define UTRACE_ARG_UNRESOLVED (-2)	/* name-based ref, resolved during augmentation */
+#define UTRACE_ARG_CTX (-3)		/* arg:ctx, the raw context pointer of a BPF program */
+
+#ifndef __bpf__
+
+struct tp_field {
+	char *name;
+	int offset;
+	int size;
+	bool is_signed;
+	bool is_data_loc;
+	bool is_string;		/* char[] array */
+};
+
+/* int -> string render mapping for an arg (sorted by key, looked up at emit) */
+struct utrace_arg_map {
+	unsigned long long key;
+	char *label;
+};
+
+enum utrace_accessor_kind {
+	UTRACE_ACC_FIELD,
+	UTRACE_ACC_OP,
+	UTRACE_ACC_ARRELEM,
+};
+
+/* Parsed field/operator access retained for BTF compilation and formatting. */
+struct utrace_accessor {
+	enum utrace_accessor_kind kind;
+	char *field;		/* FIELD: member name */
+	char *op;		/* OP: operator name */
+	struct sview *args;	/* OP: angle-bracket arguments */
+	int arg_cnt;
+	long arr_elem;		/* ARRELEM: array element */
+	struct sview source;	/* range within arg.source for diagnostics */
+};
+
+struct utrace_param {
+	enum utrace_param_type type;
+	union {
+		struct {
+			int arg_idx;			/* 0-based arg index, or UTRACE_ARG_RET */
+			enum utrace_arg_type arg_type;	/* defaults to UTRACE_ARG_U64 if omitted */
+			char *name;			/* annotation name, NULL = auto "arg<N>" / "ret" */
+			char *ref_name;			/* name-based arg reference, resolved to arg_idx during augmentation */
+			char *source;			/* original arg definition for semantic diagnostics */
+			struct utrace_accessor *accessors;
+			int accessor_cnt;
+			struct utrace_read_op read_ops[MAX_UTRACE_READ_OPS];
+			unsigned char read_op_cnt;
+			int tp_byte_off;		/* TP: byte offset into event struct */
+			bool tp_data_loc;		/* TP: __data_loc encoded string field */
+			bool hex;			/* render integer value as 0x%x */
+			struct utrace_arg_map *map;	/* optional int->string map, sorted by key */
+			int map_cnt;
+		} arg;
+		struct {
+			char *path;
+		} binary;
+		struct {
+			int pid;
+		} pid;
+		struct {
+			char *glob;	/* process name glob, matched against /proc/<pid>/comm */
+		} comm;
+	};
+};
+
+enum utrace_tmpl_seg_type {
+	UTRACE_TMPL_SEG_LIT,  /* literal string segment */
+	UTRACE_TMPL_SEG_ARG,  /* argument substitution */
+	UTRACE_TMPL_SEG_ENV,  /* capture environment substitution */
+};
+
+/* what an {env:...} placeholder pulls from the event's capture context */
+enum utrace_env_ref {
+	UTRACE_ENV_TID,
+	UTRACE_ENV_PID,
+	UTRACE_ENV_PPID,
+	UTRACE_ENV_COMM,
+	UTRACE_ENV_PCOMM,
+	UTRACE_ENV_CPU,
+	UTRACE_ENV_NUMA,
+};
+
+struct utrace_tmpl_seg {
+	enum utrace_tmpl_seg_type type;
+	union {
+		struct {
+			const char *s;   /* points into the source template string */
+			int len;
+		} lit;
+		struct {
+			int arg_idx;                /* positional index into entry-side arg_refs[] */
+			const struct utrace_param *param; /* the matched arg's full spec */
+		} arg;
+		enum utrace_env_ref env;
+	};
+};
+
+/* what a probe's tracks are grouped under */
+enum utrace_scope {
+	UTRACE_SCOPE_UNSET,	/* not given, resolved to thread scope once parsed */
+	UTRACE_SCOPE_THREAD,
+	UTRACE_SCOPE_PROCESS,
+	UTRACE_SCOPE_CPU,
+	UTRACE_SCOPE_GLOBAL,
+};
+
+struct utrace_ann {
+	char *name;
+	char *tmpl;
+	struct utrace_tmpl_seg *segs;
+	int seg_cnt;
+	bool has_args; /* references entry-side args, so exits can't render it */
+};
+
+struct utrace_settings {
+	char *id;        /* user-defined probe identifier, NULL if unset */
+	enum utrace_scope scope;
+	char *name_tmpl; /* template string for slice/instant name, NULL if unset */
+	struct utrace_tmpl_seg *name_segs; /* pre-compiled name template segments */
+	int name_seg_cnt;
+	bool name_has_args; /* name template substitutes entry-side args, so exits can't render it */
+	struct utrace_tmpl_seg *id_segs; /* pre-compiled id segments, NULL unless id has placeholders */
+	int id_seg_cnt;
+	char *flow_tmpl; /* template string for the flow key, NULL if unset */
+	struct utrace_tmpl_seg *flow_segs; /* pre-compiled flow template segments */
+	int flow_seg_cnt;
+	struct utrace_ann *anns; /* ann: settings, in definition order */
+	int ann_cnt;
+};
+
+struct utrace_cfg {
+	enum utrace_type type;
+	bool wildcard_args;
+	int parent_idx;			/* probe this was expanded from by PID discovery, -1 otherwise */
+	struct {
+		int clone_cnt;		/* per-PID clones made from this probe, 0 unless this is a parent */
+		int resolve_cnt;	/* probes that resolved: 0 or 1 normally, matching clones for a parent */
+	} stats;
+
+	struct utrace_param *params;
+	int param_cnt;
+
+	struct utrace_settings settings;
+
+	union {
+		/* UPROBE, URETPROBE, UPROBE_SPAN */
+		struct {
+			char *name;
+			long off;
+			const char *attach_path;	/* resolved path used to attach (/proc/<pid>/map_files/... or user path) */
+			const char *display_path;	/* human-readable path for logging/output */
+			unsigned long attach_off;	/* resolved total offset: sym_offset + off */
+		} uprobe;
+		/* USDT */
+		struct {
+			char *provider;
+			char *name;
+			const char *attach_path;	/* resolved path for attachment */
+			const char *display_path;	/* human-readable path for logging */
+			struct usdt_info info;		/* discovered arg metadata */
+		} usdt;
+		/* KPROBE, KRETPROBE, KPROBE_SPAN */
+		struct {
+			char *name;
+			long off;
+		} kprobe;
+		/* TRACEPOINT */
+		struct {
+			char *cat;
+			char *name;
+			struct tp_field *fields;	/* parsed from tracefs format file */
+			int field_cnt;
+		} tp;
+		/* RAW_TRACEPOINT */
+		struct {
+			char *name;
+			const struct btf_type *proto;		/* resolved FUNC_PROTO from btf_trace_<name> */
+			const struct btf_type *name_proto;	/* FUNC_PROTO from __traceiter_<name> (for param names) */
+			int arg_cnt;				/* number of tracepoint args (excluding void* ctx) */
+		} raw_tp;
+
+		/* BPF_PROBE, BPF_RETPROBE, BPF_SPAN */
+		struct {
+			char *entry;	/* optional entry program scoping a subprogram name */
+			char *name;	/* target function, resolved from prog_id when given by id */
+			unsigned int prog_id;	/* target program id, 0 when named instead */
+			int prog_fd;	/* resolved target prog fd (filled during setup) */
+			unsigned int btf_func_id; /* BTF func type ID */
+			struct btf *btf; /* target prog BTF (valid during setup only) */
+			enum bpf_prog_type prog_type;	/* type of the target program */
+			enum bpf_attach_type expected_attach_type; /* entry programs only */
+			bool args_in_ctx;		/* logical arguments arrive as ctx[N] */
+			int subprog_idx;		/* 0 for the entry program itself */
+			int arg_cnt;			/* number of logical arguments */
+			int arg_idx_off;		/* parameter holding logical argument 0 */
+			/*
+			 * Prototype describing the program's logical arguments. For
+			 * struct_ops programs it comes from the ops struct member and
+			 * lives in proto_btf (vmlinux or a module), not in ->btf.
+			 */
+			const struct btf_type *proto;
+			const struct btf *proto_btf;
+			/* the program's own prototype, in ->btf, which arg:ret returns */
+			const struct btf_type *self_proto;
+			/* vmlinux BTF ID of the kernel-side type of arg 0 for entry programs, 0 if it has none */
+			__u32 ctx_btf_id;
+		} bpf_prog;
+
+		/* GENERIC SPAN */
+		struct {
+			struct utrace_cfg *entry;
+			struct utrace_cfg *exit;
+		} span;
+	};
+};
+
+struct sbuf;
+
+/*
+ * How a bpf: probe's target reads: the function name, scoped by its entry
+ * program when one is needed, or the id it was named by until that resolves.
+ */
+static inline const char *utrace_bpf_target_str(const struct utrace_cfg *cfg)
+{
+	if (!cfg->bpf_prog.name)
+		return sfmt("%u", cfg->bpf_prog.prog_id);
+	if (cfg->bpf_prog.entry)
+		return sfmt("%s:%s", cfg->bpf_prog.entry, cfg->bpf_prog.name);
+	if (cfg->bpf_prog.prog_id)
+		return sfmt("%u:%s", cfg->bpf_prog.prog_id, cfg->bpf_prog.name);
+	return cfg->bpf_prog.name;
+}
+
+static inline bool cfg_is_span(const struct utrace_cfg *cfg)
+{
+	return cfg->type == UTRACE_UPROBE_SPAN || cfg->type == UTRACE_KPROBE_SPAN ||
+	       cfg->type == UTRACE_BPF_SPAN || cfg->type == UTRACE_SPAN;
+}
+
+/*
+ * Iterate the simple sub-configs of a utrace_cfg: for generic UTRACE_SPAN,
+ * yields entry then exit leg; for all other cfgs, yields cfg itself once.
+ */
+#define utrace_for_each_leg(leg, cfg)						\
+	for (struct utrace_cfg *___legs[3] = {					\
+			(cfg)->type == UTRACE_SPAN ? (cfg)->span.entry : (cfg),	\
+			(cfg)->type == UTRACE_SPAN ? (cfg)->span.exit : NULL,	\
+			NULL,							\
+		}, **___p = ___legs, *leg = *___p;				\
+		leg;								\
+		leg = *++___p)
+
+/* integer arg types (u8..s64) — the ones /x and /map operate on */
+static inline bool utrace_arg_is_int(enum utrace_arg_type t)
+{
+	switch (t) {
+	case UTRACE_ARG_U8:
+	case UTRACE_ARG_U16:
+	case UTRACE_ARG_U32:
+	case UTRACE_ARG_U64:
+	case UTRACE_ARG_S8:
+	case UTRACE_ARG_S16:
+	case UTRACE_ARG_S32:
+	case UTRACE_ARG_S64:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline bool utrace_arg_is_signed(enum utrace_arg_type t)
+{
+	return t == UTRACE_ARG_S8 || t == UTRACE_ARG_S16 || t == UTRACE_ARG_S32 || t == UTRACE_ARG_S64;
+}
+
+/* binary-search an arg value in a key-sorted map; returns label or NULL */
+static inline const char *utrace_arg_map_lookup(const struct utrace_arg_map *map, int cnt,
+						unsigned long long key)
+{
+	int lo = 0, hi = cnt - 1;
+
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+
+		if (map[mid].key < key)
+			lo = mid + 1;
+		else if (map[mid].key > key)
+			hi = mid - 1;
+		else
+			return map[mid].label;
+	}
+	return NULL;
+}
+
+int utrace_compile_tmpl(const char *tmpl, const struct utrace_param *params, int param_cnt,
+			struct utrace_tmpl_seg **out_segs, int *out_seg_cnt);
+int ucfg_compile_tmpls(struct utrace_cfg *cfg);
+void ucfg_ensure_pid(struct utrace_cfg *cfg, int pid);
+int ucfg_parse(const char *def);
+int ucfg_parse_file(const char *path);
+void ucfg_format(const struct utrace_cfg *cfg, struct sbuf *sb);
+bool ucfg_has_uprobe_args(const struct utrace_cfg *cfg);
+void utrace_highlight(struct sview orig, struct sview bad);
+
+#endif /* !__bpf__ */
+
+#endif /* __UTRACE_CFG_H_ */

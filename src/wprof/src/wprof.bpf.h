@@ -1,0 +1,42 @@
+/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
+/* Copyright (c) 2025 Meta Platforms, Inc. */
+#ifndef __WPROF_BPF_H_
+#define __WPROF_BPF_H_
+
+#ifndef E2BIG
+#define E2BIG		7
+#endif
+#ifndef ENODATA
+#define ENODATA		61
+#endif
+
+#define __cleanup(callback) __attribute__((cleanup(callback)))
+
+#define TASK_RUNNING 0
+
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
+
+enum wprof_task_flags {
+	WTASK_F_LOCAL_STORAGE = 0x1,	/* state lives in task-local storage, not the hash */
+	WTASK_F_INFO_EMITTED = 0x2,	/* task's wprof_thread identity already emitted (cleared on rename/exec) */
+};
+
+struct task_state {
+	u32 flags;
+	u32 last_task_state;
+	u64 softirq_ts;
+	u64 hardirq_ts;
+	u64 wq_ts;
+	char wq_name[WORKER_DESC_LEN];
+	/* start counters for current duration event */
+	struct perf_counters ctrs;
+	/* SCX-related fields, used by scx.bpf.c */
+	struct wprof_scx_dsq scx_dsq;
+};
+
+__hidden int glob_match(const char *pat, size_t pat_sz, const char *str, size_t str_sz);
+__hidden struct task_state *task_state(struct task_struct *task);
+__hidden int handle_dsq(u64 now_ts, struct task_struct *task, struct task_state *s);
+__hidden void emit_scx_dsq_event(u64 end_ts, struct task_struct *task, struct task_state *s);
+
+#endif /* __WPROF_BPF_H_ */

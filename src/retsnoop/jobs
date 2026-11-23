@@ -1,0 +1,24 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Isrc -Isrc/x86 -I../../include
+R = src/retsnoop.bpf.c src/mass_attach.bpf.c
+
+# The loader has two modes. With --fentry it picks a program by the number of arguments
+# of the function that the user names.
+retsnoop: $R | $F | drop:retsn_fentry*,retsn_fexit*
+retsnoop-fentry: $R | $F | keep:retsn_fentry*,retsn_fexit* set:use_kprobes=0 \
+    secprog:retsn_fentry0=fentry/ktime_get secprog:retsn_fexit0=fexit/ktime_get \
+    secprog:retsn_fentry1=fentry/security_file_open secprog:retsn_fexit1=fexit/security_file_open \
+    secprog:retsn_fentry2=fentry/vfs_open secprog:retsn_fexit2=fexit/vfs_open \
+    secprog:retsn_fentry3=fentry/tcp_sendmsg secprog:retsn_fexit3=fexit/tcp_sendmsg \
+    secprog:retsn_fentry4=fentry/vfs_read secprog:retsn_fexit4=fexit/vfs_read \
+    secprog:retsn_fentry5=fentry/vfs_symlink secprog:retsn_fexit5=fexit/vfs_symlink \
+    secprog:retsn_fentry6=fentry/vfs_mknod secprog:retsn_fexit6=fexit/vfs_mknod \
+    secprog:retsn_fexit_void0=fexit/schedule secprog:retsn_fexit_void1=fexit/consume_skb \
+    secprog:retsn_fexit_void2=fexit/tcp_close secprog:retsn_fexit_void3=fexit/tcp_drop_reason \
+    secprog:retsn_fexit_void4=fexit/ip_options_build \
+    secprog:retsn_fexit_void5=fexit/flush_tlb_mm_range \
+    secprog:retsn_fexit_void6=fexit/ip_icmp_error
+calib_feat: src/calib_feat.bpf.c | $F
+kmem_reader: src/kmem_reader.bpf.c | $F
+fentry_unsupp_func: src/tests/fentry_unsupp_func.bpf.c | $F
+kprobe_bad_kfunc: src/tests/kprobe_bad_kfunc.bpf.c | $F
+simple_obj: src/tests/simple_obj.bpf.c | $F

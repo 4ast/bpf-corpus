@@ -1,0 +1,11 @@
+--- a/bpf/process/types/basic.h
++++ b/bpf/process/types/basic.h
+@@ -238,7 +238,7 @@
+ #define get_index(ctx) 0
+ #endif
+ 
+-FUNC_INLINE long
++FUNC_LOCAL long
+ filter_32ty_map(struct selector_arg_filter *filter, char *args);
+ 
+ FUNC_INLINE int return_error(int *s, int err)

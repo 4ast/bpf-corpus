@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/**
+ * @file test_tool.bpf.c
+ */
+
+#include <bpf/vmlinux.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+/// License of the BPF program
+char LICENSE[] SEC("license") = "GPL";
+
+#define LOG_SIZE 128
+#define ALLOW    0
+
+u32 count = 0;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 4096);
+} ringbuf SEC(".maps");
+
+struct seabee_test_log_entry {
+	u32  count;
+	char name[LOG_SIZE];
+};
+
+/**
+ * @brief used for testing
+*/
+SEC("lsm/file_open")
+int BPF_PROG(test_seabee, struct file *file)
+{
+	if (++count % 100 != 0) {
+		return ALLOW;
+	}
+
+	// reserve ringbuf space
+	struct seabee_test_log_entry *log =
+		bpf_ringbuf_reserve(&ringbuf, LOG_SIZE + sizeof(u32), 0);
+	if (!log) {
+		bpf_printk(
+			"seabee_test_tool: unable to reserve from ringbuf of size %lu",
+			LOG_SIZE);
+		return ALLOW;
+	}
+
+	// get data
+	log->count = count;
+	s32 err    = bpf_probe_read_kernel_str(log->name, LOG_SIZE,
+	                                       file->f_path.dentry->d_name.name);
+	if (err < 0) {
+		bpf_printk("error reading name");
+	}
+
+	// log data
+	bpf_ringbuf_submit(log, 0);
+
+	return ALLOW;
+}

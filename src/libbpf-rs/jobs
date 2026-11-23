@@ -1,0 +1,30 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+F1 = $F -Ilibbpf-rs/tests/bin/src -Ilibbpf-rs/tests/bin -Ilibbpf-rs/tests -Ilibbpf-rs -I. -I../../include/vmlinux -I../../include
+
+capable: examples/capable/src/bpf/capable.bpf.c | $F -Iexamples/capable/src/bpf -Iexamples/capable/src -Iexamples/capable -Iexamples -I. -I../../include/vmlinux -I../../include
+compiler_warnings: examples/compiler_warnings/src/bpf/compiler_warnings.bpf.c | $F -Iexamples/compiler_warnings/src/bpf -Iexamples/compiler_warnings/src -Iexamples/compiler_warnings -Iexamples -I. -I../../include/vmlinux -I../../include
+netfilter_blocklist: examples/netfilter_blocklist/src/bpf/netfilter_blocklist.bpf.c | $F -Iexamples/netfilter_blocklist/src/bpf -Iexamples/netfilter_blocklist/src -Iexamples/netfilter_blocklist -Iexamples -I. -I../../include/vmlinux -I../../include
+ringbuf_multi: examples/ringbuf_multi/src/bpf/ringbuf_multi.bpf.c | $F -Iexamples/ringbuf_multi/src/bpf -Iexamples/ringbuf_multi/src -Iexamples/ringbuf_multi -Iexamples -I. -I../../include/vmlinux -I../../include
+examples_runqslower_src_bpf-runqslower: examples/runqslower/src/bpf/runqslower.bpf.c | $F -Iexamples/runqslower/src/bpf -Iexamples/runqslower/src -Iexamples/runqslower -Iexamples -I. -I../../include/vmlinux -I../../include
+task_longrun: examples/task_longrun/src/bpf/task_longrun.bpf.c | $F -Iexamples/task_longrun/src/bpf -Iexamples/task_longrun/src -Iexamples/task_longrun -Iexamples -I. -I../../include/vmlinux -I../../include
+tc: examples/tc_port_whitelist/src/bpf/tc.bpf.c | $F -Iexamples/tc_port_whitelist/src/bpf -Iexamples/tc_port_whitelist/src -Iexamples/tc_port_whitelist -Iexamples -I. -I../../include/vmlinux -I../../include
+tcp_ca: examples/tcp_ca/src/bpf/tcp_ca.bpf.c | $F -Iexamples/tcp_ca/src/bpf -Iexamples/tcp_ca/src -Iexamples/tcp_ca -Iexamples -I. -I../../include/vmlinux -I../../include
+tcp_option: examples/tcp_option/src/bpf/tcp_option.bpf.c | $F -Iexamples/tcp_option/src/bpf -Iexamples/tcp_option/src -Iexamples/tcp_option -Iexamples -I. -I../../include/vmlinux -I../../include
+tproxy: examples/tproxy/src/bpf/tproxy.bpf.c | $F -Iexamples/tproxy/src/bpf -Iexamples/tproxy/src -Iexamples/tproxy -Iexamples -I. -I../../include/vmlinux -I../../include
+arena: libbpf-rs/tests/bin/src/arena.bpf.c | $F1
+kprobe: libbpf-rs/tests/bin/src/kprobe.bpf.c | $F1
+ksyscall: libbpf-rs/tests/bin/src/ksyscall.bpf.c | $F1
+mapiter: libbpf-rs/tests/bin/src/mapiter.bpf.c | $F1
+netfilter: libbpf-rs/tests/bin/src/netfilter.bpf.c | $F1
+perf_event: libbpf-rs/tests/bin/src/perf_event.bpf.c | $F1
+ringbuf: libbpf-rs/tests/bin/src/ringbuf.bpf.c | $F1
+run_prog: libbpf-rs/tests/bin/src/run_prog.bpf.c | $F1
+libbpf-rs_tests_bin_src-runqslower: libbpf-rs/tests/bin/src/runqslower.bpf.c | $F1
+taskiter: libbpf-rs/tests/bin/src/taskiter.bpf.c | $F1
+tc-unit: libbpf-rs/tests/bin/src/tc-unit.bpf.c | $F1
+tracepoint: libbpf-rs/tests/bin/src/tracepoint.bpf.c | $F1
+uprobe: libbpf-rs/tests/bin/src/uprobe.bpf.c | $F1
+uprobe_multi: libbpf-rs/tests/bin/src/uprobe_multi.bpf.c | $F1
+usdt: libbpf-rs/tests/bin/src/usdt.bpf.c | $F1
+user_ringbuf: libbpf-rs/tests/bin/src/user_ringbuf.bpf.c | $F1
+xdp: libbpf-rs/tests/bin/src/xdp.bpf.c | $F1

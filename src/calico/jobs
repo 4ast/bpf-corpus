@@ -1,0 +1,4 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Ifelix/bpf-apache -Ifelix -I../../include/vmlinux -I../../include
+
+filter: felix/bpf-apache/filter.c | $F
+sockops: felix/bpf-apache/sockops.c | $F

@@ -1,0 +1,558 @@
+/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
+/* Copyright (c) 2025 Meta Platforms, Inc. */
+#ifndef __WPROF_H_
+#define __WPROF_H_
+
+#ifndef TASK_COMM_LEN
+#define TASK_COMM_LEN 16
+#endif
+
+#ifndef WORKER_DESC_LEN
+#define WORKER_DESC_LEN 32
+#endif
+
+#define FILEPATH_LEN 64
+#define REQ_NAME_LEN 64
+#define RPC_NAME_LEN 48
+#define HARDIRQ_NAME_LEN 32
+
+#define TASK_COMM_FULL_LEN (2 * TASK_COMM_LEN + 4)
+
+#ifndef MAX_STACK_DEPTH
+#define MAX_STACK_DEPTH 128
+#endif
+
+#define MAX_REAL_PMU_COUNTERS 8
+
+#ifndef PF_WQ_WORKER
+#define PF_WQ_WORKER 0x00000020
+#endif
+#ifndef PF_KTHREAD
+#define PF_KTHREAD 0x00200000
+#endif
+
+/*
+ * task_struct state bits from include/linux/sched.h. task->__state and
+ * task->exit_state occupy non-overlapping bits, so scheduler events store
+ * their union. Bit 31 is reserved by wprof to record sched_switch preemption.
+ */
+#define WPROF_TASK_RUNNING		0x00000000U
+#define WPROF_TASK_INTERRUPTIBLE	0x00000001U
+#define WPROF_TASK_UNINTERRUPTIBLE	0x00000002U
+#define WPROF_TASK_STOPPED		0x00000004U
+#define WPROF_TASK_TRACED		0x00000008U
+#define WPROF_EXIT_DEAD			0x00000010U
+#define WPROF_EXIT_ZOMBIE		0x00000020U
+#define WPROF_TASK_PARKED		0x00000040U
+#define WPROF_TASK_DEAD			0x00000080U
+#define WPROF_TASK_WAKEKILL		0x00000100U
+#define WPROF_TASK_WAKING		0x00000200U
+#define WPROF_TASK_NOLOAD		0x00000400U
+#define WPROF_TASK_NEW			0x00000800U
+#define WPROF_TASK_RTLOCK_WAIT		0x00001000U
+#define WPROF_TASK_FREEZABLE		0x00002000U
+#define WPROF_TASK_FREEZABLE_UNSAFE	0x00004000U
+#define WPROF_TASK_FROZEN		0x00008000U
+
+#define WPROF_TASK_KILLABLE (WPROF_TASK_WAKEKILL | WPROF_TASK_UNINTERRUPTIBLE)
+#define WPROF_TASK_IDLE (WPROF_TASK_UNINTERRUPTIBLE | WPROF_TASK_NOLOAD)
+#define WPROF_EXIT_TRACE (WPROF_EXIT_ZOMBIE | WPROF_EXIT_DEAD)
+#define WPROF_TASK_STATE_PREEMPTED (1U << 31)
+
+#define WPROF_TASK_REPORT (WPROF_TASK_INTERRUPTIBLE | WPROF_TASK_UNINTERRUPTIBLE | \
+			   WPROF_TASK_STOPPED | WPROF_TASK_TRACED | WPROF_EXIT_DEAD | \
+			   WPROF_EXIT_ZOMBIE | WPROF_TASK_PARKED)
+#define WPROF_TASK_REPORT_IDLE (WPROF_TASK_REPORT + 1)
+#define WPROF_TASK_REPORT_MAX (WPROF_TASK_REPORT_IDLE << 1)
+
+enum wprof_task_run_state {
+	WTRS_RUNNING = 0,
+	WTRS_RUNNABLE = 1,
+	WTRS_PREEMPTED = 2,
+	WTRS_INTERRUPTIBLE_SLEEP = 3,
+	WTRS_UNINTERRUPTIBLE_SLEEP = 4,
+	WTRS_KILLABLE_SLEEP = 5,
+	WTRS_STOPPED = 6,
+	WTRS_TRACED = 7,
+	WTRS_EXIT_DEAD = 8,
+	WTRS_EXIT_ZOMBIE = 9,
+	WTRS_EXIT_TRACE = 10,
+	WTRS_PARKED = 11,
+	WTRS_TASK_DEAD = 12,
+	WTRS_RTLOCK_WAIT = 13,
+	WTRS_FREEZABLE = 14,
+	WTRS_FROZEN = 15,
+	WTRS_IDLE = 16,
+	WTRS_WAKING = 17,
+	WTRS_NEW = 18,
+	WTRS_UNKNOWN = 19,
+	NR_WPROF_TASK_RUN_STATES,
+};
+
+#define WPROF_GLOB_SZ 32
+struct glob_str { char pat[WPROF_GLOB_SZ]; };
+
+enum wprof_filt_mode {
+	FILT_ALLOW_PID = 0x01,
+	FILT_ALLOW_TID = 0x02,
+	FILT_ALLOW_PNAME = 0x04,
+	FILT_ALLOW_TNAME = 0x08,
+
+	FILT_ALLOW_IDLE = 0x10,
+	FILT_ALLOW_KTHREAD = 0x20,
+
+	FILT_DENY_PID = FILT_ALLOW_PID << 16,
+	FILT_DENY_TID = FILT_ALLOW_TID << 16,
+	FILT_DENY_PNAME = FILT_ALLOW_PNAME << 16,
+	FILT_DENY_TNAME = FILT_ALLOW_TNAME << 16,
+	FILT_DENY_IDLE = FILT_ALLOW_IDLE << 16,
+	FILT_DENY_KTHREAD = FILT_ALLOW_KTHREAD << 16,
+};
+
+struct wprof_bpf_stats {
+	u64 rb_handled;
+	u64 rb_drops;
+	u64 rb_rescues;
+	u64 rb_misses;
+	u64 task_state_drops;
+	u64 task_storage_fallbacks;
+	u64 req_state_drops;
+	u64 pystacks_attempted;
+	u64 pystacks_found;
+};
+
+enum event_kind {
+	EV_INVALID = 0,
+
+	EV_TIMER = 1,
+	EV_SWITCH = 2,
+	/* EV_WAKEUP = 3, */
+	EV_WAKING = 4,
+	EV_HARDIRQ_EXIT = 5,
+	EV_SOFTIRQ_EXIT = 6,
+	EV_WQ_END = 7,
+	EV_WAKEUP_NEW = 8,
+	EV_FORK = 9,
+	EV_EXEC = 10,
+	EV_TASK_RENAME = 11,
+	EV_TASK_EXIT = 12,
+	EV_TASK_FREE = 13,
+	EV_IPI_SEND = 14,
+	EV_IPI_EXIT = 15,
+	EV_REQ_EVENT = 16,
+	EV_REQ_TASK_EVENT = 17,
+	EV_SCX_DSQ_END = 18,
+	EV_PMU_EVENT = 19,
+	EV_REQ_RPC_EVENT = 20,
+
+	EV_CUDA_CALL = 49,
+
+	/* CUDA GPU activity events (from CUPTI) */
+	EV_CUDA_KERNEL = 50,
+	EV_CUDA_MEMCPY = 51,
+	EV_CUDA_MEMSET = 52,
+	EV_CUDA_SYNC = 53,
+	EV_CUDA_API = 54,
+	EV_CUDA_OVERHEAD = 55,
+
+	/* Python function tracing events (from PyEval_SetProfile) */
+	EV_PYTRACE_ENTRY = 60,
+	EV_PYTRACE_EXIT = 61,
+
+	/* PyTorch RecordFunction events (from at::addGlobalCallback) */
+	EV_PYTORCH_ENTRY = 62,
+	EV_PYTORCH_EXIT = 63,
+
+	/* User-defined tracing (utrace) */
+	EV_UTRACE_INSTANT = 70,
+	EV_UTRACE_ENTRY = 71,
+	EV_UTRACE_EXIT = 72,
+
+	__EV_KIND_MAX,
+};
+
+enum stack_trace_kind {
+	ST_NONE = 0,
+
+	ST_TIMER		= 1 << 0, /* regular interval timer event */
+	ST_OFFCPU		= 1 << 1, /* context switch out (thread going off-CPU) */
+	ST_WAKER		= 1 << 2, /* thread being marked runnable, waker-side stack trace */
+	ST_CUDA			= 1 << 3, /* CUDA API calls */
+	ST_REQ			= 1 << 4, /* request lifecycle events (begin/end/set/unset) */
+	ST_UTRACE		= 1 << 5, /* user-defined tracing probes */
+	ST_PMU			= 1 << 6, /* sampled PMU event overflow (-S pmu=...) */
+
+	__ST_LAST,
+	ST_ANY = (__ST_LAST - 1) * 2 - 1,
+	ST_ALL = ST_ANY,		  /* alias */
+
+	ST_DEFAULT = ST_TIMER | ST_OFFCPU,
+
+	ST_ERR = -1LL,
+	ST_UNSET = -1LL,
+};
+
+struct stack_trace {
+	int stack_id;
+	enum stack_trace_kind kind;
+	int pid;
+	short kstack_sz;
+	short ustack_sz;;
+	u64 addrs[MAX_STACK_DEPTH * 2];
+};
+
+struct wprof_thread {
+	u32 tid;
+	u32 pid;
+	u32 ppid;
+	u32 flags;
+	char comm[TASK_COMM_FULL_LEN];
+	char pcomm[TASK_COMM_LEN];
+};
+
+struct wprof_task {
+	u32 tid;
+	u32 pid;
+	u32 ppid;
+	u32 flags;
+	const char *comm;
+	const char *pcomm;
+};
+
+struct pmu_val {
+	u64 val;
+	/*
+	 * Nanoseconds the counter spent loaded on hardware, which might be lower than total time
+	 * it was supposed to be active due to kernel multiplexing hardware PMUs.
+	 */
+	u64 run_ns;
+};
+
+struct perf_counters {
+	struct pmu_val ctr[MAX_REAL_PMU_COUNTERS];
+};
+
+enum waking_flags {
+	WF_UNKNOWN,
+	WF_WOKEN,
+	WF_WOKEN_NEW,
+	WF_PREEMPTED,
+};
+
+/*
+ * Interrupt context a wakeup was issued from, recorded in wprof_waking.flags.
+ * Any combination can be set at once: an NMI can land inside a hardirq, and a
+ * hardirq can interrupt softirq processing.
+ */
+enum wprof_irqctx_flag {
+	WTF_HARDIRQ	= 0x1,
+	WTF_SOFTIRQ	= 0x2,
+	WTF_NMI		= 0x4,
+
+	WTF_IRQ_CTX_MASK = WTF_HARDIRQ | WTF_SOFTIRQ | WTF_NMI,
+};
+
+/*
+ * Bit ranges hand-packed into the u16 wprof_event.flags:
+ *   bits 0-5   EF_STACK_TRACE_MSK  (ST_ALL; one bit per captured stack trace kind)
+ *   bits 6-8   free (headroom for more stack trace kinds)
+ *   bits 9-11  EF_TASK_INFO_MSK    (popcount = number of trailing wprof_thread records)
+ *   bit  12    EF_PMU_VALS
+ *   bit  13    EF_PYSTACK
+ *   bits 14-15 free
+ *
+ * These ranges are hand-assigned and share one word; re-check EF_STACK_TRACE_MSK,
+ * EF_TASK_INFO_MSK and the free-bit budget before adding a new stack trace kind
+ * or raising the max number of wprof_thread records appended per event.
+ */
+enum event_flags {
+	EF_NONE = 0x00,
+	EF_STACK_TRACE_MSK = ST_ALL,	/* bits 0-5: captured stack traces bitmask */
+	/* bits 9-11: popcount(flags & EF_TASK_INFO_MSK) = number of trailing wprof_thread records */
+	EF_TASK_INFO_SHIFT = 9,
+	EF_TASK_INFO_MSK = 0x7 << EF_TASK_INFO_SHIFT,
+	EF_PMU_VALS = 0x1000,		/* PMU counter values follow fixed event data */
+	EF_PYSTACK = 0x2000,		/* pystacks_message follows stack traces */
+};
+
+enum wprof_ipi_kind {
+	IPI_INVALID = 0,
+
+	IPI_SINGLE,
+	IPI_MULTI,
+	IPI_RESCHED,
+
+	NR_IPIS,
+};
+
+enum wprof_req_event_kind {
+	REQ_BEGIN = 10,
+	REQ_SET = 11,
+	REQ_UNSET = 12,
+	REQ_END = 13,
+	REQ_CLEAR = 14,
+
+	REQ_TASK_ENQUEUE = 15,
+	REQ_TASK_DEQUEUE = 16,
+	REQ_TASK_STATS = 17,
+
+	REQ_REPLY = 18,
+
+	/* thrift client RPC events; numbered apart, they share no history with the above */
+	REQ_RPC_REQUEST = 1000,
+	REQ_RPC_RESPONSE = 1001,
+};
+
+/*
+ * thrift:crochet_request_data_context reports its own REPLY as 15, which this
+ * enum already spends on REQ_TASK_ENQUEUE, so the USDT handler remaps it to
+ * REQ_REPLY. REPLY fires once the response has been serialized, ending the
+ * request's synchronous part; whatever runs up to CLEAR after it is post-reply
+ * work.
+ */
+#define CROCHET_USDT_REPLY 15
+
+enum scx_dsq_insert_type {
+	SCX_DSQ_INSERT = 0,
+	SCX_DSQ_INSERT_VTIME = 1,
+	SCX_DSQ_DISPATCH = 2,
+	SCX_DSQ_DISPATCH_VTIME = 3,
+	SCX_DSQ_MOVE = 4,
+	SCX_DSQ_MOVE_VTIME = 5,
+	SCX_DSQ_DISPATCH_FROM_DSQ = 6,
+	SCX_DSQ_DISPATCH_VTIME_FROM_DSQ = 7,
+};
+
+#include "utrace_cfg.h"
+
+#define MAX_UTRACE_ARGS 8
+#define MAX_UTRACE_STR_SZ 128
+
+enum utrace_event_type {
+	UTRACE_INSTANT,		/* non-span: uprobe, uretprobe, kprobe, kretprobe */
+	UTRACE_ENTRY,		/* span entry half */
+	UTRACE_EXIT,		/* span exit half */
+};
+
+enum utrace_probe_flags {
+	UTRACE_FL_CAPTURE_STACK = 1 << 0,
+};
+
+/* Per-probe config, stored in BPF array map, populated from utrace_cfg */
+struct utrace_probe_cfg {
+	u32 utrace_id;		/* index into utrace_cfgs (same for both halves of a span) */
+	int arg_cnt;
+	u32 flags;				/* enum utrace_probe_flags */
+	enum utrace_event_type event_type;
+	enum utrace_type probe_type;
+	u8 arg_op_cnt[MAX_UTRACE_ARGS];
+	struct utrace_read_op arg_ops[MAX_UTRACE_ARGS][MAX_UTRACE_READ_OPS];
+};
+
+struct wprof_event {
+	u16 sz; /* total record size including trailing dynamic data */
+	u16 flags;
+	enum event_kind kind;
+	u64 ts;
+
+	u16 cpu;
+	u16 numa_node;
+	int task_id;
+
+	char __wprof_data[0]; /* marker field */
+
+	union {
+		struct wprof_switch {
+			int next_task_id;
+			u32 prev_task_state;
+			u32 last_next_task_state;
+			int prev_prio;
+			int next_prio;
+			int next_task_scx_layer_id; /* sched-ext specific */
+			int next_task_scx_dsq_id; /* sched-ext specific */
+		} swtch;
+		struct wprof_timer {
+		} timer;
+		struct wprof_pmu_event {
+			u64 sample_period;	/* counts this sample represents (ctx->sample_period) */
+			u32 pmu_idx;		/* which -S pmu= event fired */
+		} pmu_event;
+		struct wprof_waking {
+			int wakee_task_id;
+			u8 prio;		/* 0xff is SCHED_DEADLINE's -1 */
+			u8 flags;		/* enum wprof_irqctx_flag bitmask */
+			u16 reserved;
+			int target_cpu;
+		} waking;
+		struct wprof_wakeup_new {
+			int wakee_task_id;
+			u8 prio;		/* 0xff is SCHED_DEADLINE's -1 */
+			u8 flags;		/* enum wprof_irqctx_flag bitmask */
+			u16 reserved;
+			int target_cpu;
+		} wakeup_new;
+		struct wprof_hardirq {
+			u64 hardirq_ts;
+			int irq;
+			char name[HARDIRQ_NAME_LEN];
+		} hardirq;
+		struct wprof_softirq {
+			u64 softirq_ts;
+			int vec_nr;
+		} softirq;
+		struct wprof_wq_info {
+			u64 wq_ts;
+			char desc[WORKER_DESC_LEN];
+		} wq;
+		struct wprof_task_rename {
+			char new_comm[TASK_COMM_LEN];
+		} rename;
+		struct wprof_task_exit {
+		} task_exit;
+		struct wprof_task_free {
+		} task_free;
+		struct wprof_fork {
+			int child_task_id;
+		} fork;
+		struct wprof_exec {
+			int old_tid;
+			char filename[FILEPATH_LEN];
+		} exec;
+		struct wprof_ipi_send {
+			u64 ipi_id; /* 0, if unknown */
+			enum wprof_ipi_kind kind;
+			int target_cpu; /* -1, if multicast IPI */
+		} ipi_send;
+		struct wprof_ipi_info {
+			u64 ipi_ts;
+			u64 send_ts; /* 0, if unknown origination timestamp */
+			u64 ipi_id; /* 0, if unknown */
+			enum wprof_ipi_kind kind;
+			int send_cpu; /* -1, if multicast IPI or unknown */
+		} ipi;
+		struct wprof_req_ctx {
+			u64 req_ts; /* request start timestamp */
+			u64 req_id;
+			enum wprof_req_event_kind req_event; /* lifecycle event (BEGIN, SET, UNSET, REPLY, END, CLEAR) */
+			char req_name[REQ_NAME_LEN];
+		} req;
+		struct wprof_req_rpc_ctx {
+			enum wprof_req_event_kind rpc_event; /* RPC_REQUEST/RPC_RESPONSE */
+			u8 success; /* response only */
+			u64 req_id;
+			u64 rpc_id;
+			char service[RPC_NAME_LEN]; /* request only */
+			char method[RPC_NAME_LEN];  /* request only */
+		} req_rpc;
+		struct wprof_req_task_ctx {
+			enum wprof_req_event_kind req_task_event; /* ENQUEUE/DEQUEUE/STATS */
+			u64 req_id;
+			u64 task_id;
+			u64 enqueue_ts;
+			u64 wait_time_ns;
+			u64 run_time_ns;
+		} req_task;
+		struct wprof_scx_dsq {
+			u64 scx_dsq_insert_ts;
+			u64 scx_dsq_id;
+			u32 scx_layer_id;
+			enum scx_dsq_insert_type scx_dsq_insert_type;
+		} scx_dsq;
+		struct wprof_cuda_call {
+			int domain;
+			int cbid;
+			u32 corr_id;
+		} cuda_call;
+		struct wprof_cuda_kernel {
+			u64 end_ts;
+			const char *name;
+			u32 corr_id;
+			u32 device_id;
+			u32 ctx_id;
+			u32 stream_id;
+			u32 grid_x, grid_y, grid_z;
+			u32 block_x, block_y, block_z;
+		} cuda_kernel;
+		struct wprof_cuda_memcpy {
+			u64 end_ts;
+			u64 byte_cnt;
+			u32 corr_id;
+			u32 device_id;
+			u32 src_device_id; /* for peer-to-peer (MEMCPY2) copies; else == device_id */
+			u32 dst_device_id; /* for peer-to-peer (MEMCPY2) copies; else == device_id */
+			u32 ctx_id;
+			u32 stream_id;
+			u8 copy_kind;
+			u8 src_kind;
+			u8 dst_kind;
+		} cuda_memcpy;
+		struct wprof_cuda_memset {
+			u64 end_ts;
+			u64 byte_cnt;
+			u32 corr_id;
+			u32 device_id;
+			u32 ctx_id;
+			u32 stream_id;
+			u32 value;
+			u8 mem_kind;
+		} cuda_memset;
+		struct wprof_cuda_sync {
+			u64 end_ts;
+			u32 corr_id;
+			u32 stream_id;
+			u32 ctx_id;
+			u32 event_id;
+			u8 sync_type;
+		} cuda_sync;
+		struct wprof_cuda_api {
+			u64 end_ts;
+			u32 corr_id;
+			u32 cbid;
+			u32 ret_val;
+			u8 kind;
+		} cuda_api;
+		struct wprof_utrace {
+			u32 utrace_id;
+			s16 arg_len[MAX_UTRACE_ARGS];	/* per-arg byte length; negative = read error */
+			/* trailing dyn data: u64 for integer args, raw string bytes for string args */
+		} utrace;
+	};
+};
+
+#ifndef offsetofend
+#define offsetofend(TYPE, MEMBER) (offsetof(TYPE, MEMBER) + sizeof((((TYPE *)0)->MEMBER)))
+#endif
+
+#define EV_SZ(kind) offsetofend(struct wprof_event, kind)
+
+static inline u16 bpf_event_fix_sz(const struct wprof_event *e)
+{
+	switch (e->kind) {
+	case EV_SWITCH:		return EV_SZ(swtch);
+	case EV_TIMER:		return EV_SZ(timer);
+	case EV_PMU_EVENT:	return EV_SZ(pmu_event);
+	case EV_WAKING:		return EV_SZ(waking);
+	case EV_WAKEUP_NEW:	return EV_SZ(wakeup_new);
+	case EV_HARDIRQ_EXIT:	return EV_SZ(hardirq);
+	case EV_SOFTIRQ_EXIT:	return EV_SZ(softirq);
+	case EV_WQ_END:		return EV_SZ(wq);
+	case EV_FORK:		return EV_SZ(fork);
+	case EV_EXEC:		return EV_SZ(exec);
+	case EV_TASK_RENAME:	return EV_SZ(rename);
+	case EV_TASK_EXIT:	return EV_SZ(task_exit);
+	case EV_TASK_FREE:	return EV_SZ(task_free);
+	case EV_IPI_SEND:	return EV_SZ(ipi_send);
+	case EV_IPI_EXIT:	return EV_SZ(ipi);
+	case EV_REQ_EVENT:	return EV_SZ(req);
+	case EV_REQ_TASK_EVENT:	return EV_SZ(req_task);
+	case EV_REQ_RPC_EVENT:	return EV_SZ(req_rpc);
+	case EV_SCX_DSQ_END:	return EV_SZ(scx_dsq);
+	case EV_CUDA_CALL:	return EV_SZ(cuda_call);
+	case EV_UTRACE_INSTANT:
+	case EV_UTRACE_ENTRY:
+	case EV_UTRACE_EXIT:	return EV_SZ(utrace);
+	default:		return e->sz;
+	}
+}
+
+#endif /* __WPROF_H_ */

@@ -1,0 +1,9 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+execsnoop: bpf/gobpf/execsnoop/execsnoop.bpf.c | $F -Ibpf/gobpf/execsnoop -Ibpf/gobpf -Ibpf -Ibpf/amd64 -I../../include
+bpfrestrict: bpf/bpfrestrict.bpf.c | $F -Ibpf -Ibpf/amd64 -I../../include
+disablemoduleautoload: bpf/disablemoduleautoload.bpf.c | $F -Ibpf -Ibpf/amd64 -I../../include
+filelesslock: bpf/filelesslock.bpf.c | $F -Ibpf -Ibpf/amd64 -I../../include
+kimglock: bpf/kimglock.bpf.c | $F -Ibpf -Ibpf/amd64 -I../../include
+kmodlock: bpf/kmodlock.bpf.c | $F -Ibpf -Ibpf/amd64 -I../../include
+restrictfilesystems: bpf/restrictfilesystems.bpf.c | $F -Ibpf -Ibpf/amd64 -I../../include

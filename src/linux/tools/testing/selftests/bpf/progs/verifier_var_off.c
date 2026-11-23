@@ -1,0 +1,808 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Converted from tools/testing/selftests/bpf/verifier/var_off.c */
+
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+#include "bpf_misc.h"
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, long long);
+	__type(value, long long);
+} map_hash_8b SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, long long);
+} map_array_8b SEC(".maps");
+
+SEC("lwt_in")
+__description("variable-offset ctx access")
+__failure __msg("variable ctx access var_off=(0x0; 0x4)")
+__naked void variable_offset_ctx_access(void)
+{
+	asm volatile ("					\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned */		\
+	r2 &= 4;					\
+	/* add it to skb.  We now have either &skb->len or\
+	 * &skb->pkt_type, but we don't know which	\
+	 */						\
+	r1 += r2;					\
+	/* dereference it */				\
+	r0 = *(u32*)(r1 + 0);				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("cgroup/skb")
+__description("variable-offset stack read, priv vs unpriv")
+__success __failure_unpriv
+__msg_unpriv("R2 variable stack access prohibited for !root")
+__retval(0)
+__naked void stack_read_priv_vs_unpriv(void)
+{
+	asm volatile ("					\
+	/* Fill the top 8 bytes of the stack */		\
+	r0 = 0;						\
+	*(u64*)(r10 - 8) = r0;				\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned */		\
+	r2 &= 4;					\
+	r2 -= 8;					\
+	/* add it to fp.  We now have either fp-4 or fp-8, but\
+	 * we don't know which				\
+	 */						\
+	r2 += r10;					\
+	/* dereference it for a stack read */		\
+	r0 = *(u32*)(r2 + 0);				\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("cgroup/skb")
+__description("variable-offset stack read preserves spilled zero")
+__success
+__log_level(2)
+__msg("R3=0")
+__retval(0)
+__naked void stack_read_var_off_preserves_spilled_zero(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	*(u64*)(r10 - 8) = r0;			\
+	r2 = *(u32*)(r1 + 0);				\
+	r2 &= 7;					\
+	r2 -= 8;					\
+	r2 += r10;					\
+	r3 = *(u8*)(r2 + 0);				\
+	r1 = r10;					\
+	r1 += -1;					\
+	r1 += r3;					\
+	*(u8*)(r1 + 0) = r3;			\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("cgroup/skb")
+__description("variable-offset stack read preserves spilled zero across slots")
+__success
+__log_level(2)
+__msg("R3=0")
+__retval(0)
+__naked void stack_read_var_off_preserves_spilled_zero_across_slots(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	*(u64*)(r10 - 8) = r0;			\
+	*(u64*)(r10 - 16) = r0;			\
+	r2 = *(u32*)(r1 + 0);				\
+	r2 &= 15;					\
+	r2 -= 16;					\
+	r2 += r10;					\
+	r3 = *(u8*)(r2 + 0);				\
+	r1 = r10;					\
+	r1 += -1;					\
+	r1 += r3;					\
+	*(u8*)(r1 + 0) = r3;			\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("cgroup/skb")
+__description("variable-offset stack read preserves partial spilled zero")
+__success
+__log_level(2)
+__msg("R3=0")
+__retval(0)
+__naked void stack_read_var_off_preserves_partial_spilled_zero(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	*(u8*)(r10 - 9) = r0;			\
+	*(u8*)(r10 - 10) = r0;			\
+	*(u8*)(r10 - 11) = r0;			\
+	*(u8*)(r10 - 12) = r0;			\
+	*(u8*)(r10 - 13) = r0;			\
+	*(u8*)(r10 - 14) = r0;			\
+	*(u8*)(r10 - 15) = r0;			\
+	*(u32*)(r10 - 8) = r0;			\
+	r2 = *(u32*)(r1 + 0);				\
+	r2 &= 15;					\
+	if r2 > 10 goto l0_%=;			\
+	r2 -= 15;					\
+	r2 += r10;					\
+	r3 = *(u8*)(r2 + 0);				\
+	r1 = r10;					\
+	r1 += -1;					\
+	r1 += r3;					\
+	*(u8*)(r1 + 0) = r3;			\
+l0_%=: r0 = 0;					\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("cgroup/skb")
+__description("variable-offset stack read partial spill with misc data")
+__failure
+__msg("invalid variable-offset write to stack R1")
+__naked void stack_read_var_off_partial_spill_with_misc_data(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	*(u32*)(r10 - 8) = r0;			\
+	r2 = *(u32*)(r1 + 0);				\
+	r2 &= 7;					\
+	r2 -= 8;					\
+	r2 += r10;					\
+	r3 = *(u8*)(r2 + 0);				\
+	r1 = r10;					\
+	r1 += -1;					\
+	r1 += r3;					\
+	*(u8*)(r1 + 0) = 0;			\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("cgroup/skb")
+__description("variable-offset stack read, uninitialized")
+__success
+__failure_unpriv __msg_unpriv("R2 variable stack access prohibited for !root")
+__naked void variable_offset_stack_read_uninitialized(void)
+{
+	asm volatile ("					\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned */		\
+	r2 &= 4;					\
+	r2 -= 8;					\
+	/* add it to fp.  We now have either fp-4 or fp-8, but\
+	 * we don't know which				\
+	 */						\
+	r2 += r10;					\
+	/* dereference it for a stack read */		\
+	r0 = *(u32*)(r2 + 0);				\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("socket")
+__description("variable-offset stack write, priv vs unpriv")
+__success
+/* Check that the maximum stack depth is correctly maintained according to the
+ * maximum possible variable offset.
+ */
+__log_level(4)
+__msg("subprog 0 (stack_write_priv_vs_unpriv) main {{.*}} stack 16")
+__failure_unpriv
+/* Variable stack access is rejected for unprivileged.
+ */
+__msg_unpriv("R2 variable stack access prohibited for !root")
+__retval(0)
+__naked void stack_write_priv_vs_unpriv(void)
+{
+	asm volatile ("                               \
+	/* Get an unknown value */                    \
+	r2 = *(u32*)(r1 + 0);                         \
+	/* Make it small and 8-byte aligned */        \
+	r2 &= 8;                                      \
+	r2 -= 16;                                     \
+	/* Add it to fp. We now have either fp-8 or   \
+	 * fp-16, but we don't know which             \
+	 */                                           \
+	r2 += r10;                                    \
+	/* Dereference it for a stack write */        \
+	r0 = 0;                                       \
+	*(u64*)(r2 + 0) = r0;                         \
+	exit;                                         \
+"	::: __clobber_all);
+}
+
+/* Similar to the previous test, but this time also perform a read from the
+ * address written to with a variable offet. The read is allowed, showing that,
+ * after a variable-offset write, a privileged program can read the slots that
+ * were in the range of that write (even if the verifier doesn't actually know if
+ * the slot being read was really written to or not.
+ *
+ * Despite this test being mostly a superset, the previous test is also kept for
+ * the sake of it checking the stack depth in the case where there is no read.
+ */
+SEC("socket")
+__description("variable-offset stack write followed by read")
+__success
+/* Check that the maximum stack depth is correctly maintained according to the
+ * maximum possible variable offset.
+ */
+__log_level(4)
+__msg("subprog 0 (stack_write_followed_by_read) main {{.*}} stack 16")
+__failure_unpriv
+__msg_unpriv("R2 variable stack access prohibited for !root")
+__retval(0)
+__naked void stack_write_followed_by_read(void)
+{
+	asm volatile ("					\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 8-byte aligned */		\
+	r2 &= 8;					\
+	r2 -= 16;					\
+	/* Add it to fp.  We now have either fp-8 or fp-16, but\
+	 * we don't know which				\
+	 */						\
+	r2 += r10;					\
+	/* Dereference it for a stack write */		\
+	r0 = 0;						\
+	*(u64*)(r2 + 0) = r0;				\
+	/* Now read from the address we just wrote. */ \
+	r3 = *(u64*)(r2 + 0);				\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("socket")
+__description("variable-offset stack write clobbers spilled regs")
+__failure
+/* In the privileged case, dereferencing a spilled-and-then-filled
+ * register is rejected because the previous variable offset stack
+ * write might have overwritten the spilled pointer (i.e. we lose track
+ * of the spilled register when we analyze the write).
+ */
+__msg("R2 invalid mem access 'scalar'")
+__failure_unpriv
+/* The unprivileged case is not too interesting; variable
+ * stack access is rejected.
+ */
+__msg_unpriv("R2 variable stack access prohibited for !root")
+__naked void stack_write_clobbers_spilled_regs(void)
+{
+	asm volatile ("					\
+	/* Dummy instruction; needed because we need to patch the next one\
+	 * and we can't patch the first instruction.	\
+	 */						\
+	r6 = 0;						\
+	/* Make R0 a map ptr */				\
+	r0 = %[map_hash_8b] ll;				\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 8-byte aligned */		\
+	r2 &= 8;					\
+	r2 -= 16;					\
+	/* Add it to fp. We now have either fp-8 or fp-16, but\
+	 * we don't know which.				\
+	 */						\
+	r2 += r10;					\
+	/* Spill R0(map ptr) into stack */		\
+	*(u64*)(r10 - 8) = r0;				\
+	/* Dereference the unknown value for a stack write */\
+	r0 = 0;						\
+	*(u64*)(r2 + 0) = r0;				\
+	/* Fill the register back into R2 */		\
+	r2 = *(u64*)(r10 - 8);				\
+	/* Try to dereference R2 for a memory load */	\
+	r0 = *(u64*)(r2 + 8);				\
+	exit;						\
+"	:
+	: __imm_addr(map_hash_8b)
+	: __clobber_all);
+}
+
+/*
+ * if (x) a[0] = p; else a[1] = p; with one store. The paths meet in front of it.
+ * The offset is known on each of them.
+ */
+SEC("tc")
+__description("pointer is spilled at one of two offsets")
+__success __retval(0)
+__naked void ptr_at_one_of_two_offsets(void)
+{
+	asm volatile ("					\
+	r1 = 0;						\
+	*(u32*)(r10 - 4) = r1;				\
+	r2 = r10;					\
+	r2 += -4;					\
+	r1 = %[map_array_8b] ll;			\
+	call %[bpf_map_lookup_elem];			\
+	if r0 == 0 goto l2_%=;				\
+	r6 = r0;					\
+	r1 = 0;						\
+	*(u64*)(r10 - 16) = r1;				\
+	*(u64*)(r10 - 24) = r1;				\
+	call %[bpf_get_prandom_u32];			\
+	r7 = 0;						\
+	r8 = 1;						\
+	if r0 > 100 goto l0_%=;				\
+	r7 = 8;						\
+	r8 = 2;						\
+l0_%=:	r2 = r10;					\
+	r2 += -24;					\
+	r2 += r7;					\
+	*(u64*)(r2 + 0) = r6;				\
+	if r8 != 1 goto l1_%=;				\
+	r3 = *(u64*)(r10 - 24);				\
+	r0 = *(u64*)(r3 + 0);				\
+	exit;						\
+l1_%=:	r3 = *(u64*)(r10 - 16);				\
+	r0 = *(u64*)(r3 + 0);				\
+	exit;						\
+l2_%=:	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32),
+	  __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_array_8b)
+	: __clobber_all);
+}
+
+#define PICK_OFF(slot)					\
+	"call %[bpf_get_prandom_u32];"			\
+	"r1 = 0;"					\
+	"if r0 > 100 goto +1;"				\
+	"r1 = 8;"					\
+	"*(u64*)(r10 - " #slot ") = r1;"
+
+#define USE_OFF(slot)					\
+	"r1 = *(u64*)(r10 - " #slot ");"		\
+	"r2 = r10;"					\
+	"r2 += -16;"					\
+	"r2 += r1;"					\
+	"*(u64*)(r2 + 0) = r0;"
+
+/* 4096 combinations of offsets that are known: not all of them are looked at */
+SEC("tc")
+__description("12 times one of two offsets")
+__success __retval(0)
+__naked void many_offsets(void)
+{
+	asm volatile (
+	"r1 = 0;"
+	"*(u64*)(r10 - 8) = r1;"
+	"*(u64*)(r10 - 16) = r1;"
+	PICK_OFF(24) PICK_OFF(32) PICK_OFF(40) PICK_OFF(48)
+	PICK_OFF(56) PICK_OFF(64) PICK_OFF(72) PICK_OFF(80)
+	PICK_OFF(88) PICK_OFF(96) PICK_OFF(104) PICK_OFF(112)
+	USE_OFF(24) USE_OFF(32) USE_OFF(40) USE_OFF(48)
+	USE_OFF(56) USE_OFF(64) USE_OFF(72) USE_OFF(80)
+	USE_OFF(88) USE_OFF(96) USE_OFF(104) USE_OFF(112)
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __ksym;
+extern int *bpf_iter_num_next(struct bpf_iter_num *it) __ksym;
+extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __ksym;
+
+/* The verifier doesn't know what is in there */
+unsigned long zero;
+
+#define ITER_NEW	"r1 = r10; r1 += -24; w2 = 0; w3 = 100; call %[bpf_iter_num_new];"
+#define ITER_NEXT	"r1 = r10; r1 += -24; call %[bpf_iter_num_next];"
+#define ITER_DESTROY	"r1 = r10; r1 += -24; call %[bpf_iter_num_destroy];"
+#define __imm_iter	__imm(bpf_iter_num_new), __imm(bpf_iter_num_next), \
+			__imm(bpf_iter_num_destroy)
+
+/*
+ *	u8 stack[10], depth = 0;
+ *	loop {
+ *		if (x) { if (depth >= 10) break; stack[depth++] = 1; }
+ *		else { depth--; if (depth >= 10) break; y = stack[depth]; }
+ *	}
+ * depth is in a 32-bit register. 'depth & 255' is tested, and computed anew for the index.
+ */
+#define PUSH_OR_POP					\
+		"r1 = *(u64 *)(r6 + 0);"		\
+		"if r1 == 0 goto 2f;"			\
+		"w7 = w8;"				\
+		"w7 &= 255;"				\
+		"if w7 > 9 goto 9f;"			\
+		"r1 = r8;"				\
+		"r1 &= 255;"				\
+		"r2 = r10;"				\
+		"r2 += -10;"				\
+		"r2 += r1;"				\
+		"*(u8 *)(r2 + 0) = r1;"			\
+		"w8 += 1;"				\
+		"goto 1b;"				\
+	"2:"						\
+		"w8 += -1;"				\
+		"w2 = w8;"				\
+		"w2 &= 255;"				\
+		"if w2 > 9 goto 9f;"			\
+		"r2 = r8;"				\
+		"r2 &= 255;"				\
+		"r3 = r10;"				\
+		"r3 += -10;"				\
+		"r3 += r2;"				\
+		"r9 = *(u8 *)(r3 + 0);"			\
+		"goto 1b;"
+
+SEC("tc")
+__description("depth of a stack on the stack: a copy is tested")
+__success __retval(0)
+__naked void depth_copy_is_tested(void)
+{
+	asm volatile (
+		"r6 = %[zero] ll;"
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"*(u64 *)(r10 - 16) = r1;"
+		"w8 = 0;"
+		ITER_NEW
+	"1:"
+		ITER_NEXT
+		"if r0 == 0 goto 9f;"
+		PUSH_OR_POP
+	"9:"
+		ITER_DESTROY
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero), __imm_iter
+		: __clobber_all);
+}
+
+SEC("tc")
+__description("depth of a stack on the stack: no bound")
+__failure __msg("invalid write to stack R2 off=0 size=1")
+__naked void depth_without_a_bound(void)
+{
+	asm volatile (
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"*(u64 *)(r10 - 16) = r1;"
+		"w8 = 0;"
+		ITER_NEW
+	"1:"
+		ITER_NEXT
+		"if r0 == 0 goto 9f;"
+		"r1 = r8;"
+		"r1 &= 255;"
+		"r2 = r10;"
+		"r2 += -10;"
+		"r2 += r1;"
+		"*(u8 *)(r2 + 0) = r1;"
+		"w8 += 1;"
+		"goto 1b;"
+	"9:"
+		ITER_DESTROY
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_iter
+		: __clobber_all);
+}
+
+/* BTF FUNC records are not generated for kfuncs referenced from inline assembly */
+void __kfunc_btf_root(void)
+{
+	bpf_iter_num_new(0, 0, 0);
+	bpf_iter_num_next(0);
+	bpf_iter_num_destroy(0);
+}
+
+SEC("sockops")
+__description("indirect variable-offset stack access, unbounded")
+__failure __msg("invalid unbounded variable-offset write to stack R4")
+__naked void variable_offset_stack_access_unbounded(void)
+{
+	asm volatile ("					\
+	r2 = 6;						\
+	r3 = 28;					\
+	/* Fill the top 16 bytes of the stack. */	\
+	r4 = 0;						\
+	*(u64*)(r10 - 16) = r4;				\
+	r4 = 0;						\
+	*(u64*)(r10 - 8) = r4;				\
+	/* Get an unknown value. */			\
+	r4 = *(u64*)(r1 + %[bpf_sock_ops_bytes_received]);\
+	/* Check the lower bound but don't check the upper one. */\
+	if r4 s< 0 goto l0_%=;				\
+	/* Point the lower bound to initialized stack. Offset is now in range\
+	 * from fp-16 to fp+0x7fffffffffffffef, i.e. max value is unbounded.\
+	 */						\
+	r4 -= 16;					\
+	r4 += r10;					\
+	r5 = 8;						\
+	/* Dereference it indirectly. */		\
+	call %[bpf_getsockopt];				\
+l0_%=:	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_getsockopt),
+	  __imm_const(bpf_sock_ops_bytes_received, offsetof(struct bpf_sock_ops, bytes_received))
+	: __clobber_all);
+}
+
+SEC("lwt_in")
+__description("indirect variable-offset stack access, max out of bound")
+__failure __msg("invalid variable-offset read from stack R2")
+__naked void access_max_out_of_bound(void)
+{
+	asm volatile ("					\
+	/* Fill the top 8 bytes of the stack */		\
+	r2 = 0;						\
+	*(u64*)(r10 - 8) = r2;				\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned */		\
+	r2 &= 4;					\
+	r2 -= 8;					\
+	/* add it to fp.  We now have either fp-4 or fp-8, but\
+	 * we don't know which				\
+	 */						\
+	r2 += r10;					\
+	/* dereference it indirectly */			\
+	r1 = %[map_hash_8b] ll;				\
+	call %[bpf_map_lookup_elem];			\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_hash_8b)
+	: __clobber_all);
+}
+
+/* Similar to the test above, but this time check the special case of a
+ * zero-sized stack access. We used to have a bug causing crashes for zero-sized
+ * out-of-bounds accesses.
+ */
+SEC("socket")
+__description("indirect variable-offset stack access, zero-sized, max out of bound")
+__failure __msg("invalid variable-offset write to stack R1")
+__naked void zero_sized_access_max_out_of_bound(void)
+{
+	asm volatile ("                      \
+	r0 = 0;                              \
+	/* Fill some stack */                \
+	*(u64*)(r10 - 16) = r0;              \
+	*(u64*)(r10 - 8) = r0;               \
+	/* Get an unknown value */           \
+	r1 = *(u32*)(r1 + 0);                \
+	r1 &= 63;                            \
+	r1 += -16;                           \
+	/* r1 is now anywhere in [-16,48) */ \
+	r1 += r10;                           \
+	r2 = 0;                              \
+	r3 = 0;                              \
+	call %[bpf_probe_read_kernel];       \
+	exit;                                \
+"	:
+	: __imm(bpf_probe_read_kernel)
+	: __clobber_all);
+}
+
+SEC("lwt_in")
+__description("indirect variable-offset stack access, min out of bound")
+__load_if_no_large_stack()
+__failure __msg("invalid variable-offset read from stack R2")
+__naked void access_min_out_of_bound(void)
+{
+	asm volatile ("					\
+	/* Fill the top 8 bytes of the stack */		\
+	r2 = 0;						\
+	*(u64*)(r10 - 8) = r2;				\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned */		\
+	r2 &= 4;					\
+	r2 -= 516;					\
+	/* add it to fp.  We now have either fp-516 or fp-512, but\
+	 * we don't know which				\
+	 */						\
+	r2 += r10;					\
+	/* dereference it indirectly */			\
+	r1 = %[map_hash_8b] ll;				\
+	call %[bpf_map_lookup_elem];			\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_hash_8b)
+	: __clobber_all);
+}
+
+SEC("lwt_in")
+__description("indirect variable-offset stack access, min out of bound, large stack")
+__load_if_large_stack()
+__failure __msg("invalid variable-offset read from stack R2")
+__naked void access_min_out_of_bound_large(void)
+{
+	asm volatile ("					\
+	/* Fill the top 8 bytes of the stack */		\
+	r2 = 0;						\
+	*(u64*)(r10 - 8) = r2;				\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned */		\
+	r2 &= 4;					\
+	r2 -= 2052;					\
+	/*						\
+	 * add it to fp.  We now have either fp-2052 or fp-2048, but\
+	 * we don't know which				\
+	 */						\
+	r2 += r10;					\
+	/* dereference it indirectly */			\
+	r1 = %[map_hash_8b] ll;				\
+	call %[bpf_map_lookup_elem];			\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_hash_8b)
+	: __clobber_all);
+}
+
+SEC("cgroup/skb")
+__description("indirect variable-offset stack access, min_off < min_initialized")
+__success
+__failure_unpriv __msg_unpriv("R2 variable stack access prohibited for !root")
+__naked void access_min_off_min_initialized(void)
+{
+	asm volatile ("					\
+	/* Fill only the top 8 bytes of the stack. */	\
+	r2 = 0;						\
+	*(u64*)(r10 - 8) = r2;				\
+	/* Get an unknown value */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned. */		\
+	r2 &= 4;					\
+	r2 -= 16;					\
+	/* Add it to fp.  We now have either fp-12 or fp-16, but we don't know\
+	 * which. fp-16 size 8 is partially uninitialized stack.\
+	 */						\
+	r2 += r10;					\
+	/* Dereference it indirectly. */		\
+	r1 = %[map_hash_8b] ll;				\
+	call %[bpf_map_lookup_elem];			\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_hash_8b)
+	: __clobber_all);
+}
+
+SEC("cgroup/skb")
+__description("indirect variable-offset stack access, priv vs unpriv")
+__success __failure_unpriv
+__msg_unpriv("R2 variable stack access prohibited for !root")
+__retval(0)
+__naked void stack_access_priv_vs_unpriv(void)
+{
+	asm volatile ("					\
+	/* Fill the top 16 bytes of the stack. */	\
+	r2 = 0;						\
+	*(u64*)(r10 - 16) = r2;				\
+	r2 = 0;						\
+	*(u64*)(r10 - 8) = r2;				\
+	/* Get an unknown value. */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned. */		\
+	r2 &= 4;					\
+	r2 -= 16;					\
+	/* Add it to fp.  We now have either fp-12 or fp-16, we don't know\
+	 * which, but either way it points to initialized stack.\
+	 */						\
+	r2 += r10;					\
+	/* Dereference it indirectly. */		\
+	r1 = %[map_hash_8b] ll;				\
+	call %[bpf_map_lookup_elem];			\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_hash_8b)
+	: __clobber_all);
+}
+
+SEC("lwt_in")
+__description("indirect variable-offset stack access, ok")
+__success __retval(0)
+__naked void variable_offset_stack_access_ok(void)
+{
+	asm volatile ("					\
+	/* Fill the top 16 bytes of the stack. */	\
+	r2 = 0;						\
+	*(u64*)(r10 - 16) = r2;				\
+	r2 = 0;						\
+	*(u64*)(r10 - 8) = r2;				\
+	/* Get an unknown value. */			\
+	r2 = *(u32*)(r1 + 0);				\
+	/* Make it small and 4-byte aligned. */		\
+	r2 &= 4;					\
+	r2 -= 16;					\
+	/* Add it to fp.  We now have either fp-12 or fp-16, we don't know\
+	 * which, but either way it points to initialized stack.\
+	 */						\
+	r2 += r10;					\
+	/* Dereference it indirectly. */		\
+	r1 = %[map_hash_8b] ll;				\
+	call %[bpf_map_lookup_elem];			\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_hash_8b)
+	: __clobber_all);
+}
+
+/* The next two need bpf_jit_bypass_spec_v1() */
+SEC("socket")
+__description("variable-offset stack write of a pointer")
+__arch_loongarch
+__success __caps_unpriv(CAP_BPF) __failure_unpriv
+__msg_unpriv("R1 leaks addr into stack")
+__naked void stack_write_ptr_var_off(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	*(u64*)(r10 - 8) = r0;				\
+	*(u64*)(r10 - 16) = r0;				\
+	lock *(u64*)(r10 - 8) += r0;			\
+	lock *(u64*)(r10 - 16) += r0;			\
+	r2 = *(u32*)(r1 + 0);				\
+	r2 &= 8;					\
+	r2 -= 16;					\
+	r2 += r10;					\
+	*(u64*)(r2 + 0) = r1;				\
+	r0 = *(u64*)(r10 - 8);				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("socket")
+__description("variable-offset stack pointer at the header of a loop")
+__arch_loongarch
+__success __caps_unpriv(CAP_BPF) __success_unpriv
+__naked void stack_ptr_var_off_in_loop(void)
+{
+	asm volatile ("					\
+	r1 = 0;						\
+	*(u64*)(r10 - 8) = r1;				\
+	r2 = r10;					\
+	r2 += -8;					\
+1:	r0 = *(u8*)(r2 + 0);				\
+	r1 += 1;					\
+	r2 = r1;					\
+	r2 &= 7;					\
+	r2 -= 8;					\
+	r2 += r10;					\
+	if r1 < 0x10000000 goto 1b;			\
+	exit;						\
+"	::: __clobber_all);
+}
+
+char _license[] SEC("license") = "GPL";

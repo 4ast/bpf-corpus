@@ -1,0 +1,1 @@
+main: bpf/main.c | -D__TARGET_ARCH_x86 -D__x86_64__ -Ibpf -I../../include

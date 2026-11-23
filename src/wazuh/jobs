@@ -1,0 +1,1 @@
+modern: src/syscheckd/src/ebpf/src/modern.bpf.c | -D__TARGET_ARCH_x86 -D__x86_64__ -Isrc/syscheckd/src/ebpf/src -Isrc/syscheckd/src/ebpf -Isrc/syscheckd/src -Isrc/syscheckd -Isrc -I. -I../../include/vmlinux -I../../include

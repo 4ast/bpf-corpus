@@ -1,0 +1,16 @@
+--- a/ebpf/krie/constants.h
++++ b/ebpf/krie/constants.h
+@@ -20,7 +20,12 @@
+ 
+ #include "hooks/bpf_const.h"
+ 
+-#define LOAD_CONSTANT(param, var) asm("%0 = " param " ll" : "=r"(var))
++#ifdef CORPUS_CONST_ZERO
++#define LOAD_CONSTANT(param, var) asm("%0 = 0 ll" : "=r"(var))
++#else
++volatile unsigned long long corpus_unknown_const;
++#define LOAD_CONSTANT(param, var) (var = corpus_unknown_const)
++#endif
+ 
+ __attribute__((always_inline)) u64 get_raw_syscall_tracepoint_fallback() {
+     u64 raw_syscall_tracepoint_fallback;

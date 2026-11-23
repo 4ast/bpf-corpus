@@ -1,0 +1,8 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+hello-func: chapter3/hello-func.bpf.c | $F -Ichapter3 -I. -I../../include/vmlinux -I../../include
+chapter3-hello: chapter3/hello.bpf.c | $F -Ichapter3 -I. -I../../include/vmlinux -I../../include
+hello-buffer-config: chapter5/hello-buffer-config.bpf.c | $F -Ichapter5 -I. -I../../include/vmlinux -I../../include
+xdp: chapter5/xdp.bpf.c | $F -Ichapter5 -I. -I../../include/vmlinux -I../../include
+hello-verifier: chapter6/hello-verifier.bpf.c | $F -Ichapter6 -I. -I../../include/vmlinux -I../../include
+chapter8-hello: chapter8/hello.bpf.c | $F -Ichapter8 -I. -I../../include/vmlinux -I../../include

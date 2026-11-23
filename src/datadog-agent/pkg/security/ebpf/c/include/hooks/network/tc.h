@@ -1,0 +1,132 @@
+#ifndef _HOOKS_NETWORK_TC_H_
+#define _HOOKS_NETWORK_TC_H_
+
+#include "helpers/network/parser.h"
+#include "helpers/network/router.h"
+#include "helpers/network/pid_resolver.h"
+#include "raw.h"
+
+SEC("classifier/ingress")
+int classifier_ingress(struct __sk_buff *skb) {
+    struct packet_t *pkt = parse_packet(skb, INGRESS);
+    if (!pkt) {
+        return TC_ACT_UNSPEC;
+    }
+    resolve_pid(skb, pkt);
+
+    return route_pkt(skb, pkt, INGRESS);
+};
+
+SEC("classifier/egress")
+int classifier_egress(struct __sk_buff *skb) {
+    struct packet_t *pkt = parse_packet(skb, EGRESS);
+    if (!pkt) {
+        return TC_ACT_UNSPEC;
+    }
+    resolve_pid(skb, pkt);
+
+    return route_pkt(skb, pkt, EGRESS);
+};
+
+static __always_inline int prepare_raw_packet_event(struct __sk_buff *skb, struct packet_t *pkt) {
+    struct raw_packet_event_t *evt = get_raw_packet_event();
+    if (evt == NULL) {
+        // should never happen
+        return 0;
+    }
+
+    evt->process.pid = pkt->pid;
+    evt->cgroup.path_key.ino = pkt->cgroup_id;
+
+    u32 len = *(u32 *)(skb + offsetof(struct __sk_buff, len));
+    if (len > sizeof(evt->data)) {
+        len = sizeof(evt->data);
+    }
+
+    if (len > 1) {
+        if (bpf_skb_load_bytes(skb, 0, evt->data, len) < 0) {
+            return 0;
+        }
+        evt->len = skb->len;
+    } else {
+        evt->len = 0;
+    }
+
+    return 1;
+}
+
+static __always_inline int is_raw_packet_enabled() {
+    u32 key = 0;
+    u32 *enabled = bpf_map_lookup_elem(&raw_packet_enabled, &key);
+    return enabled && *enabled;
+}
+
+SEC("classifier/ingress")
+int classifier_raw_packet_ingress(struct __sk_buff *skb) {
+    if (!is_raw_packet_enabled()) {
+        return TC_ACT_UNSPEC;
+    }
+
+    struct packet_t *pkt = parse_packet(skb, INGRESS);
+    if (!pkt) {
+        return TC_ACT_UNSPEC;
+    }
+    resolve_pid(skb, pkt);
+
+    if (!is_raw_packet_allowed(pkt)) {
+        return TC_ACT_UNSPEC;
+    }
+
+    if (!prepare_raw_packet_event(skb, pkt)) {
+        return TC_ACT_UNSPEC;
+    }
+
+    tail_call_raw_packet_router(skb, RAW_PACKET_FILTER);
+
+    return TC_ACT_UNSPEC;
+};
+
+SEC("classifier/egress")
+int classifier_raw_packet_egress(struct __sk_buff *skb) {
+    if (!is_raw_packet_enabled()) {
+        return TC_ACT_UNSPEC;
+    }
+
+    struct packet_t *pkt = parse_packet(skb, EGRESS);
+    if (!pkt) {
+        // drop actions must not fail open on packets the parser doesn't handle (unknown L4 protocols,
+        // IPv6 extension headers, ...). Drop filters match on the raw packet data, so fall back on the
+        // partially parsed packet: the pid is resolved from the socket cookie or the current task.
+        pkt = get_packet();
+        if (!pkt) {
+            return TC_ACT_UNSPEC;
+        }
+        pkt->network_direction = EGRESS;
+    }
+    resolve_pid(skb, pkt);
+
+    if (pkt->pid) {
+        pkt->cgroup_id = get_cgroup_id(pkt->pid);
+    }
+
+    if (!prepare_raw_packet_event(skb, pkt)) {
+        return TC_ACT_UNSPEC;
+    }
+
+    // call the drop action
+    if (pkt->pid > 0 || pkt->cgroup_id > 0) {
+        tail_call_raw_packet_router(skb, RAW_PACKET_DROP_ACTION);
+    }
+
+    // mostly a rate limiter
+    if (!is_raw_packet_allowed(pkt)) {
+        return TC_ACT_UNSPEC;
+    }
+
+    // call regular filter
+    tail_call_raw_packet_router(skb, RAW_PACKET_FILTER);
+
+    return TC_ACT_UNSPEC;
+};
+
+#endif

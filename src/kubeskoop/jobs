@@ -1,0 +1,12 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Ibpf -I. -Ibpf/headers -I../../include
+
+flow: bpf/flow.c | $F
+kernellatency: bpf/kernellatency.c | $F
+netiftxlatency: bpf/netiftxlatency.c | $F
+packetloss: bpf/packetloss.c | $F
+socketlatency: bpf/socketlatency.c | $F
+softirq: bpf/softirq.c | $F
+tcpreset: bpf/tcpreset.c | $F
+tcpretrans: bpf/tcpretrans.c | $F
+tracebiolatency: bpf/tracebiolatency.c | $F
+virtcmdlatency: bpf/virtcmdlatency.c | $F

@@ -1,0 +1,9 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+F1 = $F -Ibpf/src/kernel_api -Ibpf/src -Ibpf -I. -I../../include/vmlinux -Ibpf/src/seabee -Ibpf/include -Itests/kmod_test -I../../include
+
+label_file: bpf/src/kernel_api/label_file.bpf.c | $F1
+label_maps: bpf/src/kernel_api/label_maps.bpf.c | $F1
+label_task: bpf/src/kernel_api/label_task.bpf.c | $F1
+test_tool: bpf/src/tests/test_tool.bpf.c | $F -Ibpf/src/tests -Ibpf/src -Ibpf -I. -I../../include/vmlinux -I../../include
+write_user: bpf/src/tests/write_user.bpf.c | $F -Ibpf/src/tests -Ibpf/src -Ibpf -I. -I../../include/vmlinux -I../../include
+seabee: bpf/src/seabee/seabee.bpf.c | $F -Ibpf/src/seabee -Ibpf/src -Ibpf -I. -I../../include/vmlinux -Ibpf/include -Itests/kmod_test -I../../include

@@ -1,0 +1,1 @@
+tracexec_system: crates/tracexec-backend-ebpf/src/tracexec_system.bpf.c | -D__TARGET_ARCH_x86 -D__x86_64__ -DTRACEXEC_TARGET_X86_64 -DMAX_CPUS=64 -Icrates/tracexec-backend-ebpf/src -Icrates/tracexec-backend-ebpf -Icrates/tracexec-backend-ebpf/include -Icrates/tracexec-backend-ebpf/include/x86 -I../../include

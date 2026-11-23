@@ -1,0 +1,7062 @@
+#include "vmlinux.h"
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/usdt.bpf.h>
+
+#ifdef SYSTING_PYSTACKS
+#include "common.h"
+#include "pystacks.bpf.h"
+#endif
+
+#include "systing_shared.bpf.h"
+/* --include-task-context: the whole BPF side of the feature is this header
+ * (src/task_context/bpf); this file only calls task_context_read_current(). */
+#include "task_context_reader.bpf.h"
+/* --include-go-context: the goroutine and label set of a Go program's sample
+ * (src/golang/bpf); this file only calls go_context_read_current(). */
+#include "go_context.bpf.h"
+
+/* Task state definitions (from task_struct->__state) */
+#define TASK_RUNNING		0x00000000
+#define TASK_INTERRUPTIBLE	0x00000001
+#define TASK_UNINTERRUPTIBLE	0x00000002
+
+/*
+ * Exit state definitions (from task_struct->exit_state, not __state).
+ * The kernel stores exit states in a separate field to avoid interference
+ * with the running/sleeping states. When recording task state for tracing,
+ * both fields must be ORed together (see __task_state_index in kernel).
+ */
+#define EXIT_DEAD		0x00000010  /* 'X' in ftrace format */
+#define EXIT_ZOMBIE		0x00000020  /* 'Z' in ftrace format */
+
+/* TASK_REPORT mask - valid task states for ftrace format (bits 0-6) */
+#define TASK_REPORT		0x0000007f
+
+/* Preemption flag in ftrace format */
+#define TASK_REPORT_MAX		0x00000100
+
+/* Address family constants (from linux/socket.h) */
+#define AF_INET 2
+#define AF_INET6 10
+
+/*
+ * Used specifically to make sure we don't accidentally record stats for a value
+ * we didn't catch at sched_waking time.
+ */
+#define TASK_WAKING 4567
+
+#define TASK_STATE_MASK 3
+
+/* PF_VCPU: the task is a hypervisor vCPU thread currently accounted as
+ * running its guest (set from guest_timing_enter_irqoff() until
+ * guest_timing_exit_irqoff(), which KVM deliberately runs only after the
+ * host has serviced the interrupt that forced the VM-exit). A sampling
+ * interrupt that lands while a CPU is executing guest code is handled in
+ * exactly that window. */
+#define PF_VCPU 0x00000001
+#define PF_WQ_WORKER 0x00000020
+#define PF_KTHREAD 0x00200000
+
+#define MAX_STACK_DEPTH 36
+/* Kernel-stack frames to skip on TRACEPOINT-attached captures, covering
+ * the BPF/tracing entry glue between the traced site and the program
+ * (bpf_trace_run*, __traceiter_*). The exact glue depth varies by
+ * kernel version, so some kernels leak residual glue frames past this
+ * skip; fold-side leaf handling owns that remainder. Perf-event
+ * sampling captures must NOT use this: there the walk starts at the
+ * sample's interrupted registers -- no glue exists, and a nonzero skip
+ * discards the interrupted IP plus real return addresses (every kernel
+ * "leaf" becomes its third-level caller).
+ */
+#define SKIP_STACK_DEPTH 3
+#define PERF_EVENT_SKIP_STACK_DEPTH 0
+/*
+ * Upper bound on rings per family. The live count is
+ * tool_config.nr_ringbufs (min(num_cpus, NR_RINGBUFS_MAX), or the
+ * --ringbuf-shards override), set by userspace before load; the outer
+ * ARRAY_OF_MAPS below are sized to it and populated from userspace after
+ * load. A compile-time 8 was the ceiling before: on a 192-CPU host that
+ * put 24 CPUs behind one ring, and __bpf_ringbuf_reserve takes the ring's
+ * spinlock before it checks for space, so a full ring is also a lock every
+ * producer on those CPUs spins on.
+ */
+#define NR_RINGBUFS_MAX 64
+
+/* Mirror of the kernel's struct bpf_stack_build_id (filled by bpf_get_stack
+ * under BPF_F_USER_BUILD_ID), with the offset/ip union flattened to one u64
+ * so the generated Rust type has no union member. status says which meaning
+ * the u64 carries: BPF_STACK_BUILD_ID_VALID = file offset (build_id is set),
+ * BPF_STACK_BUILD_ID_IP = raw instruction pointer (the kernel could not
+ * resolve the frame's VMA to a file with a build-id note, or could not walk
+ * safely in this context). */
+struct systing_stack_build_id {
+	s32 status;
+	u8 build_id[20];
+	u64 offset_or_ip;
+};
+_Static_assert(sizeof(struct systing_stack_build_id) ==
+		       sizeof(struct bpf_stack_build_id),
+	       "layout must match the kernel struct bpf_get_stack fills");
+
+#define SYS_ENTER_COOKIE 0xFFFFFFFFFFFFFFFEULL
+#define SYS_EXIT_COOKIE 0xFFFFFFFFFFFFFFFFULL
+
+const volatile struct {
+	u32 no_stack_traces;
+	u32 no_cpu_stack_traces;
+	u32 no_sleep_stack_traces;
+	u32 no_interruptible_stack_traces;
+	u32 num_perf_counters;
+	u32 num_cpus;
+	u32 my_tgid;
+	u64 my_dev;
+	u64 my_ino;
+	u32 collect_pystacks;
+	u32 collect_syscalls;
+	u32 confidentiality_mode;
+	u64 wakeup_data_size;  /* Ringbuf fill threshold for wakeup (0 = default) */
+	u32 marker_syscall_nr; /* Syscall number for marker events (0 = disabled) */
+	u32 collect_memory;    /* Memory recorder enabled */
+	u32 memory_fault_sample_rate; /* Sample 1 in N page faults (0 or 1 = all) */
+	u32 memory_alloc_sample_rate; /* Sample 1 in N malloc/free calls (0 or 1 = all) */
+	u32 memory_map_sample_rate; /* Sample 1 in N mmap/munmap/brk events (0 or 1 = all) */
+	u32 memory_vfio;            /* VFIO/IOMMU legs enabled (vfio_dma_do_* kprobes + iommu:map/unmap histogram) */
+	u32 memory_thp_sample_rate; /* Sample 1 in N THP split events (0 = leg off, 1 = all) */
+	u32 page_size;         /* sysconf(_SC_PAGESIZE) for page-count -> byte conversion */
+	/* Minimum absolute byte-drift before an rss_stat event is emitted.
+	 * Computed by userspace as max(16 MiB, 64 * nr_cpus * page_size). On the
+	 * tp_btf path (>=6.2), the emitted value is an approximate percpu_counter
+	 * read whose worst-case error is percpu_counter_batch * nr_cpus pages
+	 * (batch = max(32, 2*nr_cpus), so quadratic on many-core hosts). In
+	 * typical operation only a few CPUs hold unflushed drift for a given mm
+	 * and the error is far below threshold; in the pathological case a
+	 * spurious emit is harmless (absolute value, just noisier cadence).
+	 * 0 disables the threshold (emit every event, the pre-change behavior). */
+	u64 memory_rss_threshold_bytes;
+	u32 no_sched;          /* Sched recorder off: sched_switch still runs for
+				* cpu_running_pid and sleep stacks, but task_event
+				* emission is suppressed. */
+	u32 collect_build_id;  /* User stacks carry (build_id, file offset) pairs
+				* instead of raw IPs (BPF_F_USER_BUILD_ID), and
+				* stack_event reservations include the
+				* user_stack_bid tail. rodata: with the knob off
+				* the verifier prunes the build-id arms entirely,
+				* so the off configuration is instruction- and
+				* reservation-identical to before the knob
+				* existed. */
+	u32 no_irq;            /* IRQ recorder off: the irq/softirq programs are
+				* not loaded at all in that case, so this rodata
+				* gate is belt-and-braces (and lets the verifier
+				* prune the bodies if the programs ever get loaded
+				* for another reason). */
+	u32 nr_ringbufs;       /* Rings per family: events land in ring
+				* `cpu % nr_ringbufs`. Userspace sizes each outer
+				* ARRAY_OF_MAPS to this before load and creates +
+				* inserts the inner rings after load (one batch
+				* update per family). Rodata, so the modulo is by
+				* a constant the verifier can see; 0 is never
+				* loaded (userspace pins it >= 1). */
+	u32 packet_sample_rate; /* network-packets: keep 1 in N PACKETS of the
+				 * data-path event types (0 or 1 = every packet).
+				 * See packet_sample_keep(). */
+} tool_config = {};
+
+enum event_type {
+	SCHED_SWITCH,
+	SCHED_WAKING,
+	SCHED_WAKEUP_NEW,
+	SCHED_WAKEUP,
+	SCHED_SOFTIRQ_ENTER,
+	SCHED_SOFTIRQ_EXIT,
+	SCHED_IRQ_ENTER,
+	SCHED_IRQ_EXIT,
+	SCHED_PROCESS_EXIT,
+	/* sched_migrate_task: the task's CPU changed (wakeup placement away
+	 * from the CPU it last ran on, or a balancer/affinity move while
+	 * runnable). Appended last so the values above stay stable. */
+	SCHED_MIGRATE,
+};
+
+enum stack_event_type {
+	STACK_SLEEP_UNINTERRUPTIBLE,
+	STACK_RUNNING,
+	STACK_SLEEP_INTERRUPTIBLE,
+	/*
+	 * This value and up: a running stack taken by a hardware:/software:
+	 * trace event's sampler (systing_perf_event_sample), one value per
+	 * configured event in the order userspace numbered them; the
+	 * stack_sample_event table says which event each value is.
+	 */
+	STACK_PERF_EVENT_FIRST,
+};
+
+/*
+ * sched_switch is the largest event, for the smaller events we just use prev_*
+ * for the values, and things are left uninitialized.
+ */
+struct task_event {
+	enum event_type type;
+	u32 cpu;
+	u64 ts;
+	u64 prev_state;
+	u32 target_cpu;
+	u32 next_prio;
+	u32 prev_prio;
+	struct task_info prev;
+	struct task_info next;
+};
+
+enum arg_type {
+	ARG_NONE,
+	ARG_LONG,
+	ARG_STRING,
+	ARG_RETVAL,
+};
+
+struct arg_desc {
+	enum arg_type arg_type;
+	int arg_index;
+};
+
+#define MAX_ARGS 4
+#define ARG_VALUE_SIZE 24
+
+struct arg_value {
+	enum arg_type type;
+	u16 size;
+	u8 value[ARG_VALUE_SIZE];
+};
+
+struct probe_event {
+	u32 cpu;
+	u64 ts;
+	u64 cookie;
+	struct task_info task;
+	u8 num_args;
+	struct arg_value args[MAX_ARGS];
+};
+
+#define MAX_MARKER_NAME_LEN 64
+/* Sentinel value for faccessat2 mode argument that identifies a systing marker.
+ * Value: -975 (0xFFFFFC31 as u32). Chosen to be an invalid mode value that cannot
+ * arise from legitimate faccessat2 access-check bits (R_OK/W_OK/X_OK/F_OK).
+ *
+ * IMPORTANT: All comparisons against this constant must use (s32) rather than (s64).
+ * Language runtimes differ in how they widen a 32-bit mode value to a 64-bit register:
+ * C default-argument promotion sign-extends (giving 0xFFFFFFFFFFFFFC31), while other
+ * runtimes (Python ctypes, some JVM variants, etc.) zero-extend (0x00000000FFFFFC31).
+ * Both forms have identical lower 32 bits (0xFFFFFC31 = -975 as s32), so comparing
+ * as s32 correctly matches both calling conventions with a single comparison. */
+#define SYSTING_MARKER_MODE (-975)
+struct marker_event {
+	u64 ts;
+	u32 cpu;
+	u32 marker_type;   // 0=start, 1=end, 2=instant
+	struct task_info task;
+	u8 name[MAX_MARKER_NAME_LEN];
+	u64 info;          // from args[3] (flags param of faccessat2)
+};
+
+/* user_stack_format values: which entry format the user_stack region
+ * carries. The capture mode is fixed for a whole run (rodata), so the
+ * per-event flag is belt-and-braces — it makes every record
+ * self-describing for downstream readers. */
+#define USER_STACK_FORMAT_IP 0
+#define USER_STACK_FORMAT_BUILD_ID 1
+
+/* stack_event.sample_flags bits. */
+/* The sample interrupted a vCPU thread while it was running its guest
+ * (task->flags & PF_VCPU — the same test the kernel's own cputime code uses
+ * to bill a tick as guest time). The kernel returns EMPTY callchains for
+ * such samples by design (perf_callchain_kernel()/perf_callchain_user()
+ * bail out under perf_guest_state(), on x86 and arm64 alike), so the event
+ * arrives with no frames; the flag lets userspace account the sample as
+ * guest execution instead of discarding it. */
+#define SAMPLE_FLAG_IN_GUEST (1U << 0)
+
+struct stack_event {
+	enum stack_event_type stack_event_type;
+	/* Occupies what was alignment padding before `ts`: no other field
+	 * moves and the record does not grow. */
+	u32 sample_flags;
+	u64 ts;
+	u32 cpu;
+	u32 user_stack_format;
+	struct task_info task;
+	/* Entry counts of at most MAX_STACK_DEPTH, so 32 bits each: the two
+	 * lengths used to be 64-bit and now share their first 8 bytes, which
+	 * frees the second 8 for the sampled thread's task_context id (see
+	 * task_context_reader.bpf.h; 0 = none, and always 0 without
+	 * --include-task-context). No other field moves and the record does
+	 * not grow. */
+	u32 kernel_stack_length;
+	u32 user_stack_length;
+	u64 task_context_id;
+	/* The goroutine a Go program's thread was running, and the id of its
+	 * label set (see go_context.bpf.h; 0 = none, and always 0 without
+	 * --include-go-context). */
+	u64 go_goid;
+	u64 go_labels_id;
+	u64 kernel_stack[MAX_STACK_DEPTH];
+#ifdef SYSTING_PYSTACKS
+	struct pystacks_message py_msg_buffer;
+#endif
+	/* One region, tail by contract, sized for the larger (build-id) entry
+	 * format. Raw-IP mode packs u64 addresses from the region start and
+	 * uses less of it: reservations stop at
+	 * offsetof(user_stack) + MAX_STACK_DEPTH * sizeof(u64) — byte-for-byte
+	 * what the pre-build-id layout reserved — and userspace zero-extends
+	 * short records (the memory ring's variable-length pattern).
+	 * user_stack_format says how to parse; user_stack_length counts
+	 * entries of that format. */
+	struct systing_stack_build_id user_stack[MAX_STACK_DEPTH];
+};
+
+struct perf_counter_event {
+	u64 ts;
+	struct task_info task;
+	struct bpf_perf_event_value value;
+	u32 cpu;
+	u32 counter_num;
+};
+
+enum network_protocol {
+	NETWORK_TCP,
+	NETWORK_UDP,
+};
+
+enum network_operation {
+	NETWORK_SEND,
+	NETWORK_RECV,
+};
+
+enum network_address_family {
+	NETWORK_AF_INET,   // IPv4
+	NETWORK_AF_INET6,  // IPv6
+};
+
+struct network_event {
+	u64 start_ts;
+	u64 end_ts;
+	struct task_info task;
+	enum network_protocol protocol;
+	enum network_operation operation;
+	enum network_address_family af;  // Address family (IPv4 or IPv6)
+	u8 src_addr[16];   // Source/local IPv4 (first 4 bytes) or IPv6 (all 16 bytes)
+	u16 src_port;      // Source/local port in host byte order
+	u8 dest_addr[16];  // Dest/remote IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
+	u16 dest_port;     // Dest/remote port in host byte order
+	u32 bytes;
+	u32 sendmsg_seq;   // TCP sequence number at sendmsg time (TCP only)
+	u32 cpu;
+	u32 sndbuf_used;   // Bytes in send buffer after sendmsg (sk_wmem_queued)
+	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
+	u64 socket_id;     // Unique socket ID for correlation with packet events
+	u32 recv_seq_start;    // TCP copied_seq at recvmsg entry (TCP recv only)
+	u32 recv_seq_end;      // TCP copied_seq at recvmsg exit (TCP recv only)
+	u32 rcv_nxt_at_entry;  // TCP rcv_nxt at entry - kernel's next expected seq (TCP recv only)
+	u64 netns_inum;    // Inode of the socket's network namespace (sk->__sk_common.skc_net).
+	                   // Lets the fold attribute a flow to its owning netns (hence pod)
+	                   // directly, instead of inferring it from src_ip against the
+	                   // interface map — which cannot disambiguate loopback (every netns
+	                   // has 127.0.0.1). 0 when the sock pointer was unavailable.
+};
+
+enum packet_event_type {
+	PACKET_ENQUEUE,         // TCP -> device queue
+	PACKET_SEND,            // device queue -> NIC
+	PACKET_RCV_ESTABLISHED, // NIC -> TCP layer (tcp_rcv_established)
+	PACKET_QUEUE_RCV,       // TCP layer -> socket buffer (tcp_queue_rcv)
+	PACKET_BUFFER_QUEUE,    // socket buffer -> application read (buffer queue latency)
+	PACKET_UDP_SEND,        // UDP: udp_send_skb (UDP layer processing)
+	PACKET_UDP_RCV,         // UDP: udp_queue_rcv_one_skb (UDP receive processing)
+	PACKET_UDP_ENQUEUE,     // UDP: __udp_enqueue_schedule_skb (socket buffer enqueue)
+	PACKET_ZERO_WINDOW_PROBE, // TCP: Zero window probe sent (tcp_send_probe0)
+	PACKET_ZERO_WINDOW_ACK,   // TCP: Receiver advertising zero/low window (tcp_send_ack)
+	PACKET_RTO_TIMEOUT,       // TCP: RTO timer fired (tcp_retransmit_timer)
+	// New drop/throttle events (Phase 1-2)
+	PACKET_SKB_DROP,          // SKB dropped (kfree_skb tracepoint)
+	PACKET_CPU_BACKLOG_DROP,  // CPU backlog queue drop (enqueue_to_backlog)
+	PACKET_MEM_PRESSURE,      // TCP memory pressure (send buffer blocked)
+	// Qdisc tracing events (Phase 3)
+	PACKET_QDISC_ENQUEUE,     // Packet entered qdisc queue
+	PACKET_QDISC_DEQUEUE,     // Packet left qdisc queue
+	PACKET_TX_QUEUE_STOP,     // TX queue stopped by driver (NIC ring full)
+	PACKET_TX_QUEUE_WAKE,     // TX queue resumed by driver
+	PACKET_TCP_STATE_CHANGE,  // TCP socket state transition (inet_sock_set_state)
+};
+
+struct packet_event {
+	u64 ts;            // Instant event timestamp
+	enum network_protocol protocol;  // TCP or UDP
+	enum network_address_family af;  // Address family (IPv4 or IPv6)
+	u8 src_addr[16];   // Source/local IPv4 (first 4 bytes) or IPv6 (all 16 bytes)
+	u16 src_port;      // Source/local port in host byte order
+	u8 dest_addr[16];  // Dest/remote IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
+	u16 dest_port;     // Dest/remote port in host byte order
+	u32 seq;           // TCP sequence number at transmit time
+	u32 length;        // Packet length (calculated from end_seq - seq)
+	u8 tcp_flags;      // TCP flags (SYN, ACK, FIN, etc.)
+	enum packet_event_type event_type;  // Type of packet event (enqueue or send)
+	u32 cpu;
+	u32 sndbuf_used;   // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
+	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
+	u64 socket_id;     // Unique socket ID for correlation with network events
+	u64 netns_inum;    // Inode of the socket's network namespace (see network_event.netns_inum).
+	u8 is_retransmit;  // 1 if this packet is a TCP retransmit, 0 otherwise
+	u8 is_zero_window_probe;  // 1 if this is a zero window probe (sender-side)
+	u8 probe_count;           // Number of probes sent (icsk_probes_out)
+	u8 is_zero_window_ack;    // 1 if this is a zero window ACK (receiver-side)
+	u32 snd_wnd;              // Current send window (0 for zero window condition)
+	// Receiver-side fields (for PACKET_ZERO_WINDOW_ACK)
+	u32 rcv_wnd;              // Receiver's current advertised window
+	u32 rcv_buf_used;         // Receive buffer bytes used (sk_rmem_alloc)
+	u32 rcv_buf_limit;        // Receive buffer limit (sk_rcvbuf)
+	u32 window_clamp;         // Maximum window (tp->window_clamp)
+	u8 rcv_wscale;            // Receive window scale factor
+	u8 _padding[3];           // Alignment padding
+	// RTO-specific fields (for PACKET_RTO_TIMEOUT)
+	u32 rto_jiffies;          // Current RTO value in kernel jiffies (convert in userspace using HZ)
+	u32 srtt_us;              // Smoothed RTT in microseconds (tp->srtt_us >> 3)
+	u32 rttvar_us;            // RTT variance in microseconds (tp->rttvar_us, not shifted)
+	u8 retransmit_count;      // Number of consecutive RTO timeouts (icsk_retransmits + 1, see note)
+	u8 backoff;               // Exponential backoff multiplier (icsk_backoff)
+	// Persist timer fields (populated on TCP packet enqueue events)
+	u8 icsk_pending;          // What timer is pending: 0=none, 1=retrans, 2=delack, 3=probe/persist
+	u8 _persist_padding[5];   // Alignment padding for u64
+	u64 icsk_timeout;         // When timer fires (jiffies)
+	// Drop event fields (for PACKET_SKB_DROP, PACKET_CPU_BACKLOG_DROP, etc.)
+	u32 drop_reason;          // SKB_DROP_REASON_* code (from kfree_skb tracepoint)
+	u32 qlen;                 // Queue length at time of event (qdisc/backlog)
+	u32 qlen_limit;           // Queue limit (for backlog: netdev_max_backlog)
+	u64 drop_location;        // Kernel code address that dropped the packet
+	// TSQ/memory pressure fields
+	u32 sk_wmem_alloc;        // TCP Small Queue: current allocated memory
+	u32 tsq_limit;            // TCP Small Queue: limit that was exceeded
+	// Qdisc tracing fields (for PACKET_QDISC_* events)
+	u32 txq_state;            // TX queue state: XOFF (driver stopped), FROZEN, etc.
+	u32 qdisc_state;          // Qdisc state: MISSED, DRAINING, etc.
+	u32 qdisc_backlog;        // Bytes queued in qdisc
+	u64 skb_addr;             // SKB address for packet correlation
+	u32 qdisc_latency_us;     // Qdisc residence time in microseconds (dequeue only)
+	// TCP state change fields (for PACKET_TCP_STATE_CHANGE)
+	u8 old_state;             // Previous TCP state
+	u8 new_state;             // New TCP state
+};
+
+struct epoll_event_bpf {
+	u64 ts;
+	struct task_info task;
+	u64 socket_id;
+	u32 requested_events;
+	u32 returned_events;
+	u32 cpu;
+};
+
+enum memory_event_type {
+	MEMORY_RSS_STAT,      // kmem:rss_stat - per-mm RSS counter change
+	MEMORY_MMAP,          // sys_exit_mmap - new VM area
+	MEMORY_MUNMAP,        // sys_exit_munmap (success-gated) - VM area removed
+	MEMORY_BRK,           // sys_exit_brk - heap boundary change
+	MEMORY_PAGE_FAULT,    // exceptions:page_fault_user (x86) / perf sw page-faults (other arches) - demand fault (sampled)
+	MEMORY_MM_SAMPLE,     // periodic mm_struct snapshot (from perf_event_clock)
+	MEMORY_ALLOC,         // uretprobe malloc/calloc/realloc/... - heap object allocated
+	MEMORY_FREE,          // uprobe free - heap object released
+	MEMORY_THRASH_SAMPLE, // periodic per-task thrash counters (from perf_event_clock)
+	MEMORY_VFIO_MAP,      // kprobe vfio_dma_do_map - one VFIO DMA region mapped (iova, size, vaddr)
+	MEMORY_VFIO_UNMAP,    // kprobe vfio_dma_do_unmap - one VFIO DMA region unmapped (iova, size)
+	MEMORY_THP_SPLIT,     // kprobe __split_huge_pmd / kretprobe split_huge_page_to_list* - a THP split (sampled)
+};
+
+/* memory_event_header.member for MEMORY_THP_SPLIT: which split. */
+enum memory_thp_split_kind {
+	MEMORY_THP_SPLIT_PMD = 1,  /* __split_huge_pmd: a PMD mapping split into PTEs (thp_split_pmd) */
+	MEMORY_THP_SPLIT_PAGE = 2, /* split_huge_page_to_list[_to_order]: the folio itself split (thp_split_page / _failed) */
+};
+
+/* RSS stat member indices (mirrors include/linux/mm_types_task.h) */
+enum memory_rss_member {
+	MEMORY_MM_FILEPAGES,
+	MEMORY_MM_ANONPAGES,
+	MEMORY_MM_SWAPENTS,
+	MEMORY_MM_SHMEMPAGES,
+};
+
+/* memory_event_header.flags bits for MEMORY_RSS_STAT events. */
+/* The counter update was performed by a task outside the mm's thread
+ * group -- an external reclaimer (kswapd, khugepaged, another process in
+ * direct reclaim, a memory.reclaim / process_madvise writer) evicted or
+ * migrated this process's pages, rather than the process itself
+ * faulting, mapping, or unmapping. Never set on exit-flush residuals
+ * (those aggregate updates from both classes). */
+#define MEMORY_RSS_FLAG_EXTERNAL (1U << 0)
+
+/* memory_event_header.flags bit for MEMORY_THRASH_SAMPLE events: delayacct
+ * was enabled and task->delays was read, so zero-valued thrash counters mean
+ * "no thrash". Events without this bit mean the counters were unavailable
+ * (CONFIG_TASK_DELAY_ACCT off, delayacct not enabled, or delays not
+ * allocated for this task). */
+#define MEMORY_THRASH_FLAG_DELAYACCT (1U << 0)
+
+/* Sentinel for "no RSS read" in the map legs' old_addr rss-delta encoding
+ * (see the header field comments): S64_MIN can never be a real signed
+ * byte delta, so it marks rows where the enter- or exit-side resident-set
+ * read was unavailable and the recorder should emit NULL. */
+#define MEMORY_RSS_DELTA_ABSENT ((s64)0x8000000000000000)
+
+/* Allocator operation, stored in memory_event.member for MEMORY_ALLOC/FREE. */
+enum memory_alloc_op {
+	MEMORY_OP_MALLOC,
+	MEMORY_OP_CALLOC,
+	MEMORY_OP_REALLOC,
+	MEMORY_OP_POSIX_MEMALIGN,
+	MEMORY_OP_ALIGNED_ALLOC,
+	MEMORY_OP_FREE,
+};
+
+/*
+ * memory_event is split so the high-frequency stack-less types
+ * (RSS_STAT, MM_SAMPLE, THRASH_SAMPLE, FREE) reserve only the ~80-byte header
+ * instead of the full struct with stack arrays and pystacks buffer.
+ */
+struct memory_event_header {
+	enum memory_event_type type;
+	u64 ts;
+	u32 cpu;
+	struct task_info task;
+	u64 addr;          // mmap ret / munmap addr / fault addr / brk new / hiwater_rss / alloc ret / thrash maj_flt
+	u64 size;          // mmap len / munmap len / rss size (bytes) / total_vm (bytes) / alloc bytes / thrash stall count
+	u32 member;        // rss_stat: enum memory_rss_member; mmap: prot; alloc: enum memory_alloc_op
+	u32 flags;         // mmap: MAP_* flags; page_fault: x86 error_code (0 on other arches); rss_stat: MEMORY_RSS_FLAG_*
+	u64 old_addr;      // realloc: previous pointer / thrash stall delay ns / map legs: signed rss-delta bytes as two's-complement (MEMORY_RSS_DELTA_ABSENT = no read); else 0
+	u64 kernel_stack_length;
+	u64 user_stack_length;
+};
+
+struct memory_event {
+	struct memory_event_header hdr;
+	u64 kernel_stack[MAX_STACK_DEPTH];
+	u64 user_stack[MAX_STACK_DEPTH];
+#ifdef SYSTING_PYSTACKS
+	struct pystacks_message py_msg_buffer;
+#endif
+};
+
+/*
+ * Dummy instance to get skeleton to generate definition for
+ * `struct task_event`
+ */
+#ifdef SYSTING_PYSTACKS
+/*
+ * Notify userspace that a traced process exec'd or forked so it can update
+ * the pystacks discovery state. The handler in handle_exec_events() reads
+ * /proc/<pid>/{exe,maps}, so this only carries the pid and a flag describing
+ * what kernel event produced it (exec vs. fork) for logging/diagnostics.
+ */
+struct exec_event {
+	u32 pid;
+	/* 1 if produced by sched_process_fork (Python parent forked a new
+	 * process), 0 if produced by sched_process_exec. u32 (not u8/bool) so
+	 * the struct has no padding bytes -- bpf_ringbuf_reserve() does not
+	 * zero its allocation, so padding would leak uninitialized kernel
+	 * memory to userspace. */
+	u32 is_fork;
+};
+#endif
+
+struct task_event _event = {0};
+struct stack_event _stack_event = {0};
+struct perf_counter_event _perf_counter_event = {0};
+struct network_event _network_event = {0};
+struct packet_event _packet_event = {0};
+struct epoll_event_bpf _epoll_event = {0};
+struct task_info _task_info = {0};
+struct probe_event _uprobe_event = {0};
+struct marker_event _marker_event = {0};
+struct memory_event _memory_event = {0};
+struct memory_event_header _memory_event_header = {0};
+enum memory_event_type _memory_event_type = MEMORY_RSS_STAT;
+enum memory_rss_member _memory_rss_member = MEMORY_MM_FILEPAGES;
+enum memory_alloc_op _memory_alloc_op = MEMORY_OP_MALLOC;
+#ifdef SYSTING_PYSTACKS
+struct exec_event _exec_event = {0};
+#endif
+struct arg_desc _arg_desc = {0};
+enum event_type _type = SCHED_SWITCH;
+enum arg_type _arg_type = ARG_NONE;
+enum stack_event_type _stack_type = STACK_SLEEP_UNINTERRUPTIBLE;
+enum network_protocol _network_proto = NETWORK_TCP;
+enum network_operation _network_op = NETWORK_SEND;
+enum network_address_family _network_af = NETWORK_AF_INET;
+enum packet_event_type _packet_event_type = PACKET_ENQUEUE;
+bool tracing_enabled = true;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, 10240);
+} perf_counters SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u64);
+	__uint(max_entries, 10240);
+} irq_events SEC(".maps");
+
+struct arg_desc_array {
+	u8 num_args;
+	u8 pad[3];
+	struct arg_desc args[MAX_ARGS];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, struct arg_desc_array);
+	__uint(max_entries, 10240);
+} event_key_types SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u8);
+	__uint(max_entries, 10240);
+} event_stack_capture SEC(".maps");
+
+
+struct arg_desc_array _arg_desc_array = {0};
+
+struct network_send_info {
+	enum network_protocol protocol;
+	enum network_address_family af;
+	u8 src_addr[16];   // Source/local address
+	u16 src_port;      // Source/local port
+	u8 dest_addr[16];  // Dest/remote address
+	u16 dest_port;     // Dest/remote port
+	u64 start_ts;
+	u32 sendmsg_seq;  // Sequence number at sendmsg time
+	u64 sk_ptr;       // Socket pointer for reading buffer state on exit
+	u64 socket_id;    // Unique socket ID for correlation
+};
+
+// Tracks pending receive operations with peer address
+struct network_recv_info {
+	enum network_protocol protocol;
+	enum network_address_family af;
+	u8 src_addr[16];   // Source/local address (our side)
+	u16 src_port;      // Source/local port (our side)
+	u8 peer_addr[16];  // Peer/remote address (dest_addr from socket perspective)
+	u16 peer_port;     // Peer/remote port
+	u64 start_ts;
+	u64 sk_ptr;       // Socket pointer for buffer queue latency tracking
+	u64 socket_id;    // Unique socket ID for correlation
+	u32 recv_seq_start;    // TCP copied_seq at recvmsg entry (app read position)
+	u32 rcv_nxt_at_entry;  // TCP rcv_nxt at entry (kernel's next expected seq)
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // tgidpid
+	__type(value, struct network_send_info);
+	__uint(max_entries, 10240);
+} pending_network_sends SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // tgidpid
+	__type(value, struct network_recv_info);
+	__uint(max_entries, 10240);
+} pending_network_recvs SEC(".maps");
+
+struct epoll_poll_info {
+	u32 requested_events;
+	u64 socket_id;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // tgidpid
+	__type(value, struct epoll_poll_info);
+	__uint(max_entries, 10240);
+} pending_epoll_polls SEC(".maps");
+
+// Socket identity key - identifies a unique socket by full 4-tuple
+struct socket_identity_key {
+	u64 sk_ptr;           // struct sock * cast to u64
+	u8 src_addr[16];      // Source/local address (IPv4 in first 4 bytes)
+	u16 src_port;         // Source/local port
+	u8 dest_addr[16];     // Destination/remote address (IPv4 in first 4 bytes)
+	u16 dest_port;        // Destination/remote port
+};
+
+// Socket metadata stored in map, readable by userspace after tracing
+struct socket_metadata {
+	u64 socket_id;                    // Unique socket ID
+	enum network_protocol protocol;   // TCP or UDP
+	enum network_address_family af;   // IPv4 or IPv6
+	u8 src_addr[16];                  // Source/local address
+	u16 src_port;                     // Source/local port
+	u8 dest_addr[16];                 // Destination/remote address
+	u16 dest_port;                    // Destination/remote port
+};
+
+// Atomic counter for generating unique socket IDs (single-entry array)
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, 1);
+} socket_id_counter SEC(".maps");
+
+// Maps socket identity to metadata
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct socket_identity_key);
+	__type(value, struct socket_metadata);
+	__uint(max_entries, 10240);
+} socket_metadata_map SEC(".maps");
+
+// Maps sk_ptr directly to socket_id for fast fd-based lookups
+// Used by marker events to resolve fd -> socket_id
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);   // sk_ptr (struct sock * cast to u64)
+	__type(value, u64); // socket_id
+	__uint(max_entries, 10240);
+} sk_socket_id_map SEC(".maps");
+
+// Maps inet_timewait_sock pointer to socket_id for TIME_WAIT lifecycle tracking.
+// Populated in inet_twsk_hashdance_schedule, consumed in inet_twsk_deschedule_put.
+// Separate from sk_socket_id_map to avoid competing for entries with regular sockets,
+// since TIME_WAIT sockets accumulate over 60s and can be numerous.
+// Capacity: 65536 handles ~1000 connections/sec over the 60s TIME_WAIT window.
+// When full, new tw sockets silently lose TIME_WAIT->CLOSE tracking (graceful degradation).
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);   // tw sock pointer (struct inet_timewait_sock * cast to u64)
+	__type(value, u64); // socket_id
+	__uint(max_entries, 65536);
+} tw_socket_id_map SEC(".maps");
+
+// Per-CPU flag to detect when inet_sock_set_state fires inside tcp_time_wait().
+// Used to rewrite the CLOSE transition to TIME_WAIT for correct lifecycle reporting.
+struct tw_pending_info {
+	u64 sk_ptr;       // original sk pointer for verification
+	u64 socket_id;    // socket_id from sk_socket_id_map
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct tw_pending_info);
+	__uint(max_entries, 1);
+} pending_tw SEC(".maps");
+
+#define MISSED_SCHED_EVENT 0
+#define MISSED_STACK_EVENT 1
+#define MISSED_PROBE_EVENT 2
+#define MISSED_CACHE_EVENT 3
+#define MISSED_NETWORK_EVENT 4
+#define MISSED_PACKET_EVENT 5
+#define MISSED_EPOLL_EVENT 6
+#define MISSED_MARKER_EVENT 7
+#define MISSED_MEMORY_EVENT 8
+/* Not a lost event: a memory syscall exit that found the thread's scratch
+ * entry written by a DIFFERENT leg (an mmap/munmap enter whose exit never
+ * ran) and dropped it instead of pairing with it -- see
+ * memory_syscall_leg below. Counted so the rate is visible in the trace. */
+#define MISSED_MEMORY_XLEG_EVENT 9
+/* MISSED_PYTHON_FUNCTION_EVENT and MISSED_EVENT_MAX: systing_shared.bpf.h */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, MISSED_EVENT_MAX);
+} missed_events SEC(".maps");
+
+/* read_counters() keeps each counter's last value here, by counter index,
+ * to turn the running count into a per-tick delta. MAX_PERF_COUNTERS is
+ * the most counters a capture may configure; userspace refuses more. */
+#define MAX_PERF_COUNTERS 64
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, MAX_PERF_COUNTERS);
+} last_perf_counter_value SEC(".maps");
+
+/*
+ * Track the currently running task's PID on each CPU.
+ * Updated by sched_switch, checked by perf_event to detect
+ * when a sample is captured during a context switch.
+ * Using per-CPU array avoids cache line contention.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, 1);
+} cpu_running_pid SEC(".maps");
+
+/*
+ * Inner-ring TEMPLATES for the eight per-CPU-sharded ring families. These
+ * types are only the `__array(values, ...)` template of each outer
+ * ARRAY_OF_MAPS below: libbpf creates one transient map from the template
+ * to obtain the outer's inner_map_fd and destroys it again. The rings the
+ * programs actually write are created by userspace after load, at the size
+ * it chose (--ringbuf-size-mib, split across tool_config.nr_ringbufs rings
+ * on hosts with more than eight CPUs), and inserted into the outer map in
+ * one batch. The kernel's inner-map compatibility check for ringbufs
+ * (bpf_map_meta_equal) compares type, key/value size and flags, not
+ * max_entries, so the template size is free; 64 KiB is a legal ring on
+ * every page size we run (power of two, page aligned).
+ */
+#define RINGBUF_TEMPLATE_BYTES (64 * 1024)
+
+struct ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct python_function_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct stack_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct probe_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct perf_counter_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct network_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct packet_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct epoll_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct memory_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+#ifdef SYSTING_PYSTACKS
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	/*
+	 * 16KB. Carries both exec events and Python-process-fork events, both
+	 * tiny (~16 bytes with ringbuf header). Pre-fork servers and
+	 * multiprocessing pools can fork in bursts; if a reservation does
+	 * fail, the BPF maps are already correct (fork propagation happens
+	 * before the ringbuf write) and only the userspace pid->version hint
+	 * is missed.
+	 */
+	__uint(max_entries, 16384);
+} ringbuf_exec_events SEC(".maps");
+#endif
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024 /* 256KB */);
+} ringbuf_marker SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct ringbuf_map);
+} ringbufs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct stack_ringbuf_map);
+} stack_ringbufs SEC(".maps");
+
+/* Written only by the python-function-trace recorder's object, which reuses it
+ * (src/bpf/python_function_trace.bpf.c); no program here refers to it. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct python_function_ringbuf_map);
+} python_function_ringbufs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct perf_counter_ringbuf_map);
+} perf_counter_ringbufs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct probe_ringbuf_map);
+} probe_ringbufs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct network_ringbuf_map);
+} network_ringbufs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct packet_ringbuf_map);
+} packet_ringbufs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct epoll_ringbuf_map);
+} epoll_ringbufs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct memory_ringbuf_map);
+} memory_ringbufs SEC(".maps");
+
+/* Which leg wrote a memory_syscall_scratch entry. The three legs share the
+ * map (one entry per thread, keyed by tgidpid), and an entry outlives its
+ * syscall whenever an enter ran without its exit: the attach window at
+ * capture start is the known source -- the enter and exit programs of a
+ * leg attach one after the other, and a syscall that enters after the
+ * enter program is live and exits before the exit program is leaves its
+ * entry behind (the attach order in systing_core.rs now puts each exit
+ * before its enter to close that window; this tag catches any other
+ * source). Untagged, a stale munmap entry was read by the thread's next
+ * brk exit as the previous break: `ret - saved->addr` with `addr` the
+ * unmapped address recorded page-aligned negative brk deltas of 13-46 TB
+ * (the mmap region minus the PIE heap) on real hosts -- rare, a handful of
+ * rows a week across thousands of hosts, each under an ordinary glibc
+ * systrim stack. An exit that finds another leg's entry drops it and
+ * counts MISSED_MEMORY_XLEG_EVENT. */
+enum memory_syscall_leg {
+	MEMORY_SYSCALL_LEG_NONE = 0,
+	MEMORY_SYSCALL_LEG_MMAP = 1,
+	MEMORY_SYSCALL_LEG_MUNMAP = 2,
+	MEMORY_SYSCALL_LEG_BRK = 3,
+};
+
+/* Per-thread scratch map for pairing mmap/munmap/brk enter→exit. */
+struct memory_syscall_args {
+	u64 addr;
+	u64 size;
+	u32 prot;
+	u32 flags;
+	/* The leg whose enter wrote this entry (enum memory_syscall_leg);
+	 * an exit of another leg drops the entry instead of pairing. */
+	u32 leg;
+	u32 pad;
+	/* munmap only: the process's total mapped size in bytes at enter,
+	 * used to bound the recorded unmap size. munmap's length argument is
+	 * the REQUESTED range, not the amount actually unmapped -- the kernel
+	 * removes whatever is mapped in [addr, addr+len) and returns 0 even
+	 * where nothing is mapped -- so callers that request oversized ranges
+	 * of a sparse address space (gVisor sentries were observed requesting
+	 * far more than the whole process has mapped) recorded impossible
+	 * sizes. No single munmap can remove more than the process has mapped
+	 * in total; this is that upper bound (looser than the exact in-range
+	 * mapped bytes, but enough to drop the impossible values). */
+	u64 vm_limit;
+	/* All map legs: the mm's resident-set bytes at syscall enter
+	 * (file + anon + shmem, the same approximate percpu-counter read
+	 * the rss_stat handler uses), so the success-gated exit can emit
+	 * the signed RSS delta the call actually caused -- pages committed
+	 * or freed, not the VA range the arguments named. The VA number
+	 * misrepresents reality on both sides: mmap commits nothing (faults
+	 * do), and munmap frees only what was resident in range. -1 = read
+	 * unavailable at enter; the exit then emits the delta as absent. */
+	s64 enter_rss;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, u64);   // tgidpid
+	__type(value, struct memory_syscall_args);
+} memory_syscall_scratch SEC(".maps");
+
+/* Per-CPU counter for page-fault sampling (x86 tracepoint path only; on other
+ * arches the perf software event samples kernel-side via sample_period). */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_fault_counter SEC(".maps");
+
+/* ---- VFIO / IOMMU legs ----
+ *
+ * Two things the memory recorder records about device DMA mappings when
+ * tool_config.memory_vfio is set:
+ *
+ * 1. The VFIO DMA regions themselves (MEMORY_VFIO_MAP / MEMORY_VFIO_UNMAP
+ *    events with stacks), from kprobes on the vfio_iommu_type1 ioctl
+ *    handlers vfio_dma_do_map / vfio_dma_do_unmap — one event per region, so
+ *    the ring sees tens to thousands of events per model load.
+ *
+ * 2. How fragmented the memory behind those regions is. vfio_iommu_type1
+ *    pins a DMA region one physically contiguous run at a time
+ *    (vfio_pin_pages_remote extends the run while pfns stay contiguous) and
+ *    maps each run with ONE iommu_map() call, and vfio_unmap_unpin unmaps
+ *    by "the largest contiguous physical memory chunk"; iommu_map/unmap fire
+ *    the iommu:map / iommu:unmap tracepoints once per call with that run's
+ *    size. So the size of each tracepoint event IS the contiguity of the
+ *    backing memory: a THP-backed region maps in >=2 MiB runs, a
+ *    4 KiB-fragmented one in 4 KiB runs. A 146 GiB region backed by 4 KiB
+ *    pages is ~38M events, far beyond any ring budget, so the tracepoints
+ *    never emit events — they count into this histogram, keyed by the
+ *    mapping process, the operation and log2(size), drained by userspace
+ *    at the end of the capture into memory_iommu rows — and only while the
+ *    current task is inside a vfio_dma_do_map/unmap ioctl, for runs inside
+ *    that region (memory_vfio_inflight): the tracepoints are host-wide
+ *    DMA-API paths, and every other iommu_map() costs one hash miss.
+ *
+ * Writers are the iommu tracepoint programs, which run in whatever context
+ * calls the DMA API — the vfio ioctl path this histogram counts is task
+ * context, but a driver mapping under a softirq fires the same tracepoint
+ * (and is dropped at the memory_vfio_inflight miss). A plain preallocated
+ * HASH is safe from any of them: the bucket lock is a raw spinlock taken
+ * with interrupts disabled (htab_lock_bucket), so writers on one CPU cannot
+ * interleave, and the one context that could still re-enter a held bucket,
+ * an NMI, is the perf_event sampler's, which never writes this map (a
+ * re-entering update is refused with -EBUSY rather than deadlocking).
+ */
+struct memory_iommu_key {
+	u32 tgid;
+	u32 op;       /* 1 = map, 2 = unmap */
+	u32 iova_gib; /* iova >> 30: which GiB of the IOVA space the run sits in */
+	u32 order;    /* log2 of the run size in bytes (12 = 4 KiB, 21 = 2 MiB, 30 = 1 GiB) */
+};
+
+struct memory_iommu_value {
+	u64 count;
+	u64 bytes;
+};
+
+/* Keyed per process AND per GiB of IOVA so the rows say where in the
+ * device's address space the fragmentation sits, not only how much. Bound:
+ * a 150 GiB arena touches ~150 IOVA GiBs x 19 size orders (4 KiB..1 GiB) x 2
+ * ops = 5.7K entries per process, so 131072 preallocated entries hold ~23
+ * such processes; an update that finds the map full is counted in
+ * memory_iommu_overflow and dropped (the histogram is then a floor). */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 131072);
+	__type(key, struct memory_iommu_key);
+	__type(value, struct memory_iommu_value);
+} memory_iommu_hist SEC(".maps");
+
+/* Per-CPU count of histogram updates dropped because the map was full. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_iommu_overflow SEC(".maps");
+
+/* The DMA region a traced task is mapping or unmapping RIGHT NOW, keyed by
+ * tgidpid: set by the vfio_dma_do_* kprobes, cleared by their kretprobes.
+ * The iommu tracepoints are host-wide DMA-API paths (every NIC/NVMe
+ * dma_map on an IOMMU-translated host, softirq/IRQ context included), so
+ * the tracepoint programs consult this map FIRST and count only runs that
+ * fall inside the region the current task is mapping through VFIO: every
+ * other iommu_map() on the host costs one lookup miss in a small
+ * preallocated hash and touches nothing else, and the histogram is VFIO's
+ * by construction. An IRQ landing on a CPU whose task is inside the ioctl
+ * would be counted only if its iova fell inside that region's range. */
+struct memory_vfio_inflight {
+	u64 iova;
+	u64 size;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u64); /* tgidpid */
+	__type(value, struct memory_vfio_inflight);
+} memory_vfio_inflight SEC(".maps");
+
+/* Per-CPU counter for THP split sampling (1 in N, like the fault leg). */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_thp_counter SEC(".maps");
+
+struct memory_iommu_key _memory_iommu_key = {0};
+struct memory_iommu_value _memory_iommu_value = {0};
+enum memory_thp_split_kind _memory_thp_split_kind = MEMORY_THP_SPLIT_PMD;
+
+/* Per-CPU sampling counters for mmap/munmap/brk. One per syscall type:
+ * a shared counter would correlate the three event streams, so a
+ * workload with a periodic mmap/munmap pair could alias the modulo and
+ * sample one type near-exclusively while starving the other. Per-type
+ * counters make each stream an independent 1:N sample. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_mmap_sample_counter SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_munmap_sample_counter SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_brk_sample_counter SEC(".maps");
+
+/* Per-process rss_stat emission state. Keyed by tgid (not tgidpid): the
+ * kernel's mm->rss_stat counters are per-mm, shared across all threads in a
+ * thread group, so a per-thread key would redundantly track the same value
+ * from every thread that happens to fault. last_emitted/latest_seen are
+ * absolute byte values per member (MM_FILEPAGES..MM_SHMEMPAGES); -1 marks
+ * "never seen". */
+struct rss_stat_state {
+	s64 last_emitted[NR_MM_COUNTERS];
+	s64 latest_seen[NR_MM_COUNTERS];
+};
+
+/* handle_rss_stat() re-bounds its member index with a mask at the point of
+ * use (see the comment there); a mask is only an exact bound when the array
+ * length is a non-zero power of two. */
+_Static_assert(NR_MM_COUNTERS > 0 &&
+		       (NR_MM_COUNTERS & (NR_MM_COUNTERS - 1)) == 0,
+	       "NR_MM_COUNTERS must be a power of two for the rss_stat index mask");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	/* Bounds concurrent TRACED processes (tgids), not threads or events.
+	 * 65536 matches memory_syscall_scratch and is comfortably above the
+	 * ~20k-task ceiling observed on the busiest CI clusters; on overflow
+	 * the rss_stat progs fall through to direct-submit so no sample is
+	 * ever dropped, only the threshold-batching optimization is lost for
+	 * the overflow tgids. */
+	__uint(max_entries, 65536);
+	__type(key, u32);   // tgid
+	__type(value, struct rss_stat_state);
+} rss_stat_last SEC(".maps");
+
+/* Per-thread scratch for pairing allocator uprobe enter→uretprobe exit.
+ * Separate from memory_syscall_scratch so a malloc that internally calls
+ * mmap does not clobber its own saved size. */
+struct memory_alloc_args {
+	u64 size;
+	u64 old_addr;  /* realloc: ptr; posix_memalign: &memptr */
+	/* User stack captured at the entry uprobe. The uretprobe trampoline
+	 * overwrites the caller's return address, so bpf_get_stack() at exit
+	 * produces a truncated/junk stack. */
+	u64 user_stack_length;
+	u64 user_stack[MAX_STACK_DEPTH];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	/* 16384 * ~312 B ≈ 5 MB; keys are per-thread so this bounds concurrent
+	 * threads mid-malloc, not total allocs. */
+	__uint(max_entries, 16384);
+	__type(key, u64);   // tgidpid
+	__type(value, struct memory_alloc_args);
+} memory_alloc_scratch SEC(".maps");
+
+/* Per-CPU scratch for building memory_alloc_args (too large for BPF stack). */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct memory_alloc_args);
+} memory_alloc_args_tmp SEC(".maps");
+
+/* Per-CPU counter for allocator sampling. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_alloc_counter SEC(".maps");
+
+/* Per-CPU enter/exit counters for allocator uprobes, to quantify uretprobe
+ * loss (entry fires but the kernel drops the return probe under load). */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_alloc_enter_count SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_alloc_exit_count SEC(".maps");
+
+static __always_inline void memory_alloc_count(void *map)
+{
+	u32 zero = 0;
+	u64 *cnt = bpf_map_lookup_elem(map, &zero);
+	if (cnt)
+		*cnt += 1;
+}
+
+// Generate new socket ID atomically
+// Returns socket IDs starting from 1 (0 indicates failure)
+static __always_inline u64 generate_socket_id(void)
+{
+	u32 key = 0;
+	u64 *counter = bpf_map_lookup_elem(&socket_id_counter, &key);
+	if (!counter)
+		return 0;
+	return __sync_fetch_and_add(counter, 1) + 1;  // Start from 1, not 0
+}
+
+// Get or create socket ID for socket with full 4-tuple
+// Returns 0 if socket metadata cannot be created
+static __always_inline u64 get_or_create_socket_id(
+	struct sock *sk,
+	enum network_protocol protocol,
+	enum network_address_family af,
+	u8 *src_addr,
+	u16 src_port,
+	u8 *dest_addr,
+	u16 dest_port,
+	u64 tgidpid)
+{
+	struct socket_identity_key identity_key = {0};
+	struct socket_metadata *existing;
+	struct socket_metadata metadata = {0};
+
+	identity_key.sk_ptr = (u64)sk;
+	__builtin_memcpy(identity_key.src_addr, src_addr, 16);
+	identity_key.src_port = src_port;
+	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
+	identity_key.dest_port = dest_port;
+
+	// Check if we already have metadata for this socket
+	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
+	if (existing) {
+		// Seed the sk-keyed map on the hit path too: a socket that
+		// merges into a persistent tuple entry (client port reuse
+		// within the capture) must still resolve sk-first at its
+		// terminal transitions, or its close falls back to the
+		// anonymous degraded-tuple identity. Guarded on a bound
+		// src_port — seeding from a port-less connect-start hit
+		// would pin the socket to a shared per-destination port-0
+		// entry for its whole lifecycle.
+		if (src_port != 0) {
+			u64 sk_ptr = (u64)sk;
+			bpf_map_update_elem(&sk_socket_id_map, &sk_ptr,
+					    &existing->socket_id, BPF_ANY);
+		}
+		return existing->socket_id;
+	}
+
+	// Create new socket metadata
+	metadata.socket_id = generate_socket_id();
+	if (metadata.socket_id == 0)
+		return 0;  // Counter lookup failed
+
+	metadata.protocol = protocol;
+	metadata.af = af;
+	__builtin_memcpy(metadata.src_addr, src_addr, 16);
+	metadata.src_port = src_port;
+	__builtin_memcpy(metadata.dest_addr, dest_addr, 16);
+	metadata.dest_port = dest_port;
+
+	bpf_map_update_elem(&socket_metadata_map, &identity_key, &metadata, BPF_NOEXIST);
+
+	// Re-lookup in case of race condition (another CPU inserted first)
+	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
+	u64 socket_id = existing ? existing->socket_id : 0;
+
+	// Also update sk_socket_id_map for fast fd-based lookups
+	// This maps sk_ptr -> socket_id directly (without needing addr info)
+	if (socket_id) {
+		u64 sk_ptr = (u64)sk;
+		bpf_map_update_elem(&sk_socket_id_map, &sk_ptr, &socket_id, BPF_ANY);
+	}
+
+	return socket_id;
+}
+
+// Lookup socket ID for an existing socket with full 4-tuple
+// Returns 0 if not found
+static __always_inline u64 lookup_socket_id(
+	struct sock *sk,
+	u8 *src_addr,
+	u16 src_port,
+	u8 *dest_addr,
+	u16 dest_port)
+{
+	struct socket_identity_key identity_key = {0};
+	struct socket_metadata *existing;
+
+	identity_key.sk_ptr = (u64)sk;
+	__builtin_memcpy(identity_key.src_addr, src_addr, 16);
+	identity_key.src_port = src_port;
+	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
+	identity_key.dest_port = dest_port;
+
+	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
+	return existing ? existing->socket_id : 0;
+}
+
+// Lookup socket_id from a file descriptor by walking the task's fd table
+// Returns 0 if fd is not a socket or socket_id is not found
+//
+// Walk: task->files->fdt->fd[fd] -> file -> private_data -> socket -> sk
+// Then lookup sk_ptr in sk_socket_id_map
+static __always_inline u64 lookup_socket_id_from_fd(struct task_struct *task, u32 fd)
+{
+	struct files_struct *files;
+	struct fdtable *fdt;
+	struct file *file;
+	struct file **fd_array;
+	void *private_data;
+	struct socket *socket;
+	struct sock *sk;
+	u64 sk_ptr;
+	u64 *socket_id;
+
+	// Read task->files
+	files = BPF_CORE_READ(task, files);
+	if (!files)
+		return 0;
+
+	// Read files->fdt
+	fdt = BPF_CORE_READ(files, fdt);
+	if (!fdt)
+		return 0;
+
+	// Check fd is within bounds
+	u32 max_fds = BPF_CORE_READ(fdt, max_fds);
+	if (fd >= max_fds)
+		return 0;
+
+	// Read fdt->fd (the file descriptor array)
+	fd_array = BPF_CORE_READ(fdt, fd);
+	if (!fd_array)
+		return 0;
+
+	// Read file pointer from fd array
+	bpf_probe_read_kernel(&file, sizeof(file), &fd_array[fd]);
+	if (!file)
+		return 0;
+
+	// Read file->private_data (this is struct socket* for socket files)
+	// Note: We can't easily verify f_op == &socket_file_ops in BPF,
+	// but if private_data contains a valid socket, we can verify by
+	// checking the socket->sk pointer is valid
+	private_data = BPF_CORE_READ(file, private_data);
+	if (!private_data)
+		return 0;
+
+	// Treat private_data as struct socket*
+	socket = (struct socket *)private_data;
+
+	// Read socket->sk
+	sk = BPF_CORE_READ(socket, sk);
+	if (!sk)
+		return 0;
+
+	// Lookup sk_ptr in sk_socket_id_map
+	sk_ptr = (u64)sk;
+	socket_id = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!socket_id)
+		return 0;
+
+	return *socket_id;
+}
+
+/*
+ * Helper to determine wakeup flags based on ringbuf fill level.
+ * Uses the kernel's recommended pattern from ringbuf_bench.c
+ */
+static __always_inline long get_ringbuf_flags(void *rb)
+{
+	long sz;
+
+	if (!tool_config.wakeup_data_size)
+		return 0;
+
+	sz = bpf_ringbuf_query(rb, BPF_RB_AVAIL_DATA);
+	return sz >= tool_config.wakeup_data_size ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
+}
+
+static struct task_event *reserve_task_event(long *flags)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	struct task_event *event = bpf_ringbuf_reserve(rb, sizeof(struct task_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+static struct stack_event *reserve_stack_event(long *flags)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&stack_ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	/*
+	 * Two reservation sizes over ONE user_stack region: raw-IP mode packs
+	 * u64s and reserves only the bytes it uses — byte-for-byte what the
+	 * pre-build-id layout reserved — while build-id mode reserves the full
+	 * region for the 32-byte entries. collect_build_id is rodata, so the
+	 * verifier prunes the dead branch at load time. Userspace zero-extends
+	 * short records (see create_ring_zero_extend), the same contract as
+	 * the memory ring.
+	 */
+	struct stack_event *event;
+	if (tool_config.collect_build_id)
+		event = bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
+	else
+		event = bpf_ringbuf_reserve(
+			rb,
+			offsetof(struct stack_event, user_stack) +
+				MAX_STACK_DEPTH * sizeof(u64),
+			0);
+	if (event) {
+		/*
+		 * When SYSTING_PYSTACKS is enabled, stack_event includes a large
+		 * pystacks_message buffer (~1KB). Zero only the base fields to avoid
+		 * emitting a memset call that BPF doesn't support for large sizes.
+		 * The py_msg_buffer is populated by pystacks_read_stacks() and doesn't
+		 * need pre-zeroing. The user_stack region is bounded by
+		 * user_stack_length, so it needs no pre-zeroing either.
+		 */
+#ifdef SYSTING_PYSTACKS
+		__builtin_memset(event, 0, offsetof(struct stack_event, py_msg_buffer));
+#else
+		__builtin_memset(event, 0, offsetof(struct stack_event, user_stack));
+#endif
+	}
+	return event;
+}
+
+static struct perf_counter_event *reserve_perf_counter_event(long *flags)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&perf_counter_ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	struct perf_counter_event *event = bpf_ringbuf_reserve(rb, sizeof(struct perf_counter_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+static struct probe_event *reserve_probe_event(long *flags)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&probe_ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	struct probe_event *event = bpf_ringbuf_reserve(rb, sizeof(struct probe_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+static struct network_event *reserve_network_event(long *flags)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&network_ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	struct network_event *event = bpf_ringbuf_reserve(rb, sizeof(struct network_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+static struct packet_event *reserve_packet_event(long *flags)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&packet_ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	struct packet_event *event = bpf_ringbuf_reserve(rb, sizeof(struct packet_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+/*
+ * --packet-sample-rate N: keep 1 in N PACKETS of the network-packets
+ * recorder's data-path event types (PACKET_ENQUEUE / SEND / RCV_ESTABLISHED
+ * / QUEUE_RCV / BUFFER_QUEUE, the UDP send / rcv / enqueue triple and the
+ * qdisc pair). The decision is a pure function of the socket and the
+ * packet's own key - the TCP sequence number, or the buffer address for UDP
+ * (udp_packet_key) - so every stage of one packet hashes to the same verdict
+ * and the per-stage latencies (enqueue -> qdisc -> send, rcv -> queue ->
+ * buffer) stay pairable under sampling; counts and bytes scale by N. The
+ * diagnostic types (zero-window probe / ack, RTO, drops, backlog, memory
+ * pressure, TX queue stop / wake, state changes) never come through here and
+ * are always recorded. 0 or 1 = every packet (the default). No map is
+ * touched: nothing for the map / context pairing check to see.
+ */
+static __always_inline bool packet_sample_keep(u64 sk_ptr, u64 key)
+{
+	u32 rate = tool_config.packet_sample_rate;
+	if (rate <= 1)
+		return true;
+	u64 h = (sk_ptr ^ (key * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL;
+	h ^= h >> 32;
+	return ((u32)h % rate) == 0;
+}
+
+/*
+ * The UDP packet's sampling key: the skb's buffer address, read as a value.
+ * Reading it (rather than hashing the skb pointer itself) keeps the key a
+ * scalar in every program — in the tp_btf programs the skb is a BTF pointer
+ * and the verifier refuses arithmetic on it — and the buffer is shared by
+ * the clones the stack makes on the way out, so every stage of one datagram
+ * hashes alike.
+ */
+static __always_inline u64 udp_packet_key(const struct sk_buff *skb)
+{
+	unsigned char *head = NULL;
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	return (u64)head;
+}
+
+static __always_inline void *reserve_memory_ringbuf(long *flags, u64 size)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&memory_ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	return bpf_ringbuf_reserve(rb, size, 0);
+}
+
+static __always_inline void memory_header_init(struct memory_event_header *hdr)
+{
+	hdr->addr = 0;
+	hdr->size = 0;
+	hdr->member = 0;
+	hdr->flags = 0;
+	hdr->old_addr = 0;
+	hdr->kernel_stack_length = 0;
+	hdr->user_stack_length = 0;
+}
+
+static struct memory_event_header *reserve_memory_event_header(long *flags)
+{
+	struct memory_event_header *hdr =
+		reserve_memory_ringbuf(flags, sizeof(struct memory_event_header));
+	if (hdr)
+		memory_header_init(hdr);
+	return hdr;
+}
+
+static struct memory_event *reserve_memory_event(long *flags)
+{
+	struct memory_event *event =
+		reserve_memory_ringbuf(flags, sizeof(struct memory_event));
+	if (event) {
+		memory_header_init(&event->hdr);
+#ifdef SYSTING_PYSTACKS
+		event->py_msg_buffer.stack_len = 0;
+		event->py_msg_buffer.pthread_id_match = 0;
+#endif
+	}
+	return event;
+}
+
+static struct epoll_event_bpf *reserve_epoll_event(long *flags)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&epoll_ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	struct epoll_event_bpf *event = bpf_ringbuf_reserve(rb, sizeof(struct epoll_event_bpf), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+static u32 task_cpu(struct task_struct *task)
+{
+	if (bpf_core_field_exists(task->thread_info)) {
+		return task->thread_info.cpu;
+	}
+	struct thread_info *ti = task->stack;
+	return ti->cpu;
+}
+
+/*
+ * Hands a --cgroup target to BPF as a referenced struct cgroup pointer.
+ *
+ * Userspace runs this once per target, before tracing starts, through a cgroup
+ * iterator pinned to the target with BPF_CGROUP_ITER_SELF_ONLY, so the program
+ * is called exactly once with ctx->cgroup = the target (and once more with
+ * NULL, the iterator's end). It runs in the context of the read(2) on the
+ * iterator fd: process context, where bpf_cgroup_from_id() may take
+ * kernfs_idr_lock. The reference goes into the first free slot of
+ * cgroup_target_refs together with the cgroup id, which is what userspace
+ * checks afterwards. Taking the reference by id rather than by acquiring
+ * ctx->cgroup keeps this loadable on 6.6, where the iterator's cgroup argument
+ * is not yet a trusted pointer. The references are dropped with the map when
+ * systing exits. Autoloaded only with --cgroup.
+ */
+SEC("iter/cgroup")
+int systing_cgroup_target_add(struct bpf_iter__cgroup *ctx)
+{
+	struct cgroup *cgrp = ctx->cgroup;
+	u64 id;
+
+	if (!cgrp)
+		return 0;
+	id = cgrp->kn->id;
+	if (!id)
+		return 0;
+
+	for (u32 i = 0; i < MAX_CGROUP_TARGETS; i++) {
+		struct cgroup_target_ref *slot;
+		struct cgroup *ref;
+		u32 key = i; /* see task_in_cgroup_filter() */
+
+		slot = bpf_map_lookup_elem(&cgroup_target_refs, &key);
+		if (!slot)
+			break;
+		if (slot->id)
+			continue;
+
+		ref = bpf_cgroup_from_id(id);
+		if (!ref)
+			break;
+		ref = bpf_kptr_xchg(&slot->cgrp, ref);
+		if (ref)
+			bpf_cgroup_release(ref);
+		slot->id = id;
+		break;
+	}
+	return 0;
+}
+
+/*
+ * CO-RE flavor type for kernels < 6.18 that have icsk_timeout as a separate field.
+ * The ___pre618 suffix is ignored by CO-RE type matching, so this matches the
+ * kernel's actual struct inet_connection_sock at runtime.
+ */
+struct inet_connection_sock___pre618 {
+	long unsigned int icsk_timeout;
+};
+
+/*
+ * CO-RE flavor type for kernels 6.18 that have icsk_retransmit_timer in
+ * inet_connection_sock.
+ */
+struct inet_connection_sock___has_retransmit {
+	struct timer_list icsk_retransmit_timer;
+};
+
+/*
+ * CO-RE flavor type for kernels 6.19+ where the retransmit timer moved to
+ * struct sock as tcp_retransmit_timer (in a union with sk_timer).
+ */
+struct sock___has_tcp_retransmit {
+	struct timer_list tcp_retransmit_timer;
+};
+
+/*
+ * Read icsk_timeout from inet_connection_sock, handling kernel version differences.
+ *
+ * - Kernels < 6.18: icsk_timeout is a separate field in inet_connection_sock.
+ * - Kernel 6.18: icsk_timeout removed, timeout in icsk_retransmit_timer.expires.
+ * - Kernel 6.19+: icsk_retransmit_timer moved to struct sock as tcp_retransmit_timer.
+ */
+static __always_inline void read_icsk_timeout(struct sock *sk,
+					      struct inet_connection_sock *icsk,
+					      u64 *timeout)
+{
+	struct inet_connection_sock___pre618 *old = (void *)icsk;
+	struct inet_connection_sock___has_retransmit *mid = (void *)icsk;
+	struct sock___has_tcp_retransmit *new_sk = (void *)sk;
+
+	if (bpf_core_field_exists(old->icsk_timeout)) {
+		*timeout = BPF_CORE_READ(old, icsk_timeout);
+	} else if (bpf_core_field_exists(mid->icsk_retransmit_timer)) {
+		*timeout = BPF_CORE_READ(mid, icsk_retransmit_timer.expires);
+	} else {
+		*timeout = BPF_CORE_READ(new_sk, tcp_retransmit_timer.expires);
+	}
+}
+
+static u64 task_key(struct task_struct *task)
+{
+	return ((u64)task->tgid << 32) | task->pid;
+}
+
+struct systing_pid_filter {
+	u32 kernel_tgid;
+	u32 initialized;
+};
+
+struct systing_pid_filter filter = {0, 0};
+
+static bool should_filter_systing(struct task_struct *task)
+{
+	return false;
+
+	// If filter is initialized, check against kernel namespace TGID
+	if (filter.initialized) {
+		return task->tgid == filter.kernel_tgid;
+	}
+
+	// Filter not initialized - check if we have namespace info
+	if (tool_config.my_dev == 0 && tool_config.my_ino == 0) {
+		// No namespace info, use the userspace TGID directly
+		filter.kernel_tgid = tool_config.my_tgid;
+		filter.initialized = 1;
+		return task->tgid == filter.kernel_tgid;
+	}
+
+	// We have namespace info, check if current process matches our namespace TGID
+	struct bpf_pidns_info ns_info = {};
+	if (bpf_get_ns_current_pid_tgid(tool_config.my_dev, tool_config.my_ino,
+					 &ns_info, sizeof(ns_info)) == 0) {
+		// Check if the namespace TGID matches our userspace TGID
+		if (ns_info.tgid == tool_config.my_tgid) {
+			// This is our process - get the kernel namespace TGID
+			u64 pid_tgid = bpf_get_current_pid_tgid();
+			filter.kernel_tgid = pid_tgid >> 32;
+			filter.initialized = 1;
+			return true; // This is systing process
+		}
+	}
+
+	// Unable to determine if this is our process, don't filter
+	return false;
+}
+
+/* Every filter except the --pid / --cgroup targeting; see trace_task() and
+ * trace_task_btf(). */
+static bool trace_task_common(struct task_struct *task)
+{
+	if (!tracing_enabled)
+		return false;
+	if (task->tgid == 0)
+		return false;
+	if (should_filter_systing(task))
+		return false;
+	return true;
+}
+
+/*
+ * Is this task traced? For callers that pass current (every program outside
+ * the sched tracepoints: the --cgroup test here is on current, through the
+ * helper every program type may call). A caller in a tp_btf program that
+ * tests a task other than current uses trace_task_btf() instead.
+ *
+ * The task argument feeds the pid/tgid checks only: in kernel mode the
+ * --cgroup decision is bpf_current_task_under_cgroup(), which judges current
+ * whatever task was passed. There is no runtime guard (a helper call per
+ * event on the sampling paths is not worth it), so a new caller must pass
+ * current or use trace_task_btf().
+ */
+static bool trace_task(struct task_struct *task)
+{
+	if (!trace_task_common(task) || !task_in_target_pids(task))
+		return false;
+	if (target_filter.filter_cgroup) {
+		if (target_filter.cgroup_match_kernel)
+			return current_in_cgroup_filter();
+		return task_in_legacy_cgroup_set(task);
+	}
+	return true;
+}
+
+/*
+ * trace_task() for tp_btf programs, where the task need not be current (the
+ * switched-in task, a wakee, a migrating task, a forked child's parent): the
+ * --cgroup test is bpf_task_under_cgroup() on the task itself. tp_btf only -
+ * the kfunc does not verify in kprobe or raw_tracepoint programs on any
+ * kernel, nor in tracepoint or perf_event programs before 6.12 (see the
+ * cgroup_targets comment).
+ */
+static bool trace_task_btf(struct task_struct *task)
+{
+	return trace_task_common(task) && task_in_target_set(task);
+}
+
+static int handle_missed_event(u32 index)
+{
+	u64 *value = bpf_map_lookup_elem(&missed_events, &index);
+	if (value)
+		*value += 1;
+	return 0;
+}
+
+/*
+ * Safe wrapper for reading kernel strings that handles confidentiality mode.
+ * When confidentiality mode is enabled, bpf_probe_read_kernel_str is disabled,
+ * so we use a placeholder string instead.
+ */
+static __always_inline long safe_probe_read_kernel_str(void *dst, u32 size, const void *unsafe_ptr)
+{
+	if (tool_config.confidentiality_mode) {
+		// In confidentiality mode, use a placeholder
+		// We can't use bpf_probe_read_str as it's also restricted
+		const char placeholder[] = "<restricted>";
+		int len = sizeof(placeholder) - 1;
+		if (len > size - 1)
+			len = size - 1;
+		__builtin_memcpy(dst, placeholder, len);
+		((char *)dst)[len] = '\0';
+		return len;
+	}
+
+	// Normal mode - use the standard kernel string reader
+	return bpf_probe_read_kernel_str(dst, size, unsafe_ptr);
+}
+
+/*
+ * Safe wrapper for reading user strings that handles confidentiality mode.
+ * When confidentiality mode is enabled, bpf_probe_read_user_str is disabled,
+ * so we use a placeholder string instead.
+ */
+static __always_inline long safe_probe_read_user_str(void *dst, u32 size, const void *unsafe_ptr)
+{
+	if (tool_config.confidentiality_mode) {
+		// In confidentiality mode, use a placeholder
+		// We can't use bpf_probe_read_str as it's also restricted
+		const char placeholder[] = "<restricted>";
+		int len = sizeof(placeholder) - 1;
+		if (len > size - 1)
+			len = size - 1;
+		__builtin_memcpy(dst, placeholder, len);
+		((char *)dst)[len] = '\0';
+		return len;
+	}
+
+	// Normal mode - use the standard user string reader
+	return bpf_probe_read_user_str(dst, size, unsafe_ptr);
+}
+
+static void record_task_info(struct task_info *info, struct task_struct *task)
+{
+	info->tgidpid = task_key(task);
+	// Record the cgroup id so that short-lived tasks (which may exit before
+	// userspace can read /proc) can still be attributed to a cgroup. This uses
+	// direct BTF field reads (not a restricted probe-read helper), so it is safe
+	// under kernel lockdown confidentiality mode too - the same way the cgroup
+	// filter already reads task_cg_id() unconditionally. Done before the comm
+	// read below, which IS skipped under lockdown.
+	info->cgid = task_cg_id(task);
+
+	// In confidentiality mode, use NULL comm (all zeros)
+	if (tool_config.confidentiality_mode) {
+		__builtin_memset(info->comm, 0, TASK_COMM_LEN);
+		return;
+	}
+
+	if (task->flags & PF_WQ_WORKER) {
+		struct kthread *k = bpf_core_cast(task->worker_private,
+						  struct kthread);
+		struct worker *worker = bpf_core_cast(k->data, struct worker);
+
+		bpf_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
+					  worker->desc);
+	} else {
+		bpf_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
+					  task->comm);
+	}
+}
+
+static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
+				     enum stack_event_type type, u64 ts,
+				     u64 kernel_skip)
+{
+	struct stack_event *event;
+	long len = 0;
+
+	if (tool_config.no_stack_traces)
+		return;
+
+	if (!trace_task(task))
+		return;
+
+	/*
+	 * For STACK_RUNNING events, verify the task is still the expected
+	 * running task according to our sched_switch tracking.
+	 * This guards against a race where a perf event fires during the
+	 * window between sched_switch (where we update cpu_running_pid) and
+	 * the actual context switch (where 'current' is updated).
+	 *
+	 * At startup (before any sched_switch on this CPU), expected_pid is 0.
+	 * The race we're guarding against requires sched_switch to have set
+	 * the slot to a real PID, so a 0 slot cannot indicate a race — let the
+	 * sample through. This matters on idle many-core machines: a CPU-bound
+	 * task that was already running when the trace started can run for the
+	 * entire trace without a single sched_switch on its CPU, and dropping
+	 * those samples loses all CPU stacks for that task.
+	 */
+	if (type == STACK_RUNNING) {
+		u32 key = 0;
+		u32 *expected_pid = bpf_map_lookup_elem(&cpu_running_pid, &key);
+		if (!expected_pid)
+			return;
+		if (*expected_pid != 0 && *expected_pid != task->pid)
+			return;
+	}
+
+	long flags;
+	event = reserve_stack_event(&flags);
+	if (!event) {
+		handle_missed_event(MISSED_STACK_EVENT);
+		return;
+	}
+
+	event->ts = ts ? ts : bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+
+	/*
+	 * The sampled thread's task_context id. Only running-stack events for
+	 * now (STACK_RUNNING: the CPU sampler's, and the ones the usdt, uprobe,
+	 * kprobe, tracepoint and raw tracepoint handlers emit, and the perf
+	 * event samplers' STACK_PERF_EVENT_FIRST and up; in each of them the
+	 * task is current). Sleep stacks are left out on purpose: they are
+	 * emitted from sched_switch. reserve_stack_event() cleared the record's
+	 * fixed part, this field in it, so every other stack event carries
+	 * 0 = none. The knob is rodata: with it off this arm is pruned at load
+	 * time and the maps it names are not created.
+	 */
+	if (task_context_config.enabled && type != STACK_SLEEP_UNINTERRUPTIBLE &&
+	    type != STACK_SLEEP_INTERRUPTIBLE)
+		event->task_context_id = task_context_read_current(task);
+	/* The same for a Go program's goroutine, the same events, the same
+	 * reasons; pruned at load time without the flag. */
+	if (go_context_config.enabled && type != STACK_SLEEP_UNINTERRUPTIBLE &&
+	    type != STACK_SLEEP_INTERRUPTIBLE)
+		event->go_goid = go_context_read_current(task, &event->go_labels_id);
+
+#ifdef SYSTING_PYSTACKS
+	event->py_msg_buffer.stack_len = 0;
+	/*
+	 * The walker fills the message only for a Python process; a sample of
+	 * any other process leaves the rest of the buffer as the ring had it,
+	 * so the witness byte user space tallies is reset here to "unknown".
+	 */
+	event->py_msg_buffer.pthread_id_match = 0;
+	if (tool_config.collect_pystacks) {
+		struct pt_regs *pt_regs = (struct pt_regs *)bpf_task_pt_regs(task);
+		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
+	}
+#endif
+
+	event->stack_event_type = type;
+
+	unsigned int task_flags = task->flags;
+	/*
+	 * A vCPU thread sampled while its guest was executing: the callchain
+	 * walks below come back empty for it (see SAMPLE_FLAG_IN_GUEST), and
+	 * without this mark userspace could not tell "CPU busy running guest
+	 * code" from an unwind failure — it would drop the sample and the
+	 * guest's CPU time would vanish from the profile entirely.
+	 */
+	event->sample_flags = (task_flags & PF_VCPU) ? SAMPLE_FLAG_IN_GUEST : 0;
+
+	if (!(task_flags & PF_KTHREAD)) {
+		/*
+		 * Both modes walk into the same user_stack region; the entry
+		 * format (and how much of the region was reserved) differs.
+		 * Build-id mode: the kernel emits (build_id, file offset) per
+		 * frame where it can resolve the VMA's file (falling back to
+		 * the raw IP with status BPF_STACK_BUILD_ID_IP where it
+		 * cannot), so frames stay symbolizable after the process
+		 * exits. The extraction is the kernel's own bounded,
+		 * trylock-guarded walk (perf's build-id mechanism) — no code
+		 * of ours runs per frame, and with the rodata knob off this
+		 * arm is pruned at load time.
+		 */
+		if (tool_config.collect_build_id) {
+			event->user_stack_format = USER_STACK_FORMAT_BUILD_ID;
+			len = bpf_get_stack(ctx, &event->user_stack,
+					    sizeof(event->user_stack),
+					    BPF_F_USER_STACK |
+						    BPF_F_USER_BUILD_ID);
+			if (len > 0)
+				event->user_stack_length =
+					len / sizeof(struct systing_stack_build_id);
+			else
+				event->user_stack_length = 0;
+		} else {
+			event->user_stack_format = USER_STACK_FORMAT_IP;
+			len = bpf_get_stack(ctx, &event->user_stack,
+					    MAX_STACK_DEPTH * sizeof(u64),
+					    BPF_F_USER_STACK);
+			if (len > 0)
+				event->user_stack_length = len / sizeof(u64);
+			else
+				event->user_stack_length = 0;
+		}
+	} else {
+		event->user_stack_length = 0;
+	}
+
+	len = bpf_get_stack(ctx, &event->kernel_stack,
+			    sizeof(event->kernel_stack), kernel_skip);
+	if (len > 0)
+		event->kernel_stack_length = len / sizeof(u64);
+	else
+		event->kernel_stack_length = 0;
+	bpf_ringbuf_submit(event, flags);
+}
+
+static void emit_stack_event(void *ctx, struct task_struct *task,
+			     enum stack_event_type type)
+{
+	emit_stack_event_with_ts(ctx, task, type, 0, SKIP_STACK_DEPTH);
+}
+
+static int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
+{
+	struct task_struct *tsk;
+
+	if (tool_config.no_irq)
+		return 0;
+
+	tsk = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(tsk))
+		return 0;
+
+	struct task_event *event;
+	long flags;
+	event = reserve_task_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_SCHED_EVENT);
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->prev, tsk);
+	event->target_cpu = irq;
+	if (enter) {
+		event->type = SCHED_IRQ_ENTER;
+		if (tool_config.confidentiality_mode) {
+			__builtin_memset(event->next.comm, 0, TASK_COMM_LEN);
+		} else {
+			bpf_probe_read_kernel_str(event->next.comm, TASK_COMM_LEN,
+						  action->name);
+		}
+	} else {
+		event->type = SCHED_IRQ_EXIT;
+		event->next_prio = ret;
+	}
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+static int trace_softirq_event(unsigned int vec_nr, bool enter)
+{
+	struct task_struct *tsk;
+
+	if (tool_config.no_irq)
+		return 0;
+
+	tsk = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(tsk))
+		return 0;
+
+	struct task_event *event;
+	long flags;
+	event = reserve_task_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_SCHED_EVENT);
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->prev, tsk);
+	event->target_cpu = vec_nr;
+	event->type = enter ? SCHED_SOFTIRQ_ENTER : SCHED_SOFTIRQ_EXIT;
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
+			 enum event_type type)
+{
+	struct task_event *event;
+	long flags;
+	u64 ts = bpf_ktime_get_boot_ns();
+
+	event = reserve_task_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_SCHED_EVENT);
+	event->ts = ts;
+	event->type = type;
+	event->cpu = bpf_get_smp_processor_id();
+	event->next_prio = wakee->prio;
+	event->target_cpu = task_cpu(wakee);
+	record_task_info(&event->prev, waker);
+	record_task_info(&event->next, wakee);
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+static int handle_sched_wakeup_new(struct task_struct *task)
+{
+	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task_btf(cur) && !trace_task_btf(task))
+		return 0;
+	return handle_wakeup(cur, task, SCHED_WAKEUP_NEW);
+}
+
+SEC("tp_btf/sched_wakeup_new")
+int BPF_PROG(systing_sched_wakeup_new, struct task_struct *task)
+{
+	return handle_sched_wakeup_new(task);
+}
+
+static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev,
+			       struct task_struct *next, unsigned int prev_state)
+{
+	struct task_event *event;
+	long flags;
+
+	/*
+	 * Update cpu_running_pid FIRST, before capturing timestamp.
+	 * This allows perf event handlers to detect if they're racing
+	 * with a context switch by comparing their current task's pid
+	 * against cpu_running_pid.
+	 */
+	u32 key = 0;
+	u32 next_pid = next->pid;
+	bpf_map_update_elem(&cpu_running_pid, &key, &next_pid, BPF_ANY);
+
+	u64 ts = bpf_ktime_get_boot_ns();
+
+	if (!trace_task_btf(prev) && !trace_task_btf(next))
+		return 0;
+
+	/*
+	 * Scheduler recorder may be off while stack collection is on (e.g.
+	 * `--only-recorder cpu-stacks`). The sched_switch program still has
+	 * to run unconditionally to keep cpu_running_pid current for
+	 * STACK_RUNNING gating and to emit sleep stacks, but we must not
+	 * emit the scheduler task_event itself in that mode.
+	 */
+	if (!tool_config.no_sched) {
+		event = reserve_task_event(&flags);
+		if (!event) {
+			/*
+			 * Intentional fall-through: previously this returned
+			 * early on missed events, but the sleep-stack ringbuf
+			 * is independent of `ringbufs`, so a full sched ring
+			 * shouldn't cascade into dropping the sleep stack.
+			 */
+			handle_missed_event(MISSED_SCHED_EVENT);
+		} else {
+			event->ts = ts;
+			event->type = SCHED_SWITCH;
+			event->cpu = bpf_get_smp_processor_id();
+			record_task_info(&event->next, next);
+			record_task_info(&event->prev, prev);
+			/*
+			 * Convert raw task state to ftrace format (mask to
+			 * TASK_REPORT bits + preemption). The kernel stores
+			 * exit states (EXIT_ZOMBIE, EXIT_DEAD) in a separate
+			 * exit_state field, so we must OR the kernel-provided
+			 * prev_state (captured at the right moment) with
+			 * exit_state to get the complete task state. See
+			 * kernel's __task_state_index() in include/linux/sched.h.
+			 */
+			event->prev_state = preempt ? TASK_REPORT_MAX :
+				((prev_state | prev->exit_state) & TASK_REPORT);
+			event->next_prio = next->prio;
+			event->prev_prio = prev->prio;
+			bpf_ringbuf_submit(event, flags);
+		}
+	}
+
+	/*
+	 * Record the blocked stack trace for sleep states.
+	 * TASK_INTERRUPTIBLE and TASK_UNINTERRUPTIBLE are mutually exclusive.
+	 * sleep-stacks controls all sleep stacks; interruptible-stacks adds
+	 * additional control for interruptible sleep specifically.
+	 *
+	 * Use the same timestamp as the sched_switch event so the stack sample
+	 * timestamp matches the end of the sched_slice.
+	 *
+	 * Note: Only check prev_state here, not exit_state. Exit states (EXIT_DEAD,
+	 * EXIT_ZOMBIE) should not trigger sleep stack recording - we only want
+	 * stacks for tasks that are blocked waiting for something.
+	 */
+	if (!tool_config.no_sleep_stack_traces) {
+		if (prev_state & TASK_UNINTERRUPTIBLE)
+			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_UNINTERRUPTIBLE, ts,
+						 SKIP_STACK_DEPTH);
+		else if (!tool_config.no_interruptible_stack_traces &&
+			 prev_state & TASK_INTERRUPTIBLE)
+			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_INTERRUPTIBLE, ts,
+						 SKIP_STACK_DEPTH);
+	}
+	return 0;
+}
+
+/*
+ * The kernel captures prev_state (prev->__state) at exactly the right moment
+ * before the context switch. Reading prev->__state directly in BPF could race
+ * with state changes. We use the kernel-provided prev_state and OR it with
+ * prev->exit_state to capture EXIT_DEAD/EXIT_ZOMBIE states.
+ */
+SEC("tp_btf/sched_switch")
+int BPF_PROG(systing_sched_switch, bool preempt, struct task_struct *prev,
+	     struct task_struct *next, unsigned int prev_state)
+{
+	return handle_sched_switch(ctx, preempt, prev, next, prev_state);
+}
+
+static int handle_sched_waking(struct task_struct *task)
+{
+	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task_btf(cur) && !trace_task_btf(task))
+		return 0;
+	return handle_wakeup(cur, task, SCHED_WAKING);
+}
+
+SEC("tp_btf/sched_waking")
+int BPF_PROG(systing_sched_waking, struct task_struct *task)
+{
+	return handle_sched_waking(task);
+}
+
+/*
+ * sched_migrate_task fires from set_task_cpu(), i.e. whenever a task's CPU
+ * changes: at wakeup, after select_task_rq() picked a CPU other than the one
+ * the task last ran on (the sched_waking event above is recorded BEFORE that
+ * choice, so its target_cpu is only the previous CPU); and when the load
+ * balancer, NUMA balancing, or an affinity change moves a runnable task. It
+ * is the only place the placement decision is visible, so it is what makes
+ * per-CPU runqueue accounting exact. At the tracepoint the task still carries
+ * its old CPU, so `cpu` = the CPU it is leaving and `target_cpu` = dest_cpu.
+ * Only the task ringbuf is touched (tp_btf context, no map the perf_event
+ * sampler writes), and the program is only loaded with the sched recorder.
+ */
+static int handle_sched_migrate(struct task_struct *task, int dest_cpu)
+{
+	struct task_event *event;
+	long flags;
+	u64 ts = bpf_ktime_get_boot_ns();
+
+	if (!trace_task_btf(task))
+		return 0;
+	event = reserve_task_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_SCHED_EVENT);
+	event->ts = ts;
+	event->type = SCHED_MIGRATE;
+	event->cpu = task_cpu(task);
+	event->target_cpu = dest_cpu;
+	event->next_prio = task->prio;
+	record_task_info(&event->next, task);
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tp_btf/sched_migrate_task")
+int BPF_PROG(systing_sched_migrate, struct task_struct *task, int dest_cpu)
+{
+	return handle_sched_migrate(task, dest_cpu);
+}
+
+static int handle_sched_process_exit(struct task_struct *task)
+{
+	struct task_event *event;
+	long flags;
+	u64 ts = bpf_ktime_get_boot_ns();
+
+	if (!trace_task_btf(task))
+		return 0;
+
+#ifdef SYSTING_PYSTACKS
+	/*
+	 * Drop the pystacks config when the *last* thread of a process exits.
+	 * Forked Python children that exit without exec'ing (multiprocessing
+	 * workers, plain os.fork()) would otherwise leak entries in the
+	 * bounded targeted_pids/pystacks_pid_config maps and starve later
+	 * forks once those maps fill (1024 entries each).
+	 *
+	 * sched_process_exit fires per *thread*, but both maps are keyed by
+	 * tgid. do_exit() decrements signal->live before this tracepoint
+	 * fires, so 0 here means this thread is the last one in the group;
+	 * earlier-exiting threads see > 0 and leave the config alone (the
+	 * remaining threads still need it).
+	 */
+	if (tool_config.collect_pystacks &&
+	    BPF_CORE_READ(task, signal, live.counter) == 0)
+		pystacks_clear_pid(task->tgid);
+#endif
+
+	event = reserve_task_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_SCHED_EVENT);
+	event->ts = ts;
+	event->type = SCHED_PROCESS_EXIT;
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->prev, task);
+	event->prev_prio = task->prio;
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(systing_sched_process_exit, struct task_struct *task)
+{
+	return handle_sched_process_exit(task);
+}
+
+static int handle_sched_process_fork(struct task_struct *parent,
+				     struct task_struct *child)
+{
+	// Check if parent is being traced
+	if (!trace_task_btf(parent))
+		return 0;
+
+	// Add child to the pids map so we trace it too
+	u32 child_pid = child->tgid;
+	u8 val = 1;
+	bpf_map_update_elem(&pids, &child_pid, &val, BPF_ANY);
+
+#ifdef SYSTING_PYSTACKS
+	/*
+	 * If the parent is a registered Python process, the forked child shares
+	 * its address space (CoW) until it execs, so the parent's pystacks
+	 * config is valid for the child too. Propagate it immediately so the
+	 * child's very first samples have working pystacks (no userspace round
+	 * trip), then notify userspace so the symbol resolver learns the
+	 * child's Python version (used for line-table parsing).
+	 *
+	 * Threads (CLONE_THREAD) share the parent's tgid; pystacks_propagate_fork
+	 * detects that and returns false without touching the maps.
+	 */
+	if (tool_config.collect_pystacks &&
+	    pystacks_propagate_fork(parent->tgid, child->tgid)) {
+		struct exec_event *event = bpf_ringbuf_reserve(
+			&ringbuf_exec_events, sizeof(*event), 0);
+		if (event) {
+			event->pid = child->tgid;
+			event->is_fork = 1;
+			bpf_ringbuf_submit(event, 0);
+		}
+		/*
+		 * If the ringbuf reservation fails the BPF maps are still
+		 * correct (populated above); only the userspace pid->version
+		 * mapping is missed, which degrades line numbers but keeps
+		 * function-level symbolization working.
+		 */
+	}
+#endif
+
+	return 0;
+}
+
+SEC("tp_btf/sched_process_fork")
+int BPF_PROG(systing_sched_process_fork, struct task_struct *parent,
+	     struct task_struct *child)
+{
+	return handle_sched_process_fork(parent, child);
+}
+
+#ifdef SYSTING_PYSTACKS
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(systing_sched_process_exec, struct task_struct *task,
+	     pid_t old_pid, struct linux_binprm *bprm)
+{
+	if (!tool_config.collect_pystacks)
+		return 0;
+	if (!trace_task_btf(task))
+		return 0;
+
+	/*
+	 * Reserve the ringbuf slot *before* clearing the stale pystacks config.
+	 * If the reservation fails, userspace never learns about this exec, so
+	 * leaving the (now-stale) config in place is the lesser evil: stale
+	 * config produces unreadable garbage that walks to a 0-frame stack,
+	 * but no config means we'd silently never re-register if the new image
+	 * is still Python.
+	 */
+	struct exec_event *event =
+		bpf_ringbuf_reserve(&ringbuf_exec_events, sizeof(*event), 0);
+	if (!event)
+		return 0;
+
+	/*
+	 * Exec replaces the address space, so any pystacks config we have for
+	 * this pid (whether registered at startup, dynamically discovered, or
+	 * inherited from a parent at fork time) is now stale. Drop it; the
+	 * exec event triggers userspace re-discovery, which re-registers the
+	 * pid if the new image is still Python.
+	 *
+	 * This is what keeps subprocess.Popen() from a Python parent from
+	 * leaking a stale entry per call: fork propagates the parent's config
+	 * to the child, then exec into the subprocess binary clears it again.
+	 */
+	pystacks_clear_pid(task->tgid);
+
+	event->pid = task->tgid;
+	event->is_fork = 0;
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+#endif
+
+SEC("tp_btf/irq_handler_entry")
+int BPF_PROG(systing_irq_handler_entry, int irq, struct irqaction *action)
+{
+	return trace_irq_event(action, irq, 0, true);
+}
+
+SEC("tp_btf/irq_handler_exit")
+int BPF_PROG(systing_irq_handler_exit, int irq, struct irqaction *action, int ret)
+{
+	return trace_irq_event(action, irq, ret, false);
+}
+
+SEC("tp_btf/softirq_entry")
+int BPF_PROG(systing_softirq_entry, unsigned int vec_nr)
+{
+	return trace_softirq_event(vec_nr, true);
+}
+
+SEC("tp_btf/softirq_exit")
+int BPF_PROG(systing_softirq_exit, unsigned int vec_nr)
+{
+	return trace_softirq_event(vec_nr, false);
+}
+
+SEC("usdt")
+int systing_usdt(struct pt_regs *ctx)
+{
+	if (tool_config.confidentiality_mode)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 cookie = bpf_usdt_cookie(ctx);
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PROBE_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = cookie;
+	event->num_args = 0;
+
+	struct arg_desc_array *desc_array = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc_array && desc_array->num_args > 0) {
+		event->num_args = desc_array->num_args < MAX_ARGS ? desc_array->num_args : MAX_ARGS;
+
+		for (int i = 0; i < MAX_ARGS && i < desc_array->num_args; i++) {
+			struct arg_desc *desc = &desc_array->args[i];
+			long val = 0;
+
+			event->args[i].type = ARG_NONE;
+			event->args[i].size = 0;
+
+			// ARG_RETVAL not supported for USDT - skip it
+			if (desc->arg_type == ARG_RETVAL) {
+				continue;
+			}
+
+			bpf_usdt_arg(ctx, desc->arg_index, &val);
+
+			if (val) {
+				if (desc->arg_type == ARG_STRING) {
+					int len = safe_probe_read_user_str(&event->args[i].value,
+									   sizeof(event->args[i].value), (long *)val);
+					event->args[i].type = ARG_STRING;
+					event->args[i].size = len > 0 ? len : 0;
+				} else if (desc->arg_type == ARG_LONG) {
+					__builtin_memcpy(&event->args[i].value, &val, sizeof(long));
+					event->args[i].type = ARG_LONG;
+					event->args[i].size = sizeof(long);
+				}
+			}
+		}
+	}
+	bpf_ringbuf_submit(event, flags);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(ctx, task, STACK_RUNNING);
+
+	return 0;
+}
+
+static void read_counters(void *ctx, struct task_struct *task)
+{
+	u32 key, cpu = bpf_get_smp_processor_id();
+
+	if (!trace_task(task))
+		return;
+
+	u64 ts = bpf_ktime_get_boot_ns();
+	key = cpu;
+
+	for (int i = 0; i < tool_config.num_perf_counters; i++, key += tool_config.num_cpus) {
+		int err;
+		long flags;
+
+		struct perf_counter_event *event = reserve_perf_counter_event(&flags);
+		if (!event) {
+			handle_missed_event(MISSED_CACHE_EVENT);
+			continue;
+		}
+
+		err = bpf_perf_event_read_value(&perf_counters, key, (void *)&event->value,
+						sizeof(event->value));
+		if (err) {
+			bpf_ringbuf_discard(event, 0);
+			continue;
+		}
+		if (event->value.counter == 0) {
+			bpf_ringbuf_discard(event, 0);
+			continue;
+		}
+		u32 index = i;
+		u64 *last_value = bpf_map_lookup_elem(&last_perf_counter_value, &index);
+		if (last_value) {
+			u64 old_value = event->value.counter;
+			event->value.counter -= *last_value;
+			*last_value = old_value;
+		}
+		event->ts = ts;
+		event->cpu = cpu;
+		event->counter_num = i;
+		record_task_info(&event->task, task);
+		bpf_ringbuf_submit(event, flags);
+	}
+}
+
+SEC("perf_event")
+int systing_perf_event_clock(void *ctx)
+{
+	/*
+	 * Capture timestamp at the start, then get the current task.
+	 * The cpu_running_pid check in emit_stack_event_with_ts guards against
+	 * races where the perf event fires during a context switch window.
+	 */
+	u64 ts = bpf_ktime_get_boot_ns();
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	/*
+	 * No stack skip on this path: a perf-event program's
+	 * bpf_get_stack() walks from the sample's interrupted registers,
+	 * not through tracepoint glue. The shared skip here discarded the
+	 * interrupted IP plus the first two real return addresses, so
+	 * every kernel leaf in sampled profiles rendered as its
+	 * third-level caller.
+	 */
+	if (!tool_config.no_cpu_stack_traces)
+		emit_stack_event_with_ts(ctx, task, STACK_RUNNING, ts,
+					 PERF_EVENT_SKIP_STACK_DEPTH);
+	read_counters(ctx, task);
+
+	if (tool_config.collect_memory && trace_task(task)) {
+		struct mm_struct *mm = BPF_CORE_READ(task, mm);
+		if (mm) {
+			long mflags;
+			struct memory_event_header *mev = reserve_memory_event_header(&mflags);
+			if (mev) {
+				mev->type = MEMORY_MM_SAMPLE;
+				mev->ts = ts;
+				mev->cpu = bpf_get_smp_processor_id();
+				record_task_info(&mev->task, task);
+				mev->addr = BPF_CORE_READ(mm, hiwater_rss) * (u64)tool_config.page_size;
+				mev->size = BPF_CORE_READ(mm, total_vm) * (u64)tool_config.page_size;
+				bpf_ringbuf_submit(mev, mflags);
+			} else {
+				handle_missed_event(MISSED_MEMORY_EVENT);
+			}
+			/* Companion thrash sample: a separate event type so
+			 * the shared header doesn't grow for fields only this
+			 * low-rate path fills. task->delays is only present
+			 * with CONFIG_TASK_DELAY_ACCT and only allocated when
+			 * delayacct is enabled; absent or NULL leaves the
+			 * init-zeroed values. */
+			struct memory_event_header *tev = reserve_memory_event_header(&mflags);
+			if (tev) {
+				tev->type = MEMORY_THRASH_SAMPLE;
+				tev->ts = ts;
+				tev->cpu = bpf_get_smp_processor_id();
+				record_task_info(&tev->task, task);
+				tev->addr = BPF_CORE_READ(task, maj_flt);
+				if (bpf_core_field_exists(task->delays)) {
+					struct task_delay_info *d =
+						BPF_CORE_READ(task, delays);
+					if (d) {
+						tev->flags = MEMORY_THRASH_FLAG_DELAYACCT;
+						tev->size = BPF_CORE_READ(d, thrashing_count);
+						tev->old_addr = BPF_CORE_READ(d, thrashing_delay);
+					}
+				}
+				bpf_ringbuf_submit(tev, mflags);
+			} else {
+				handle_missed_event(MISSED_MEMORY_EVENT);
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * A hardware:/software: trace event with a period: one perf event per CPU,
+ * opened by userspace in period mode like the clock sampler's and attached in
+ * the same last slot (attach_clock_sampler in systing_core.rs), so the same
+ * stack-skip rule holds — the walk starts from the sample's registers. The
+ * attach cookie is the stack_event_type the samples are stored under
+ * (STACK_PERF_EVENT_FIRST and up), so the record carries nothing new. The
+ * event's count is read with the other counters on the clock tick
+ * (read_counters), not here. Loaded only when a trace event is configured.
+ */
+SEC("perf_event")
+int systing_perf_event_sample(void *ctx)
+{
+	u64 ts = bpf_ktime_get_boot_ns();
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	emit_stack_event_with_ts(ctx, task, bpf_get_attach_cookie(ctx), ts,
+				 PERF_EVENT_SKIP_STACK_DEPTH);
+	return 0;
+}
+
+static void handle_probe_event(struct pt_regs *ctx, bool kernel)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return;
+
+	u64 cookie = bpf_get_attach_cookie(ctx);
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = cookie;
+	event->num_args = 0;
+
+	struct arg_desc_array *desc_array = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc_array && desc_array->num_args > 0) {
+		event->num_args = desc_array->num_args < MAX_ARGS ? desc_array->num_args : MAX_ARGS;
+
+		for (int i = 0; i < MAX_ARGS && i < desc_array->num_args; i++) {
+			struct arg_desc *desc = &desc_array->args[i];
+			u64 arg = 0;
+
+			event->args[i].type = ARG_NONE;
+			event->args[i].size = 0;
+
+			if (desc->arg_type == ARG_RETVAL) {
+				arg = PT_REGS_RC_CORE(ctx);
+				__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+				event->args[i].type = ARG_RETVAL;
+				event->args[i].size = sizeof(u64);
+			} else {
+				if (desc->arg_index == 0) {
+					arg = PT_REGS_PARM1_CORE(ctx);
+				} else if (desc->arg_index == 1) {
+					arg = PT_REGS_PARM2_CORE(ctx);
+				} else if (desc->arg_index == 2) {
+					arg = PT_REGS_PARM3_CORE(ctx);
+				} else if (desc->arg_index == 3) {
+					arg = PT_REGS_PARM4_CORE(ctx);
+				} else if (desc->arg_index == 4) {
+					arg = PT_REGS_PARM5_CORE(ctx);
+				} else if (desc->arg_index == 5) {
+					arg = PT_REGS_PARM6_CORE(ctx);
+				}
+
+				if (desc->arg_type == ARG_STRING) {
+					int len;
+					if (kernel)
+						len = safe_probe_read_kernel_str(&event->args[i].value,
+										 sizeof(event->args[i].value),
+										 (void *)arg);
+					else
+						len = safe_probe_read_user_str(&event->args[i].value,
+									       sizeof(event->args[i].value),
+									       (void *)arg);
+					event->args[i].type = ARG_STRING;
+					event->args[i].size = len > 0 ? len : 0;
+				} else if (desc->arg_type == ARG_LONG) {
+					__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+					event->args[i].type = ARG_LONG;
+					event->args[i].size = sizeof(u64);
+				}
+			}
+		}
+	}
+	bpf_ringbuf_submit(event, flags);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(ctx, task, STACK_RUNNING);
+}
+
+SEC("uprobe")
+int systing_uprobe(struct pt_regs *ctx)
+{
+	// Exit early in confidentiality mode since probe helpers are restricted
+	if (tool_config.confidentiality_mode)
+		return 0;
+
+	handle_probe_event(ctx, false);
+	return 0;
+}
+
+SEC("kprobe")
+int systing_kprobe(struct pt_regs *ctx)
+{
+	// Exit early in confidentiality mode since probe helpers are restricted
+	if (tool_config.confidentiality_mode)
+		return 0;
+
+	handle_probe_event(ctx, true);
+	return 0;
+}
+
+static __always_inline int handle_raw_tracepoint(struct bpf_raw_tracepoint_args *args,
+						 bool may_capture_stack)
+{
+	if (tool_config.confidentiality_mode)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 cookie = bpf_get_attach_cookie(args);
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return 0;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = cookie;
+	event->num_args = 0;
+
+	struct arg_desc_array *desc_array = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc_array && desc_array->num_args > 0) {
+		event->num_args = desc_array->num_args < MAX_ARGS ? desc_array->num_args : MAX_ARGS;
+
+		for (int i = 0; i < MAX_ARGS && i < desc_array->num_args; i++) {
+			struct arg_desc *desc = &desc_array->args[i];
+			u64 arg = 0;
+
+			event->args[i].type = ARG_NONE;
+			event->args[i].size = 0;
+
+			// ARG_RETVAL not supported for raw_tracepoint - skip it
+			if (desc->arg_type == ARG_RETVAL) {
+				continue;
+			}
+
+			if (desc->arg_index == 0) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[0]);
+			} else if (desc->arg_index == 1) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[1]);
+			} else if (desc->arg_index == 2) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[2]);
+			} else if (desc->arg_index == 3) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[3]);
+			} else if (desc->arg_index == 4) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[4]);
+			} else if (desc->arg_index == 5) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[5]);
+			}
+
+			if (desc->arg_type == ARG_STRING) {
+				int len = safe_probe_read_kernel_str(&event->args[i].value,
+								     sizeof(event->args[i].value),
+								     (void *)arg);
+				event->args[i].type = ARG_STRING;
+				event->args[i].size = len > 0 ? len : 0;
+			} else if (desc->arg_type == ARG_LONG) {
+				__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+				event->args[i].type = ARG_LONG;
+				event->args[i].size = sizeof(u64);
+			}
+		}
+	}
+	bpf_ringbuf_submit(event, flags);
+
+	if (!may_capture_stack)
+		return 0;
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(args, task, STACK_RUNNING);
+
+	return 0;
+}
+
+SEC("raw_tracepoint")
+int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
+{
+	return handle_raw_tracepoint(args, true);
+}
+
+/*
+ * For events that capture no stack. The kernel skips a run of a program that is
+ * already running on the CPU, so a tracepoint firing in an interrupt during a
+ * stack walk in systing_raw_tracepoint would be lost if it ran that program too.
+ */
+SEC("raw_tracepoint")
+int systing_raw_tracepoint_no_stack(struct bpf_raw_tracepoint_args *args)
+{
+	return handle_raw_tracepoint(args, false);
+}
+
+SEC("tracepoint")
+int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
+{
+	if (tool_config.confidentiality_mode)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 cookie = bpf_get_attach_cookie(args);
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return 0;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = cookie;
+	event->num_args = 0;
+
+	bpf_ringbuf_submit(event, flags);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(args, task, STACK_RUNNING);
+
+	return 0;
+}
+
+// Helper function to handle marker events from syscalls (faccessat2)
+// faccessat2(dirfd, pathname, mode, flags) - we use:
+//   mode (arg[2]): must be SYSTING_MARKER_MODE (-975) to identify call as a systing marker
+//   pathname (arg[1]): "<trackname>:<eventname>" or "<eventname>"
+//   dirfd (arg[0]): 0=start, 1=end, 2=instant
+static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter *ctx,
+					       struct task_struct *task)
+{
+	// Validate marker_type
+	u32 mtype = (u32)ctx->args[0];
+	if (mtype > 2)
+		return 0;
+
+	struct marker_event *event = bpf_ringbuf_reserve(&ringbuf_marker,
+							  sizeof(struct marker_event), 0);
+	if (!event) {
+		handle_missed_event(MISSED_MARKER_EVENT);
+		return 0;
+	}
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->marker_type = mtype;
+	int len = bpf_probe_read_user_str(event->name, sizeof(event->name),
+					  (void *)ctx->args[1]);
+	if (len <= 0) {
+		bpf_ringbuf_discard(event, 0);
+		return 0;
+	}
+	event->info = (u64)ctx->args[3];
+	bpf_ringbuf_submit(event, 0);
+	return 1;
+}
+
+SEC("tracepoint/raw_syscalls/sys_enter")
+int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	struct task_struct *task = bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	/* Note: when collect_syscalls is enabled these calls are also recorded as
+	 * raw syscalls -- do not return early after handling the marker. */
+	if (tool_config.marker_syscall_nr && ctx->id == tool_config.marker_syscall_nr) {
+		/* Use s32 comparison -- see SYSTING_MARKER_MODE comment for details. */
+		if ((s32)ctx->args[2] == (s32)SYSTING_MARKER_MODE)
+			handle_marker_event(ctx, task);
+	}
+
+	if (!tool_config.collect_syscalls)
+		return 0;
+
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return 0;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = SYS_ENTER_COOKIE;
+	event->num_args = 1;
+	event->args[0].type = ARG_LONG;
+	event->args[0].size = sizeof(u64);
+	__builtin_memcpy(&event->args[0].value, &ctx->id, sizeof(u64));
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tracepoint/raw_syscalls/sys_exit")
+int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	if (!tool_config.collect_syscalls)
+		return 0;
+
+	struct task_struct *task = bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return 0;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = SYS_EXIT_COOKIE;
+	event->num_args = 2;
+	event->args[0].type = ARG_LONG;
+	event->args[0].size = sizeof(u64);
+	__builtin_memcpy(&event->args[0].value, &ctx->id, sizeof(u64));
+	event->args[1].type = ARG_LONG;
+	event->args[1].size = sizeof(u64);
+	__builtin_memcpy(&event->args[1].value, &ctx->ret, sizeof(u64));
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+static __always_inline int read_socket_dest_info(struct sock *sk,
+						  enum network_address_family *af,
+						  u8 *dest_addr,
+						  u16 *dest_port)
+{
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		*af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(dest_addr, &addr, 4);
+		u16 port;
+		bpf_probe_read_kernel(&port, sizeof(port), &sk->__sk_common.skc_dport);
+		*dest_port = __builtin_bswap16(port);
+		return 0;
+	} else if (family == AF_INET6) {
+		*af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+		u16 port;
+		bpf_probe_read_kernel(&port, sizeof(port), &sk->__sk_common.skc_dport);
+		*dest_port = __builtin_bswap16(port);
+		return 0;
+	}
+	return -1;
+}
+
+// Read source/local address from socket
+static __always_inline int read_socket_src_info(struct sock *sk,
+						 enum network_address_family *af,
+						 u8 *src_addr,
+						 u16 *src_port)
+{
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		*af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_rcv_saddr);
+		__builtin_memcpy(src_addr, &addr, 4);
+		u16 port;
+		bpf_probe_read_kernel(&port, sizeof(port), &sk->__sk_common.skc_num);
+		*src_port = port;  // skc_num is already in host byte order
+		return 0;
+	} else if (family == AF_INET6) {
+		*af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(src_addr, 16, &sk->__sk_common.skc_v6_rcv_saddr);
+		u16 port;
+		bpf_probe_read_kernel(&port, sizeof(port), &sk->__sk_common.skc_num);
+		*src_port = port;  // skc_num is already in host byte order
+		return 0;
+	}
+	return -1;
+}
+
+// Read both source and destination address from socket (full 4-tuple)
+static __always_inline int read_socket_addrs(struct sock *sk,
+					      enum network_address_family *af,
+					      u8 *src_addr,
+					      u16 *src_port,
+					      u8 *dest_addr,
+					      u16 *dest_port)
+{
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		*af = NETWORK_AF_INET;
+		u32 saddr, daddr;
+		u16 sport, dport;
+
+		bpf_probe_read_kernel(&saddr, sizeof(saddr), &sk->__sk_common.skc_rcv_saddr);
+		bpf_probe_read_kernel(&daddr, sizeof(daddr), &sk->__sk_common.skc_daddr);
+		bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+		bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+
+		__builtin_memcpy(src_addr, &saddr, 4);
+		__builtin_memcpy(dest_addr, &daddr, 4);
+		*src_port = sport;  // skc_num is already in host byte order
+		*dest_port = __builtin_bswap16(dport);
+		return 0;
+	} else if (family == AF_INET6) {
+		*af = NETWORK_AF_INET6;
+		u16 sport, dport;
+
+		bpf_probe_read_kernel(src_addr, 16, &sk->__sk_common.skc_v6_rcv_saddr);
+		bpf_probe_read_kernel(dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+		bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+		bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+
+		*src_port = sport;  // skc_num is already in host byte order
+		*dest_port = __builtin_bswap16(dport);
+		return 0;
+	}
+	return -1;
+}
+
+static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum network_protocol protocol)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_send_info info = {0};
+
+	info.protocol = protocol;
+	info.start_ts = bpf_ktime_get_boot_ns();
+	info.af = NETWORK_AF_INET;
+
+	if (protocol == NETWORK_TCP && sk) {
+		struct tcp_sock *tp = (struct tcp_sock *)sk;
+		u32 write_seq = 0;
+		bpf_probe_read_kernel(&write_seq, sizeof(write_seq), &tp->write_seq);
+		info.sendmsg_seq = write_seq;
+	}
+
+	// For UDP (and optionally TCP with msg_name), try to read from msghdr first
+	// This handles unconnected UDP sockets where destination is passed per-send
+	if (msg) {
+		void *msg_name;
+		size_t msg_namelen;
+
+		// Read msg_name and msg_namelen from the msghdr structure using probe_read
+		bpf_probe_read_kernel(&msg_name, sizeof(msg_name), &msg->msg_name);
+		bpf_probe_read_kernel(&msg_namelen, sizeof(msg_namelen), &msg->msg_namelen);
+
+		if (msg_name) {
+			u16 family;
+			bpf_probe_read_kernel(&family, sizeof(family), msg_name);
+
+			// Check if this is IPv4
+			if (family == AF_INET && msg_namelen >= sizeof(struct sockaddr_in)) {
+				struct sockaddr_in addr;
+				bpf_probe_read_kernel(&addr, sizeof(addr), msg_name);
+
+				info.af = NETWORK_AF_INET;
+				__builtin_memcpy(info.dest_addr, &addr.sin_addr.s_addr, 4);
+				info.dest_port = __builtin_bswap16(addr.sin_port);
+			}
+			// Check if this is IPv6
+			else if (family == AF_INET6 && msg_namelen >= sizeof(struct sockaddr_in6)) {
+				struct sockaddr_in6 addr6;
+				bpf_probe_read_kernel(&addr6, sizeof(addr6), msg_name);
+
+				info.af = NETWORK_AF_INET6;
+				__builtin_memcpy(info.dest_addr, &addr6.sin6_addr, 16);
+				info.dest_port = __builtin_bswap16(addr6.sin6_port);
+			}
+		}
+	}
+
+	if (sk && info.dest_port == 0) {
+		read_socket_dest_info(sk, &info.af, info.dest_addr, &info.dest_port);
+	}
+
+	// Read source address from socket
+	if (sk) {
+		read_socket_src_info(sk, &info.af, info.src_addr, &info.src_port);
+	}
+
+	// Store socket pointer for reading buffer state on exit
+	info.sk_ptr = (u64)sk;
+
+	// Get or create socket ID for this socket with full 4-tuple
+	if (sk && info.dest_port != 0) {
+		info.socket_id = get_or_create_socket_id(sk, protocol, info.af,
+							  info.src_addr, info.src_port,
+							  info.dest_addr, info.dest_port, tgidpid);
+	}
+
+	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
+
+	return 0;
+}
+
+// Read the inode of a socket's network namespace from a struct sock pointer.
+// The netns is stable over the socket's lifetime, so reading it at event-emit
+// time is equivalent to reading it at socket creation. Returns 0 if sk_ptr is
+// null. The inode matches what userspace reads via /proc/<pid>/ns/net, so the
+// fold can join a flow's netns_inum to the interface map's per-netns inode.
+static __always_inline u64 read_sk_netns_inum(u64 sk_ptr)
+{
+	if (!sk_ptr)
+		return 0;
+	struct sock *sk = (struct sock *)sk_ptr;
+	return BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
+}
+
+static int handle_sendmsg_exit(void *ctx, int ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	// Only record successful sends
+	if (ret <= 0)
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_send_info *info = bpf_map_lookup_elem(&pending_network_sends, &tgidpid);
+
+	if (!info) {
+		// No matching entry, skip
+		return 0;
+	}
+
+	long flags;
+	struct network_event *event = reserve_network_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&pending_network_sends, &tgidpid);
+		return handle_missed_event(MISSED_NETWORK_EVENT);
+	}
+
+	event->start_ts = info->start_ts;
+	event->end_ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->protocol = info->protocol;
+	event->operation = NETWORK_SEND;
+	event->af = info->af;
+	__builtin_memcpy(event->src_addr, info->src_addr, 16);
+	event->src_port = info->src_port;
+	__builtin_memcpy(event->dest_addr, info->dest_addr, 16);
+	event->dest_port = info->dest_port;
+	event->bytes = (u32)ret;  // Return value is number of bytes sent
+	event->sendmsg_seq = info->sendmsg_seq;  // TCP sequence at sendmsg time
+
+	// Read send buffer state from socket (TCP only)
+	if (info->protocol == NETWORK_TCP && info->sk_ptr) {
+		struct sock *sk = (struct sock *)info->sk_ptr;
+		int wmem_queued = 0;
+		int sndbuf = 0;
+		bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+		bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+		event->sndbuf_used = (u32)wmem_queued;
+		event->sndbuf_limit = (u32)sndbuf;
+	}
+
+	// Copy socket_id for correlation
+	event->socket_id = info->socket_id;
+	event->netns_inum = read_sk_netns_inum(info->sk_ptr);
+
+	bpf_ringbuf_submit(event, flags);
+	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
+
+	return 0;
+}
+
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(tcp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
+{
+	return handle_sendmsg_entry(sk, msg, NETWORK_TCP);
+}
+
+SEC("kretprobe/tcp_sendmsg")
+int BPF_KRETPROBE(tcp_sendmsg_exit, int ret)
+{
+	return handle_sendmsg_exit(ctx, ret);
+}
+
+SEC("kprobe/udp_sendmsg")
+int BPF_KPROBE(udp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
+{
+	return handle_sendmsg_entry(sk, msg, NETWORK_UDP);
+}
+
+SEC("kretprobe/udp_sendmsg")
+int BPF_KRETPROBE(udp_sendmsg_exit, int ret)
+{
+	return handle_sendmsg_exit(ctx, ret);
+}
+
+// For TCP: read peer address from socket structure
+static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info info = {0};
+
+	info.protocol = NETWORK_TCP;
+	info.start_ts = bpf_ktime_get_boot_ns();
+	info.af = NETWORK_AF_INET;  // Default to IPv4
+	info.sk_ptr = (u64)sk;  // Store socket pointer for buffer queue latency
+
+	if (sk) {
+		// Read both source and destination addresses
+		read_socket_src_info(sk, &info.af, info.src_addr, &info.src_port);
+		read_socket_dest_info(sk, &info.af, info.peer_addr, &info.peer_port);
+
+		// Get or create socket ID for this socket with full 4-tuple
+		if (info.peer_port != 0) {
+			info.socket_id = get_or_create_socket_id(sk, NETWORK_TCP, info.af,
+								  info.src_addr, info.src_port,
+								  info.peer_addr, info.peer_port, tgidpid);
+		}
+
+		// Capture TCP receive sequence info at entry
+		struct tcp_sock *tp = (struct tcp_sock *)sk;
+		u32 copied_seq = 0;
+		u32 rcv_nxt = 0;
+		bpf_probe_read_kernel(&copied_seq, sizeof(copied_seq), &tp->copied_seq);
+		bpf_probe_read_kernel(&rcv_nxt, sizeof(rcv_nxt), &tp->rcv_nxt);
+		info.recv_seq_start = copied_seq;
+		info.rcv_nxt_at_entry = rcv_nxt;
+	}
+
+	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
+
+	return 0;
+}
+
+static int handle_recvmsg_exit(void *ctx, int ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	// Only record successful receives
+	if (ret <= 0)
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info *info = bpf_map_lookup_elem(&pending_network_recvs, &tgidpid);
+
+	if (!info) {
+		// No matching entry, skip
+		return 0;
+	}
+
+	// For UDP: skip if peer address wasn't successfully extracted (peer_port will be 0)
+	// This can happen if __skb_recv_udp returned NULL
+	if (info->protocol == NETWORK_UDP && info->peer_port == 0) {
+		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+		return 0;
+	}
+
+	long flags;
+	struct network_event *event = reserve_network_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+		return handle_missed_event(MISSED_NETWORK_EVENT);
+	}
+
+	event->start_ts = info->start_ts;
+	event->end_ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->protocol = info->protocol;
+	event->operation = NETWORK_RECV;
+	event->af = info->af;
+	event->bytes = (u32)ret;  // Return value is number of bytes received
+
+	// Copy source address (our local address)
+	__builtin_memcpy(event->src_addr, info->src_addr, 16);
+	event->src_port = info->src_port;
+
+	// Use the peer address that was extracted in the entry handler
+	__builtin_memcpy(event->dest_addr, info->peer_addr, 16);
+	event->dest_port = info->peer_port;
+
+	// Copy socket_id for correlation
+	event->socket_id = info->socket_id;
+	event->netns_inum = read_sk_netns_inum(info->sk_ptr);
+
+	// Copy TCP receive sequence tracking fields (TCP only)
+	if (info->protocol == NETWORK_TCP) {
+		event->recv_seq_start = info->recv_seq_start;
+		event->rcv_nxt_at_entry = info->rcv_nxt_at_entry;
+		// Calculate end sequence: start + bytes consumed
+		event->recv_seq_end = info->recv_seq_start + (u32)ret;
+	} else {
+		// Zero recv sequence fields for non-TCP (UDP) events
+		event->recv_seq_start = 0;
+		event->recv_seq_end = 0;
+		event->rcv_nxt_at_entry = 0;
+	}
+
+	bpf_ringbuf_submit(event, flags);
+	bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+
+	// Note: Buffer queue end events are now emitted at packet dequeue time
+	// in tcp_recv_skb probe, not here at recvmsg exit
+
+	return 0;
+}
+
+SEC("kprobe/tcp_recvmsg")
+int BPF_KPROBE(tcp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t len, int flags)
+{
+	return handle_tcp_recvmsg_entry(sk, msg);
+}
+
+SEC("kretprobe/tcp_recvmsg")
+int BPF_KRETPROBE(tcp_recvmsg_exit, int ret)
+{
+	return handle_recvmsg_exit(ctx, ret);
+}
+
+// Store timing info for UDP receives on entry
+SEC("kprobe/udp_recvmsg")
+int BPF_KPROBE(udp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t len, int flags)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info info = {0};
+
+	info.protocol = NETWORK_UDP;
+	info.start_ts = bpf_ktime_get_boot_ns();
+	info.af = NETWORK_AF_INET;  // Default to IPv4
+	// Peer address/port will be extracted from sk_buff headers by __skb_recv_udp kretprobe
+
+	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
+
+	return 0;
+}
+
+// Capture the sk_buff when __skb_recv_udp returns it
+SEC("kretprobe/__skb_recv_udp")
+int BPF_KRETPROBE(skb_recv_udp_exit, struct sk_buff *skb)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	if (!skb)
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info *info = bpf_map_lookup_elem(&pending_network_recvs, &tgidpid);
+
+	if (!info || info->protocol != NETWORK_UDP)
+		return 0;
+
+	// Extract headers from the sk_buff
+	unsigned char *head = NULL;
+	u16 network_header = 0;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (head) {
+		// First, determine IP version by reading the first byte
+		u8 ip_version = 0;
+		bpf_probe_read_kernel(&ip_version, sizeof(ip_version), head + network_header);
+		ip_version = (ip_version >> 4) & 0x0F;
+
+		if (ip_version == 4) {
+			// IPv4
+			struct iphdr ip = {0};
+			struct udphdr udp = {0};
+
+			info->af = NETWORK_AF_INET;
+
+			// Read IP header to get source address (peer who sent to us)
+			if (bpf_probe_read_kernel(&ip, sizeof(ip), head + network_header) == 0) {
+				__builtin_memcpy(info->peer_addr, &ip.saddr, 4);
+			}
+
+			// Read UDP header to get source port (peer port)
+			if (bpf_probe_read_kernel(&udp, sizeof(udp), head + transport_header) == 0) {
+				info->peer_port = __builtin_bswap16(udp.source);
+			}
+		} else if (ip_version == 6) {
+			// IPv6
+			struct ipv6hdr ip6 = {0};
+			struct udphdr udp = {0};
+
+			info->af = NETWORK_AF_INET6;
+
+			// Read IPv6 header to get source address
+			if (bpf_probe_read_kernel(&ip6, sizeof(ip6), head + network_header) == 0) {
+				__builtin_memcpy(info->peer_addr, &ip6.saddr, 16);
+			}
+
+			// Read UDP header to get source port
+			if (bpf_probe_read_kernel(&udp, sizeof(udp), head + transport_header) == 0) {
+				info->peer_port = __builtin_bswap16(udp.source);
+			}
+		}
+
+		// Now that we have peer address/port, get or create socket ID
+		// Get the sock from the sk_buff and read source address
+		if (info->peer_port != 0) {
+			struct sock *sk = NULL;
+			bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+			if (sk) {
+				// Read our local source address from socket
+				read_socket_src_info(sk, &info->af, info->src_addr, &info->src_port);
+				info->socket_id = get_or_create_socket_id(sk, NETWORK_UDP, info->af,
+									  info->src_addr, info->src_port,
+									  info->peer_addr, info->peer_port, tgidpid);
+			}
+		}
+	}
+
+	return 0;
+}
+
+SEC("kretprobe/udp_recvmsg")
+int BPF_KRETPROBE(udp_recvmsg_exit, int ret)
+{
+	return handle_recvmsg_exit(ctx, ret);
+}
+
+// ========== UDP Packet-Level Tracing ==========
+
+// Trace udp_send_skb to capture UDP transmit packet details
+// Emits instant PACKET_UDP_SEND event
+SEC("kprobe/udp_send_skb")
+int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, struct inet_cork *cork)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!skb || !fl4)
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+	if (tool_config.packet_sample_rate > 1 &&
+	    !packet_sample_keep((u64)sk, udp_packet_key(skb)))
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_UDP;
+	event->event_type = PACKET_UDP_SEND;
+	event->cpu = bpf_get_smp_processor_id();
+	event->af = NETWORK_AF_INET;
+
+	// Calculate UDP payload length like kernel does (udp.c:1126-1127)
+	u32 skb_len = 0;
+	u16 network_header = 0;
+	u16 transport_header = 0;
+	bpf_probe_read_kernel(&skb_len, sizeof(skb_len), &skb->len);
+	bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	// Calculate IP header length
+	u32 ip_header_len = transport_header - network_header;
+
+	// Payload length = total - IP header - UDP header
+	u32 payload_len = skb_len > (ip_header_len + sizeof(struct udphdr))
+		? skb_len - ip_header_len - sizeof(struct udphdr)
+		: 0;
+	event->length = payload_len;
+
+	// Read flow info to get destination address
+	u32 daddr = 0;
+	u16 dport = 0;
+	bpf_probe_read_kernel(&daddr, sizeof(daddr), &fl4->daddr);
+	bpf_probe_read_kernel(&dport, sizeof(dport), &fl4->uli.ports.dport);
+
+	__builtin_memcpy(event->dest_addr, &daddr, 4);
+	event->dest_port = __builtin_bswap16(dport);
+
+	// Read source address from socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+
+	// Initialize TCP-only fields (not applicable for UDP)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace udp_queue_rcv_one_skb to capture UDP receive
+// Emits instant PACKET_UDP_RCV event
+SEC("kprobe/udp_queue_rcv_one_skb")
+int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk || !skb)
+		return 0;
+
+	// Extract headers from skb
+	unsigned char *head = NULL;
+	u16 network_header = 0;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (!head)
+		return 0;
+	if (!packet_sample_keep((u64)sk, (u64)head))
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_UDP;
+	event->event_type = PACKET_UDP_RCV;
+	event->cpu = bpf_get_smp_processor_id();
+	event->af = NETWORK_AF_INET;
+
+	// Read IP and UDP headers to get peer address and payload length
+	struct iphdr ip = {0};
+	struct udphdr udp = {0};
+
+	if (bpf_probe_read_kernel(&ip, sizeof(ip), head + network_header) == 0) {
+		__builtin_memcpy(event->dest_addr, &ip.saddr, 4);
+	}
+
+	if (bpf_probe_read_kernel(&udp, sizeof(udp), head + transport_header) == 0) {
+		event->dest_port = __builtin_bswap16(udp.source);
+		u16 udp_total_len = __builtin_bswap16(udp.len);
+		event->length = udp_total_len > sizeof(struct udphdr)
+			? udp_total_len - sizeof(struct udphdr)
+			: 0;
+	}
+
+	// Read source address from socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
+	// Look up socket ID
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+
+	// Initialize TCP-only fields (not applicable for UDP)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace __udp_enqueue_schedule_skb to capture buffer queue entry point
+// Emits instant PACKET_UDP_ENQUEUE event
+SEC("kprobe/__udp_enqueue_schedule_skb")
+int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *skb)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk || !skb)
+		return 0;
+
+	// Extract headers from skb
+	unsigned char *head = NULL;
+	u16 network_header = 0;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (!head)
+		return 0;
+	if (!packet_sample_keep((u64)sk, (u64)head))
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_UDP;
+	event->event_type = PACKET_UDP_ENQUEUE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->af = NETWORK_AF_INET;
+
+	// Read IP and UDP headers to get peer address and payload length
+	struct iphdr ip = {0};
+	struct udphdr udp = {0};
+
+	if (bpf_probe_read_kernel(&ip, sizeof(ip), head + network_header) == 0) {
+		__builtin_memcpy(event->dest_addr, &ip.saddr, 4);
+	}
+
+	if (bpf_probe_read_kernel(&udp, sizeof(udp), head + transport_header) == 0) {
+		event->dest_port = __builtin_bswap16(udp.source);
+		u16 udp_total_len = __builtin_bswap16(udp.len);
+		event->length = udp_total_len > sizeof(struct udphdr)
+			? udp_total_len - sizeof(struct udphdr)
+			: 0;
+	}
+
+	// Read source address from socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
+	// Look up socket ID
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+
+	// Initialize TCP-only fields (not applicable for UDP)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace __tcp_transmit_skb to capture packet details at transmission
+// Emits instant PACKET_ENQUEUE event with tcp_skb_cb metadata
+SEC("kprobe/__tcp_transmit_skb")
+int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int clone_it, gfp_t gfp_mask, u32 rcv_nxt)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk || !skb)
+		return 0;
+
+	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
+	u32 start_seq = 0;
+	u32 end_seq = 0;
+	u8 tcp_flags = 0;
+	u8 sacked = 0;
+
+	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
+	if (!packet_sample_keep((u64)sk, start_seq))
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_ENQUEUE;
+	event->cpu = bpf_get_smp_processor_id();
+
+	// Extract source and destination address from the socket (full 4-tuple)
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
+
+	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
+	bpf_probe_read_kernel(&tcp_flags, sizeof(tcp_flags), &tcb->tcp_flags);
+	bpf_probe_read_kernel(&sacked, sizeof(sacked), &tcb->sacked);
+
+	event->seq = start_seq;
+	event->length = end_seq - start_seq;
+	event->tcp_flags = tcp_flags;
+
+	// TCPCB_RETRANS = TCPCB_SACKED_RETRANS | TCPCB_EVER_RETRANS | TCPCB_REPAIRED
+	#define TCPCB_RETRANS 0x92
+	event->is_retransmit = (sacked & TCPCB_RETRANS) ? 1 : 0;
+
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	// Read send buffer state from socket
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	event->sndbuf_used = (u32)wmem_queued;
+	event->sndbuf_limit = (u32)sndbuf;
+
+	// Read persist timer state from inet_connection_sock
+	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
+	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
+	read_icsk_timeout(sk, icsk, &event->icsk_timeout);
+	bpf_probe_read_kernel(&event->rto_jiffies, sizeof(event->rto_jiffies), &icsk->icsk_rto);
+	bpf_probe_read_kernel(&event->probe_count, sizeof(event->probe_count), &icsk->icsk_probes_out);
+	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Helper to extract TCP sequence from skb
+static __always_inline int read_tcp_seq_from_skb(struct sk_buff *skb, u32 *seq)
+{
+	unsigned char *head = NULL;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (!head || transport_header == (u16)~0U)
+		return -1;
+
+	struct tcphdr tcp = {0};
+	if (bpf_probe_read_kernel(&tcp, sizeof(tcp), head + transport_header) != 0)
+		return -1;
+
+	*seq = __builtin_bswap32(tcp.seq);
+	return 0;
+}
+
+// Helper to emit instant packet event for TCP with full socket metadata
+static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff *skb,
+						  enum packet_event_type event_type)
+{
+	// Read seq from TCP header in skb: the packet's sampling key and its
+	// seq field.
+	u32 seq = 0;
+	read_tcp_seq_from_skb(skb, &seq);
+	if (!packet_sample_keep((u64)sk, seq))
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = event_type;
+	event->cpu = bpf_get_smp_processor_id();
+
+	// Extract full 4-tuple from socket (src and dest addresses/ports)
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
+
+	event->seq = seq;
+
+	u32 len = 0;
+	bpf_probe_read_kernel(&len, sizeof(len), &skb->len);
+	event->length = len;
+	event->tcp_flags = 0;  // tcp_skb_cb not available at this probe point
+	event->is_retransmit = 0;  // TCPCB_RETRANS not available at this probe point
+
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	// Read send buffer state from socket
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	event->sndbuf_used = (u32)wmem_queued;
+	event->sndbuf_limit = (u32)sndbuf;
+
+	// Initialize persist timer fields (not available at this probe point)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Helper to emit instant packet event for UDP with socket metadata
+static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff *skb,
+						  u32 length, enum packet_event_type event_type)
+{
+	if (tool_config.packet_sample_rate > 1 &&
+	    !packet_sample_keep((u64)sk, udp_packet_key(skb)))
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_UDP;
+	event->event_type = event_type;
+	event->cpu = bpf_get_smp_processor_id();
+	event->length = length;
+
+	// Extract destination address and port from the socket
+	// Read source and destination address from socket (full 4-tuple)
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
+
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+
+	// Initialize TCP-only fields (not applicable for UDP)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace net_dev_start_xmit to capture actual packet transmission (device queue -> NIC)
+// TCP PACKET_ENQUEUE is emitted at __tcp_transmit_skb, so this only emits PACKET_SEND
+SEC("tp_btf/net_dev_start_xmit")
+int BPF_PROG(net_dev_start_xmit, struct sk_buff *skb, struct net_device *dev)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!skb)
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	// Check protocol type from socket
+	u16 protocol = 0;
+	bpf_probe_read_kernel(&protocol, sizeof(protocol), &sk->sk_protocol);
+
+	// Emit PACKET_SEND instant event
+	if (protocol == IPPROTO_TCP) {
+		return emit_tcp_packet_event(sk, skb, PACKET_SEND);
+	} else if (protocol == IPPROTO_UDP) {
+		// Get packet length from skb
+		u32 len = 0;
+		bpf_probe_read_kernel(&len, sizeof(len), &skb->len);
+		return emit_udp_packet_event(sk, skb, len, PACKET_SEND);
+	}
+
+	return 0;
+}
+
+// Helper to read source address from IP headers in received packet
+static __always_inline int read_src_addr_from_skb(struct sk_buff *skb,
+						   enum network_address_family *af,
+						   u8 *src_addr, u16 *src_port)
+{
+	unsigned char *head = NULL;
+	u16 network_header = 0;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (!head || network_header == (u16)~0U || transport_header == (u16)~0U)
+		return -1;
+
+	u8 ip_version = 0;
+	bpf_probe_read_kernel(&ip_version, sizeof(ip_version), head + network_header);
+	ip_version = (ip_version >> 4) & 0x0F;
+
+	if (ip_version == 4) {
+		*af = NETWORK_AF_INET;
+		struct iphdr ip = {0};
+		struct tcphdr tcp = {0};
+
+		if (bpf_probe_read_kernel(&ip, sizeof(ip), head + network_header) != 0)
+			return -1;
+		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), head + transport_header) != 0)
+			return -1;
+
+		__builtin_memcpy(src_addr, &ip.saddr, 4);
+		*src_port = __builtin_bswap16(tcp.source);
+		return 0;
+	} else if (ip_version == 6) {
+		*af = NETWORK_AF_INET6;
+		struct ipv6hdr ip6 = {0};
+		struct tcphdr tcp = {0};
+
+		if (bpf_probe_read_kernel(&ip6, sizeof(ip6), head + network_header) != 0)
+			return -1;
+		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), head + transport_header) != 0)
+			return -1;
+
+		__builtin_memcpy(src_addr, &ip6.saddr, 16);
+		*src_port = __builtin_bswap16(tcp.source);
+		return 0;
+	}
+
+	return -1;
+}
+
+// Trace tcp_rcv_established to capture when packet enters TCP layer
+// Emits instant PACKET_RCV_ESTABLISHED event
+SEC("kprobe/tcp_rcv_established")
+int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk || !skb)
+		return 0;
+
+	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
+	u32 start_seq = 0;
+	u32 end_seq = 0;
+	u8 tcp_flags = 0;
+
+	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
+	if (!packet_sample_keep((u64)sk, start_seq))
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_RCV_ESTABLISHED;
+	event->cpu = bpf_get_smp_processor_id();
+
+	// For receive: dest_addr/port are actually the peer who sent to us
+	if (read_src_addr_from_skb(skb, &event->af, event->dest_addr, &event->dest_port) != 0) {
+		bpf_ringbuf_discard(event, flags);
+		return 0;
+	}
+
+	// Read our local source address from the socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
+	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
+	bpf_probe_read_kernel(&tcp_flags, sizeof(tcp_flags), &tcb->tcp_flags);
+
+	event->seq = start_seq;
+	event->length = end_seq - start_seq;
+	event->tcp_flags = tcp_flags;
+
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+
+	// Initialize persist timer fields (receive events don't have this info)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace tcp_queue_rcv to capture when data enters socket buffer.
+// Covers both the header-prediction fast path in tcp_rcv_established and the
+// slow path via tcp_data_queue, which also calls tcp_queue_rcv for in-sequence
+// data. Emits instant PACKET_QUEUE_RCV event.
+SEC("kprobe/tcp_queue_rcv")
+int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *fragstolen)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk || !skb)
+		return 0;
+
+	// Read seq from TCP header: the packet's sampling key and its seq field
+	u32 seq = 0;
+	read_tcp_seq_from_skb(skb, &seq);
+	if (!packet_sample_keep((u64)sk, seq))
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_QUEUE_RCV;
+	event->cpu = bpf_get_smp_processor_id();
+
+	// Read source (peer) address from skb
+	if (read_src_addr_from_skb(skb, &event->af, event->dest_addr, &event->dest_port) != 0) {
+		bpf_ringbuf_discard(event, flags);
+		return 0;
+	}
+
+	// Read our local source address from the socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
+	event->seq = seq;
+
+	// Read length from tcp_skb_cb
+	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
+	u32 start_seq = 0;
+	u32 end_seq = 0;
+	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
+	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
+	event->length = end_seq - start_seq;
+	event->tcp_flags = 0;
+
+	// Look up socket ID
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+
+	// Initialize persist timer fields (receive events don't have this info)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Track when data is copied from skb to userspace (actual packet consumption)
+// Emits instant PACKET_BUFFER_QUEUE event
+SEC("tp_btf/skb_copy_datagram_iovec")
+int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	if (!skb)
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	// Read seq from TCP header: the packet's sampling key and its seq field.
+	// This hook fires for UDP reads too (the event is labelled TCP either
+	// way, as before); under sampling a UDP packet's key is its buffer, the
+	// key its receive and enqueue stages hashed.
+	u32 seq = 0;
+	read_tcp_seq_from_skb(skb, &seq);
+	if (tool_config.packet_sample_rate > 1) {
+		u16 sk_protocol = 0;
+		bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+		u64 sample_key = (sk_protocol == IPPROTO_UDP) ? udp_packet_key(skb) : seq;
+		if (!packet_sample_keep((u64)sk, sample_key))
+			return 0;
+	}
+
+	long flags;
+	struct packet_event *pkt_event = reserve_packet_event(&flags);
+	if (!pkt_event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	pkt_event->ts = bpf_ktime_get_boot_ns();
+	pkt_event->protocol = NETWORK_TCP;
+	pkt_event->event_type = PACKET_BUFFER_QUEUE;
+	pkt_event->cpu = bpf_get_smp_processor_id();
+
+	// Read peer address from socket
+	if (read_socket_dest_info(sk, &pkt_event->af, pkt_event->dest_addr, &pkt_event->dest_port) != 0) {
+		bpf_ringbuf_discard(pkt_event, flags);
+		return 0;
+	}
+
+	// Read our local source address from the socket
+	read_socket_src_info(sk, &pkt_event->af, pkt_event->src_addr, &pkt_event->src_port);
+
+	pkt_event->seq = seq;
+	pkt_event->length = len;
+	pkt_event->tcp_flags = 0;
+
+	// Look up socket ID
+	pkt_event->socket_id = lookup_socket_id(sk, pkt_event->src_addr, pkt_event->src_port,
+						 pkt_event->dest_addr, pkt_event->dest_port);
+	pkt_event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	pkt_event->sndbuf_used = 0;
+	pkt_event->sndbuf_limit = 0;
+
+	// Initialize persist timer fields (buffer queue events don't have this info)
+	pkt_event->icsk_pending = 0;
+	pkt_event->icsk_timeout = 0;
+	pkt_event->rto_jiffies = 0;
+	pkt_event->probe_count = 0;
+	pkt_event->backoff = 0;
+
+	bpf_ringbuf_submit(pkt_event, flags);
+	return 0;
+}
+
+// Trace tcp_send_probe0 to capture zero window probe events
+// Zero window probes are sent when the peer advertises a zero receive window
+// and the sender has data waiting to be transmitted
+SEC("kprobe/tcp_send_probe0")
+int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_ZERO_WINDOW_PROBE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->is_zero_window_probe = 1;
+
+	// Extract socket address info (full 4-tuple)
+	if (read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			       event->dest_addr, &event->dest_port) != 0) {
+		bpf_ringbuf_discard(event, flags);
+		return 0;
+	}
+
+	// Read TCP-specific info from tcp_sock
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+	u32 snd_una;
+	bpf_probe_read_kernel(&snd_una, sizeof(snd_una), &tp->snd_una);
+	event->seq = snd_una - 1;  // Probe uses SND.UNA - 1
+	event->length = 0;  // Zero-length probe
+	event->tcp_flags = 0x10;  // ACK flag
+
+	// Read current send window (should be 0 for zero window condition)
+	u32 snd_wnd;
+	bpf_probe_read_kernel(&snd_wnd, sizeof(snd_wnd), &tp->snd_wnd);
+	event->snd_wnd = snd_wnd;
+
+	// Read zero window probe count from inet_connection_sock
+	// Note: icsk_probes_out is incremented AFTER tcp_send_probe0 returns,
+	// so this value may be off by 1 (showing N-1 instead of N probes)
+	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
+	u8 probes_out;
+	bpf_probe_read_kernel(&probes_out, sizeof(probes_out), &icsk->icsk_probes_out);
+	event->probe_count = probes_out;
+
+	// Read send buffer state from socket
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	// Validate values to prevent negative/garbage data
+	event->sndbuf_used = wmem_queued > 0 ? (u32)wmem_queued : 0;
+	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
+
+	// Read persist timer state (since this is a zero window probe, timer is active)
+	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
+	read_icsk_timeout(sk, icsk, &event->icsk_timeout);
+	bpf_probe_read_kernel(&event->rto_jiffies, sizeof(event->rto_jiffies), &icsk->icsk_rto);
+	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
+
+	// Get socket ID for correlation
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace tcp_send_ack to capture receiver-side zero/low window ACK events
+// This fires when the receiver sends an ACK, which includes the advertised window.
+// We only emit events when the receive window is zero or very low (< 1/16 of buffer).
+SEC("kprobe/tcp_send_ack")
+int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk)
+		return 0;
+
+	// Read TCP socket state
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+
+	// Read receive window from socket (unscaled value in TCP header)
+	u32 rcv_wnd;
+	bpf_probe_read_kernel(&rcv_wnd, sizeof(rcv_wnd), &tp->rcv_wnd);
+
+	// Read window scale from rx_opt to calculate actual window size
+	// (rcv_wscale is a bit-field, so read the whole struct)
+	struct tcp_options_received rx_opt;
+	bpf_probe_read_kernel(&rx_opt, sizeof(rx_opt), &tp->rx_opt);
+	u8 rcv_wscale = rx_opt.rcv_wscale;
+
+	// Calculate actual window size accounting for scaling
+	// rcv_wnd is the unscaled value; actual window = rcv_wnd << rcv_wscale
+	u32 rcv_wnd_scaled = rcv_wnd << rcv_wscale;
+
+	// Read receive buffer state
+	int rmem_alloc = 0;
+	int rcvbuf = 0;
+	bpf_probe_read_kernel(&rmem_alloc, sizeof(rmem_alloc), &sk->sk_backlog.rmem_alloc.counter);
+	bpf_probe_read_kernel(&rcvbuf, sizeof(rcvbuf), &sk->sk_rcvbuf);
+
+	// Determine threshold for "low window" (e.g., < 1/16 of buffer)
+	u32 low_window_threshold = rcvbuf > 0 ? (u32)rcvbuf >> 4 : 0;
+
+	// Only emit event if scaled window is zero or very low
+	// This filters out the vast majority of normal ACKs
+	if (rcv_wnd_scaled > low_window_threshold)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_ZERO_WINDOW_ACK;
+	event->cpu = bpf_get_smp_processor_id();
+	event->is_zero_window_ack = (rcv_wnd == 0) ? 1 : 0;
+
+	// Extract socket address info (peer address - who we're sending the ACK to)
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		event->af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(event->dest_addr, &addr, 4);
+	} else if (family == AF_INET6) {
+		event->af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+	} else {
+		// Unknown address family, discard event
+		bpf_ringbuf_discard(event, flags);
+		return 0;
+	}
+	bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
+			      &sk->__sk_common.skc_dport);
+	event->dest_port = __builtin_bswap16(event->dest_port);
+
+	// Receiver-side metrics
+	event->rcv_wnd = rcv_wnd;
+	event->rcv_buf_used = rmem_alloc > 0 ? (u32)rmem_alloc : 0;
+	event->rcv_buf_limit = rcvbuf > 0 ? (u32)rcvbuf : 0;
+
+	// Read window clamp
+	u32 window_clamp;
+	bpf_probe_read_kernel(&window_clamp, sizeof(window_clamp), &tp->window_clamp);
+	event->window_clamp = window_clamp;
+
+	// Use rcv_wscale read earlier (before threshold check)
+	event->rcv_wscale = rcv_wscale;
+
+	// Read rcv_nxt as the sequence being ACKed
+	u32 rcv_nxt;
+	bpf_probe_read_kernel(&rcv_nxt, sizeof(rcv_nxt), &tp->rcv_nxt);
+	event->seq = rcv_nxt;
+	event->length = 0;  // Pure ACK
+	event->tcp_flags = 0x10;  // ACK flag
+
+	// Get socket ID for correlation
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	// Initialize persist timer fields (receiver-side ACK events don't have this info)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace tcp_retransmit_timer to capture RTO timeout events
+// RTO (Retransmission Timeout) fires when the sender hasn't received an ACK
+// within the expected timeout period, indicating possible packet loss
+//
+// TIMING NOTE: This kprobe fires at ENTRY of tcp_retransmit_timer, meaning:
+// - icsk_retransmits has NOT been incremented yet (we add 1 to compensate)
+// - icsk_backoff has NOT been incremented yet (we report the current value)
+// - The actual retransmission has NOT been sent yet
+// - RTO value is the CURRENT RTO before potential exponential backoff
+//
+// EDGE CASE: If snd_wnd==0, this RTO may be handling a zero-window condition
+// rather than a true loss-based retransmit. We set is_zero_window_probe=1 in
+// this case to distinguish from regular RTOs.
+SEC("kprobe/tcp_retransmit_timer")
+int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk)
+		return 0;
+
+	// Read TCP socket state to check if there are packets in flight
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+	u32 packets_out;
+	bpf_probe_read_kernel(&packets_out, sizeof(packets_out), &tp->packets_out);
+
+	// Only emit if there are actually packets waiting (avoid spurious events)
+	if (packets_out == 0)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_RTO_TIMEOUT;
+	event->cpu = bpf_get_smp_processor_id();
+	event->is_retransmit = 1;  // RTO triggers retransmission
+
+	// Extract socket address info (full 4-tuple)
+	if (read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			       event->dest_addr, &event->dest_port) != 0) {
+		bpf_ringbuf_discard(event, flags);
+		return 0;
+	}
+
+	// Read TCP-specific info
+	u32 snd_una;
+	bpf_probe_read_kernel(&snd_una, sizeof(snd_una), &tp->snd_una);
+	event->seq = snd_una;  // Sequence number of first unacknowledged byte
+	event->length = 0;  // This is an RTO event, not a packet
+	event->tcp_flags = 0;  // RTO timeout event, no specific flags
+
+	// Read current send window
+	u32 snd_wnd;
+	bpf_probe_read_kernel(&snd_wnd, sizeof(snd_wnd), &tp->snd_wnd);
+	event->snd_wnd = snd_wnd;
+
+	// If snd_wnd is 0, this RTO is handling a zero-window condition
+	if (snd_wnd == 0) {
+		event->is_zero_window_probe = 1;
+	}
+
+	// Read RTO-related fields from inet_connection_sock
+	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
+	u32 icsk_rto;
+	u8 icsk_retransmits;
+	u8 icsk_backoff;
+	bpf_probe_read_kernel(&icsk_rto, sizeof(icsk_rto), &icsk->icsk_rto);
+	bpf_probe_read_kernel(&icsk_retransmits, sizeof(icsk_retransmits), &icsk->icsk_retransmits);
+	bpf_probe_read_kernel(&icsk_backoff, sizeof(icsk_backoff), &icsk->icsk_backoff);
+
+	// Store RTO as raw jiffies - conversion to microseconds happens in userspace
+	// where we can read the system's actual HZ value from /proc/sys/kernel/sched_clock_tick_rate
+	event->rto_jiffies = icsk_rto;
+
+	// Add 1 to retransmit_count because we fire BEFORE the kernel increments it
+	// (tcp_retransmit_timer increments icsk_retransmits after our probe fires)
+	event->retransmit_count = icsk_retransmits + 1;
+
+	// backoff is not incremented until later in the function, so report current value
+	event->backoff = icsk_backoff;
+
+	// Read RTT measurements from tcp_sock
+	u32 srtt_us;
+	u32 rttvar_us;
+	bpf_probe_read_kernel(&srtt_us, sizeof(srtt_us), &tp->srtt_us);
+	bpf_probe_read_kernel(&rttvar_us, sizeof(rttvar_us), &tp->rttvar_us);
+	// srtt_us is stored shifted by 3 bits
+	event->srtt_us = srtt_us >> 3;
+	event->rttvar_us = rttvar_us;
+
+	// Read send buffer state from socket
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	event->sndbuf_used = wmem_queued > 0 ? (u32)wmem_queued : 0;
+	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
+
+	// Get socket ID for correlation
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+
+	// Read persist timer state
+	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
+	read_icsk_timeout(sk, icsk, &event->icsk_timeout);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// ============================================================================
+// Epoll Tracking (ep_item_poll)
+// ============================================================================
+
+// S_IFSOCK from linux/stat.h
+#define S_IFSOCK 0140000
+#define S_IFMT   0170000
+
+// Extract socket from file, returns NULL if file is not a socket
+static __always_inline struct sock *get_sock_from_file(struct file *file)
+{
+	if (!file)
+		return NULL;
+
+	// Check if this is a socket file by checking inode mode
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+	if (!inode)
+		return NULL;
+
+	umode_t i_mode = 0;
+	bpf_probe_read_kernel(&i_mode, sizeof(i_mode), &inode->i_mode);
+
+	// Check if it's a socket (S_IFSOCK)
+	if ((i_mode & S_IFMT) != S_IFSOCK)
+		return NULL;
+
+	// For socket files, private_data points to struct socket
+	struct socket *socket = NULL;
+	bpf_probe_read_kernel(&socket, sizeof(socket), &file->private_data);
+	if (!socket)
+		return NULL;
+
+	// Get struct sock from socket
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &socket->sk);
+	return sk;
+}
+
+SEC("kprobe/tcp_poll")
+int BPF_KPROBE(tcp_poll_entry, struct file *file, struct socket *sock, poll_table *wait)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &sock->sk);
+	if (!sk)
+		return 0;
+
+	u32 requested_events = 0;
+	if (wait) {
+		bpf_probe_read_kernel(&requested_events, sizeof(requested_events), &wait->_key);
+	}
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+
+	enum network_address_family af = NETWORK_AF_INET;
+	u8 src_addr[16] = {0};
+	u16 src_port = 0;
+	u8 dest_addr[16] = {0};
+	u16 dest_port = 0;
+	read_socket_src_info(sk, &af, src_addr, &src_port);
+	read_socket_dest_info(sk, &af, dest_addr, &dest_port);
+
+	if (dest_port == 0)
+		return 0;
+
+	u64 socket_id = get_or_create_socket_id(sk, NETWORK_TCP, af, src_addr, src_port, dest_addr, dest_port, tgidpid);
+	if (socket_id == 0)
+		return 0;
+
+	struct epoll_poll_info info = {
+		.requested_events = requested_events,
+		.socket_id = socket_id,
+	};
+	bpf_map_update_elem(&pending_epoll_polls, &tgidpid, &info, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/tcp_poll")
+int BPF_KRETPROBE(tcp_poll_exit, __poll_t ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct epoll_poll_info *info = bpf_map_lookup_elem(&pending_epoll_polls, &tgidpid);
+	if (!info)
+		return 0;
+
+	if (ret == 0) {
+		bpf_map_delete_elem(&pending_epoll_polls, &tgidpid);
+		return 0;
+	}
+
+	long flags;
+	struct epoll_event_bpf *event = reserve_epoll_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&pending_epoll_polls, &tgidpid);
+		return handle_missed_event(MISSED_EPOLL_EVENT);
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->socket_id = info->socket_id;
+	event->requested_events = info->requested_events;
+	event->returned_events = (u32)ret;
+
+	bpf_ringbuf_submit(event, flags);
+	bpf_map_delete_elem(&pending_epoll_polls, &tgidpid);
+	return 0;
+}
+
+// ========== Packet Drop Tracing (Phase 1) ==========
+
+// Helper to check if an SKB belongs to a TCP/UDP socket we're tracking
+static __always_inline u64 get_socket_id_from_skb(struct sk_buff *skb)
+{
+	if (!skb)
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	// Read socket family to check if it's TCP or UDP
+	u16 sk_family = 0;
+	u8 sk_protocol = 0;
+	bpf_probe_read_kernel(&sk_family, sizeof(sk_family), &sk->__sk_common.skc_family);
+	bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+
+	// Only trace TCP (IPPROTO_TCP=6) and UDP (IPPROTO_UDP=17) sockets
+	if (sk_protocol != 6 && sk_protocol != 17)
+		return 0;
+
+	// Only trace AF_INET (2) and AF_INET6 (10)
+	if (sk_family != AF_INET && sk_family != AF_INET6)
+		return 0;
+
+	// Look up socket_id from our sk_socket_id_map
+	u64 sk_ptr = (u64)sk;
+	u64 *socket_id_ptr = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (socket_id_ptr)
+		return *socket_id_ptr;
+
+	return 0;
+}
+
+// Trace kfree_skb to capture all packet drops with reason codes
+// This is the most comprehensive drop tracing point in the kernel
+SEC("tracepoint/skb/kfree_skb")
+int tracepoint__skb__kfree_skb(struct trace_event_raw_kfree_skb *ctx)
+{
+	if (!tracing_enabled)
+		return 0;
+	// Get the SKB and check if it's associated with a tracked socket
+	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
+	u64 socket_id = get_socket_id_from_skb(skb);
+
+	// Only emit events for sockets we're tracking
+	if (socket_id == 0)
+		return 0;
+
+	// Skip SKB_CONSUMED and SKB_NOT_DROPPED_YET - these aren't real drops
+	if (ctx->reason <= 1)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->event_type = PACKET_SKB_DROP;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = socket_id;
+
+	// Record drop reason and location
+	event->drop_reason = (u32)ctx->reason;
+	event->drop_location = (u64)ctx->location;
+
+	// Try to extract protocol from skb
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (sk) {
+		u8 sk_protocol = 0;
+		bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+		event->protocol = (sk_protocol == 6) ? NETWORK_TCP : NETWORK_UDP;
+
+		// Read socket addresses
+		read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+				  event->dest_addr, &event->dest_port);
+
+		// Read buffer state
+		int wmem_queued = 0;
+		int sndbuf = 0;
+		bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+		bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+		event->sndbuf_used = (u32)wmem_queued;
+		event->sndbuf_limit = (u32)sndbuf;
+	} else {
+		event->protocol = NETWORK_TCP;  // Default when sk is NULL
+	}
+
+	// Try to get packet length from skb
+	u32 skb_len = 0;
+	bpf_probe_read_kernel(&skb_len, sizeof(skb_len), &skb->len);
+	event->length = skb_len;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Track pending enqueue_to_backlog calls for correlation with kretprobe
+struct backlog_entry {
+	struct sk_buff *skb;
+	u32 cpu;
+	u64 socket_id;  // Store socket_id to avoid duplicate lookup in kretprobe
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // pid_tgid
+	__type(value, struct backlog_entry);
+	__uint(max_entries, 10240);
+} pending_backlog SEC(".maps");
+
+// Trace enqueue_to_backlog entry to capture queue state before potential drop
+SEC("kprobe/enqueue_to_backlog")
+int BPF_KPROBE(enqueue_to_backlog_entry, struct sk_buff *skb, int cpu, unsigned int *qtail)
+{
+	if (!tracing_enabled)
+		return 0;
+	u64 socket_id = get_socket_id_from_skb(skb);
+	if (socket_id == 0)
+		return 0;
+
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct backlog_entry entry = {
+		.skb = skb,
+		.cpu = (u32)cpu,
+		.socket_id = socket_id,
+	};
+	bpf_map_update_elem(&pending_backlog, &pid_tgid, &entry, BPF_ANY);
+	return 0;
+}
+
+// Trace enqueue_to_backlog exit to detect drops (NET_RX_DROP return)
+SEC("kretprobe/enqueue_to_backlog")
+int BPF_KRETPROBE(enqueue_to_backlog_exit, int ret)
+{
+	if (!tracing_enabled)
+		return 0;
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct backlog_entry *entry = bpf_map_lookup_elem(&pending_backlog, &pid_tgid);
+	if (!entry) {
+		return 0;
+	}
+
+	struct sk_buff *skb = entry->skb;
+	u32 target_cpu = entry->cpu;
+	u64 socket_id = entry->socket_id;  // Use stored socket_id instead of re-looking up
+	bpf_map_delete_elem(&pending_backlog, &pid_tgid);
+
+	// NET_RX_DROP = 1 indicates the packet was dropped
+	if (ret != 1)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->event_type = PACKET_CPU_BACKLOG_DROP;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = socket_id;
+
+	// The drop reason is SKB_DROP_REASON_CPU_BACKLOG (66)
+	event->drop_reason = 66;  // SKB_DROP_REASON_CPU_BACKLOG
+
+	// Record which CPU's backlog was full in qlen field
+	// Note: qlen_limit=1000 is the default netdev_max_backlog, but may differ
+	// if sysctl net.core.netdev_max_backlog has been tuned
+	event->qlen = target_cpu;
+	event->qlen_limit = 1000;
+
+	// Extract socket info
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (sk) {
+		u8 sk_protocol = 0;
+		bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+		event->protocol = (sk_protocol == 6) ? NETWORK_TCP : NETWORK_UDP;
+
+		read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+				  event->dest_addr, &event->dest_port);
+	} else {
+		event->protocol = NETWORK_TCP;  // Default when sk is NULL
+	}
+
+	// Get packet length
+	u32 skb_len = 0;
+	bpf_probe_read_kernel(&skb_len, sizeof(skb_len), &skb->len);
+	event->length = skb_len;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// ========== TCP Memory Pressure / TSQ Throttling (Phase 2) ==========
+
+// Trace sk_stream_wait_memory to detect when TCP is blocked on send buffer
+// This is called when the application's write is blocked waiting for buffer space
+SEC("kprobe/sk_stream_wait_memory")
+int BPF_KPROBE(sk_stream_wait_memory_entry, struct sock *sk, long *timeo)
+{
+	if (!tracing_enabled)
+		return 0;
+	if (!sk)
+		return 0;
+
+	// Check if this is a TCP socket
+	u8 sk_protocol = 0;
+	bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+	if (sk_protocol != 6)  // IPPROTO_TCP
+		return 0;
+
+	// Look up socket_id
+	u64 sk_ptr = (u64)sk;
+	u64 *socket_id_ptr = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!socket_id_ptr)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->event_type = PACKET_MEM_PRESSURE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = *socket_id_ptr;
+	event->netns_inum = read_sk_netns_inum(sk_ptr);
+	event->protocol = NETWORK_TCP;
+
+	// Read socket addresses
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
+
+	// Read buffer state - this is the key info for memory pressure
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	event->sndbuf_used = (u32)wmem_queued;
+	event->sndbuf_limit = (u32)sndbuf;
+
+	// Read sk_wmem_alloc for TSQ tracking
+	int wmem_alloc = 0;
+	bpf_probe_read_kernel(&wmem_alloc, sizeof(wmem_alloc), &sk->sk_wmem_alloc.refs.counter);
+	event->sk_wmem_alloc = (u32)wmem_alloc;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Note: tcp_tsq_write probe removed - function is often inlined/split by compiler
+// (appears as tcp_tsq_write.part.0). Memory pressure is captured by sk_stream_wait_memory.
+
+// ========== Qdisc Tracing (Phase 3) ==========
+// Track packets in qdisc queue to detect where packets get stuck
+
+// Helper to populate packet event from socket and skb (reduces code duplication)
+static __always_inline void populate_qdisc_event_from_skb(
+	struct packet_event *event,
+	struct sock *sk,
+	struct sk_buff *skb)
+{
+	// Read protocol from socket
+	u8 sk_protocol = 0;
+	bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+	event->protocol = (sk_protocol == 6) ? NETWORK_TCP : NETWORK_UDP;
+
+	// Read socket addresses
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
+
+	// Read send buffer state
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	event->sndbuf_used = (u32)wmem_queued;
+	event->sndbuf_limit = (u32)sndbuf;
+
+	// Read packet length from skb
+	u32 skb_len = 0;
+	bpf_probe_read_kernel(&skb_len, sizeof(skb_len), &skb->len);
+	event->length = skb_len;
+}
+
+// Map to track packets in qdisc for latency calculation
+struct qdisc_packet_entry {
+	u64 socket_id;
+	u64 enqueue_ts;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // skb address
+	__type(value, struct qdisc_packet_entry);
+	__uint(max_entries, 65536);
+} pending_qdisc_packets SEC(".maps");
+
+// Trace qdisc_enqueue tracepoint - packet entering qdisc queue
+SEC("tracepoint/qdisc/qdisc_enqueue")
+int tracepoint__qdisc__qdisc_enqueue(struct trace_event_raw_qdisc_enqueue *ctx)
+{
+	if (!tracing_enabled)
+		return 0;
+	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
+	if (!skb)
+		return 0;
+
+	// Get socket from skb
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	// Check if we're tracking this socket
+	u64 sk_ptr = (u64)sk;
+	u64 *socket_id_ptr = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!socket_id_ptr)
+		return 0;
+
+	u64 socket_id = *socket_id_ptr;
+
+	// The packet's sampling key: the TCP seq (the key the transmit and
+	// send stages hash), the buffer address for UDP — read only when
+	// sampling is on (rodata: the whole arm is pruned at the default). A
+	// packet sampled out is never inserted into pending_qdisc_packets, so
+	// the dequeue side finds nothing and the pair is kept or dropped
+	// together.
+	if (tool_config.packet_sample_rate > 1) {
+		u16 sk_protocol = 0;
+		bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+		u64 sample_key;
+		if (sk_protocol == IPPROTO_TCP) {
+			u32 seq = 0;
+			read_tcp_seq_from_skb(skb, &seq);
+			sample_key = seq;
+		} else {
+			sample_key = udp_packet_key(skb);
+		}
+		if (!packet_sample_keep((u64)sk, sample_key))
+			return 0;
+	}
+
+	// Read qdisc state
+	struct Qdisc *qdisc = (struct Qdisc *)ctx->qdisc;
+	u32 qlen = 0;
+	u32 backlog = 0;
+	unsigned long qdisc_state = 0;
+
+	if (qdisc) {
+		// Read qdisc queue length from q.qlen
+		bpf_probe_read_kernel(&qlen, sizeof(qlen), &qdisc->q.qlen);
+		// Read qdisc state
+		bpf_probe_read_kernel(&qdisc_state, sizeof(qdisc_state), &qdisc->state);
+		// Read backlog from qstats
+		bpf_probe_read_kernel(&backlog, sizeof(backlog), &qdisc->qstats.backlog);
+	}
+
+	// Read TX queue state
+	const struct netdev_queue *txq = (const struct netdev_queue *)ctx->txq;
+	unsigned long txq_state = 0;
+	if (txq) {
+		bpf_probe_read_kernel(&txq_state, sizeof(txq_state), &txq->state);
+	}
+
+	// Store entry for latency tracking
+	u64 skb_addr = (u64)skb;
+	struct qdisc_packet_entry entry = {
+		.socket_id = socket_id,
+		.enqueue_ts = bpf_ktime_get_boot_ns(),
+	};
+	bpf_map_update_elem(&pending_qdisc_packets, &skb_addr, &entry, BPF_ANY);
+
+	// Emit qdisc enqueue event
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = entry.enqueue_ts;
+	event->event_type = PACKET_QDISC_ENQUEUE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = socket_id;
+	event->qlen = qlen;
+	event->qdisc_backlog = backlog;
+	event->qdisc_state = (u32)qdisc_state;
+	event->txq_state = (u32)txq_state;
+	event->skb_addr = skb_addr;
+
+	// Populate socket and skb info using helper
+	populate_qdisc_event_from_skb(event, sk, skb);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace qdisc_dequeue tracepoint - packet leaving qdisc queue
+SEC("tracepoint/qdisc/qdisc_dequeue")
+int tracepoint__qdisc__qdisc_dequeue(struct trace_event_raw_qdisc_dequeue *ctx)
+{
+	if (!tracing_enabled)
+		return 0;
+	// skb can be NULL if dequeue was attempted but queue was empty
+	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
+	if (!skb)
+		return 0;
+
+	u64 skb_addr = (u64)skb;
+
+	// Look up the enqueue entry
+	struct qdisc_packet_entry *entry = bpf_map_lookup_elem(&pending_qdisc_packets, &skb_addr);
+	if (!entry)
+		return 0;
+
+	u64 socket_id = entry->socket_id;
+	u64 enqueue_ts = entry->enqueue_ts;
+
+	// Remove from tracking map
+	bpf_map_delete_elem(&pending_qdisc_packets, &skb_addr);
+
+	// Get socket from skb
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	// Read qdisc state
+	struct Qdisc *qdisc = (struct Qdisc *)ctx->qdisc;
+	u32 qlen = 0;
+	u32 backlog = 0;
+	unsigned long qdisc_state = 0;
+
+	if (qdisc) {
+		bpf_probe_read_kernel(&qlen, sizeof(qlen), &qdisc->q.qlen);
+		bpf_probe_read_kernel(&qdisc_state, sizeof(qdisc_state), &qdisc->state);
+		bpf_probe_read_kernel(&backlog, sizeof(backlog), &qdisc->qstats.backlog);
+	}
+
+	// Read TX queue state from tracepoint context
+	unsigned long txq_state = ctx->txq_state;
+
+	// Emit qdisc dequeue event
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	u64 now = bpf_ktime_get_boot_ns();
+	event->ts = now;
+	event->event_type = PACKET_QDISC_DEQUEUE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = socket_id;
+	event->qlen = qlen;
+	event->qdisc_backlog = backlog;
+	event->qdisc_state = (u32)qdisc_state;
+	event->txq_state = (u32)txq_state;
+	event->skb_addr = skb_addr;
+
+	// Store qdisc residence time in dedicated field (microseconds)
+	event->qdisc_latency_us = (u32)((now - enqueue_ts) / 1000);
+
+	// Populate socket and skb info using helper
+	populate_qdisc_event_from_skb(event, sk, skb);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Note: netif_tx_stop_queue and netif_tx_wake_queue probes removed because they are
+// inline functions on most kernels. TX queue state is captured via the txq_state field
+// in qdisc_enqueue and qdisc_dequeue events instead.
+
+// ========== TCP State Change Tracing ==========
+
+// Trace TCP socket state transitions via the inet_sock_set_state tracepoint.
+SEC("tp_btf/inet_sock_set_state")
+int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newstate)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	// Only trace TCP sockets
+	u8 protocol = BPF_CORE_READ(sk, sk_protocol);
+	if (protocol != IPPROTO_TCP)
+		return 0;
+
+	// Only trace IPv4 and IPv6
+	u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (family != AF_INET && family != AF_INET6)
+		return 0;
+
+	// Read the 4-tuple from the socket
+	enum network_address_family af;
+	u8 src_addr[16] = {0};
+	u16 src_port = 0;
+	u8 dest_addr[16] = {0};
+	u16 dest_port = 0;
+
+	if (read_socket_addrs((struct sock *)sk, &af, src_addr, &src_port,
+			      dest_addr, &dest_port) < 0)
+		return 0;
+
+	// Socket identity: reuse the socket's EXISTING id first (sk-keyed
+	// lookup). State transitions fire with degraded tuples at both ends
+	// of the lifecycle — the connect-start transition (CLOSE ->
+	// SYN_SENT) fires in tcp_v4_connect() before the ephemeral port is
+	// assigned, and transitions to CLOSE observably arrive with the
+	// bound port already zeroed (every anonymous close row reads
+	// src_port=0 in production traces) — so the tuple-keyed
+	// get_or_create minted a SECOND, anonymous src_port=0 identity for
+	// terminal transitions and a socket's opens and closes landed on
+	// different flow rows. The sk-first lookup pins the whole
+	// lifecycle to one identity. get_or_create remains the fallback
+	// for a socket whose first-ever observed event is a state change
+	// (it also seeds sk_socket_id_map for the next event).
+	// Note: tgidpid may not be the socket owner in softirq/timer
+	// context, but get_or_create_socket_id does not use it for
+	// identification.
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	u64 sk_key = (u64)sk;
+	u64 socket_id = 0;
+	u64 *sid = bpf_map_lookup_elem(&sk_socket_id_map, &sk_key);
+	if (sid && *sid)
+		socket_id = *sid;
+	else
+		socket_id = get_or_create_socket_id(
+			(struct sock *)sk, NETWORK_TCP, af,
+			src_addr, src_port, dest_addr, dest_port, tgidpid);
+	if (socket_id == 0)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_TCP_STATE_CHANGE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->af = af;
+	__builtin_memcpy(event->src_addr, src_addr, 16);
+	event->src_port = src_port;
+	__builtin_memcpy(event->dest_addr, dest_addr, 16);
+	event->dest_port = dest_port;
+	event->socket_id = socket_id;
+	event->netns_inum = read_sk_netns_inum((u64)sk);
+	event->old_state = (u8)oldstate;
+	event->new_state = (u8)newstate;
+
+	// If this CLOSE transition is happening inside tcp_time_wait(),
+	// the socket is actually entering TIME_WAIT, not CLOSE.
+	// Rewrite new_state for correct lifecycle reporting.
+	// Note: if tcp_time_wait() fails to allocate the tw sock (OOM), it still
+	// calls tcp_done(sk) which fires this tracepoint. The per-CPU flag will
+	// cause a spurious TIME_WAIT rewrite. This is rare and produces a
+	// TIME_WAIT entry with no subsequent TIME_WAIT->CLOSE, which is
+	// distinguishable in analysis.
+	if (newstate == TCP_CLOSE) {
+		u32 tw_key = 0;
+		struct tw_pending_info *pending = bpf_map_lookup_elem(&pending_tw, &tw_key);
+		if (pending && pending->sk_ptr == (u64)sk) {
+			event->new_state = TCP_TIME_WAIT;
+			// Clear the per-CPU flag
+			struct tw_pending_info empty = {};
+			bpf_map_update_elem(&pending_tw, &tw_key, &empty, BPF_ANY);
+		}
+		// This sk is being destroyed on BOTH paths that reach here
+		// with a raw CLOSE — a real close, and the TIME_WAIT rewrite
+		// (tcp_time_wait() frees this sk via tcp_done(); the
+		// timewait sock carries on under its own pointer, tracked by
+		// the tw kprobes, which captured the id before this fires).
+		// Drop the sk-keyed identity so a recycled sk allocation
+		// mints a fresh id instead of inheriting this lifecycle's.
+		bpf_map_delete_elem(&sk_socket_id_map, &sk_key);
+	}
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// ========== TIME_WAIT Lifecycle Tracking ==========
+//
+// The kernel never fires inet_sock_set_state with TCP_TIME_WAIT.
+// Instead, tcp_time_wait() creates a lightweight inet_timewait_sock and
+// calls tcp_done(sk) which fires the tracepoint with new_state=TCP_CLOSE.
+// Three hooks fix the gap:
+// 1. tcp_time_wait entry: set per-CPU flag so inet_sock_set_state rewrites CLOSE->TIME_WAIT
+// 2. inet_twsk_hashdance_schedule: map tw sock pointer -> socket_id
+// 3. inet_twsk_deschedule_put: emit TIME_WAIT -> CLOSE when tw sock is destroyed
+//
+// Each hook ships twice, with one shared body: a kprobe program (the
+// default set — the three kprobes share one ftrace_ops, so dropping them
+// costs one ftrace_shutdown) and an fentry program (the trampoline set,
+// opt-in through `--kernel-hooks trampoline`: cheaper while the capture
+// runs, but each trampoline's last link drop runs ftrace_shutdown()'s two
+// synchronous Tasks-RCU grace periods, three times for the three hooks —
+// measured at about four times the kprobe set's "detach bpf programs"
+// phase, see SCHEMA_CHANGES.md schema 20; the kprobe set is its fallback
+// when the attach fails, e.g. an arm64 kernel without
+// DYNAMIC_FTRACE_WITH_DIRECT_CALLS). Userspace loads the kprobe set always
+// and the fentry set only when opted in, and attaches exactly one of them
+// (see NETWORK_TW_FENTRY_PROGRAMS / attach_network_tw_leg in
+// systing_core.rs); which one ran is recorded as sysinfo.network_tw_leg.
+//
+// Note: inet_twsk_hashdance_schedule was introduced in kernel 6.11 (commit
+// b334b924c9b7, "net: tcp/dccp: prepare for tw_timer un-pinning", v6.11-rc1;
+// absent from the 6.6 stable series). On older kernels the function was named
+// inet_twsk_hashdance with a different signature and no single scheduling
+// point. Userspace gates the whole leg on the symbol before the object is
+// loaded (sysinfo.network_tw_leg = off:nosym): a capture on such a kernel
+// runs without TIME_WAIT tracking instead of failing its every attach.
+
+// Set per-CPU flag when entering tcp_time_wait().
+// The flag is checked by inet_sock_set_state (above) to rewrite CLOSE -> TIME_WAIT.
+// Safe to use per-CPU because tcp_time_wait runs with BH disabled (softirq or lock_sock).
+static __always_inline int tcp_time_wait_common(struct sock *sk)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *sid = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!sid || *sid == 0)
+		return 0;
+
+	u32 key = 0;
+	struct tw_pending_info info = {
+		.sk_ptr = sk_ptr,
+		.socket_id = *sid,
+	};
+	bpf_map_update_elem(&pending_tw, &key, &info, BPF_ANY);
+	return 0;
+}
+
+SEC("fentry/tcp_time_wait")
+int BPF_PROG(tcp_time_wait_fentry, struct sock *sk, int state, int timeo)
+{
+	return tcp_time_wait_common(sk);
+}
+
+SEC("kprobe/tcp_time_wait")
+int BPF_KPROBE(tcp_time_wait_entry, struct sock *sk, int state, int timeo)
+{
+	return tcp_time_wait_common(sk);
+}
+
+// Map the tw sock pointer to the original socket_id.
+// Called from tcp_time_wait() after tw allocation, before tcp_done() destroys the original sk.
+static __always_inline int inet_twsk_hashdance_schedule_common(struct inet_timewait_sock *tw,
+							       struct sock *sk)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *sid = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!sid || *sid == 0)
+		return 0;
+
+	// Map tw sock pointer to the same socket_id so we can correlate
+	// the TIME_WAIT → CLOSE transition when the tw sock is destroyed.
+	u64 tw_ptr = (u64)tw;
+	bpf_map_update_elem(&tw_socket_id_map, &tw_ptr, sid, BPF_ANY);
+
+	return 0;
+}
+
+SEC("fentry/inet_twsk_hashdance_schedule")
+int BPF_PROG(inet_twsk_hashdance_schedule_fentry,
+	     struct inet_timewait_sock *tw, struct sock *sk,
+	     struct inet_hashinfo *hashinfo, int timeo)
+{
+	return inet_twsk_hashdance_schedule_common(tw, sk);
+}
+
+SEC("kprobe/inet_twsk_hashdance_schedule")
+int BPF_KPROBE(inet_twsk_hashdance_schedule_entry,
+	       struct inet_timewait_sock *tw, struct sock *sk,
+	       struct inet_hashinfo *hashinfo, int timeo)
+{
+	return inet_twsk_hashdance_schedule_common(tw, sk);
+}
+
+// Emit TIME_WAIT → CLOSE when a timewait socket is destroyed.
+// inet_twsk_deschedule_put is the universal destruction point for all TIME_WAIT
+// sockets: timer expiry, RST received, tw_reuse, and namespace purge.
+static __always_inline int inet_twsk_deschedule_put_common(struct inet_timewait_sock *tw)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	u64 tw_ptr = (u64)tw;
+	u64 *sid = bpf_map_lookup_elem(&tw_socket_id_map, &tw_ptr);
+	if (!sid || *sid == 0)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&tw_socket_id_map, &tw_ptr);
+		return handle_missed_event(MISSED_PACKET_EVENT);
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_TCP_STATE_CHANGE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = *sid;
+	event->old_state = TCP_TIME_WAIT;
+	event->new_state = TCP_CLOSE;
+
+	// SAFETY: inet_timewait_sock embeds sock_common at offset 0 (__tw_common),
+	// matching sock's __sk_common at offset 0. read_socket_addrs only touches
+	// skc_* fields within sock_common via bpf_probe_read_kernel (raw pointer
+	// arithmetic, no CO-RE relocations), so the byte offsets are identical.
+	read_socket_addrs((struct sock *)tw, &event->af, event->src_addr,
+			  &event->src_port, event->dest_addr, &event->dest_port);
+
+	bpf_ringbuf_submit(event, flags);
+
+	bpf_map_delete_elem(&tw_socket_id_map, &tw_ptr);
+	return 0;
+}
+
+SEC("fentry/inet_twsk_deschedule_put")
+int BPF_PROG(inet_twsk_deschedule_put_fentry, struct inet_timewait_sock *tw)
+{
+	return inet_twsk_deschedule_put_common(tw);
+}
+
+SEC("kprobe/inet_twsk_deschedule_put")
+int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
+{
+	return inet_twsk_deschedule_put_common(tw);
+}
+
+/* ===== Memory recorder ===== */
+
+/* `with_kernel` selects whether the kernel half is captured at all. The
+ * page-fault leg passes false: at the exceptions/page_fault_user tracepoint
+ * the kernel stack is only the exception-entry glue above the faulting user
+ * frame — how much of it survives SKIP_STACK_DEPTH varies by kernel version
+ * (6.12.55 leaves asm_exc_page_fault; 6.12.68+ leaves nothing), so the
+ * capture carries no analytical signal and made `leaf` grouping split by
+ * kernel. The mmap/munmap/brk legs still pass true: their captures sit at
+ * the syscall wrapper's entry/exit (a trampoline frame, or the syscall
+ * tracepoints on the fallback set), so the kernel half there is the same
+ * plumbing class (the syscall body is not on the stack at either point) —
+ * they are kept for now only to hold this change to the measured hot
+ * path, and dropping them the same way is a candidate follow-up. */
+static __always_inline void memory_capture_stack(void *ctx, struct memory_event *event,
+						 struct task_struct *task, bool with_kernel)
+{
+	long len;
+
+	if (!(task->flags & PF_KTHREAD)) {
+		len = bpf_get_stack(ctx, &event->user_stack,
+				    sizeof(event->user_stack),
+				    BPF_F_USER_STACK);
+		event->hdr.user_stack_length = len > 0 ? len / sizeof(u64) : 0;
+	} else {
+		event->hdr.user_stack_length = 0;
+	}
+
+	if (with_kernel) {
+		len = bpf_get_stack(ctx, &event->kernel_stack,
+				    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
+		event->hdr.kernel_stack_length = len > 0 ? len / sizeof(u64) : 0;
+	} else {
+		event->hdr.kernel_stack_length = 0;
+	}
+
+#ifdef SYSTING_PYSTACKS
+	if (tool_config.collect_pystacks) {
+		struct pt_regs *pt_regs = (struct pt_regs *)bpf_task_pt_regs(task);
+		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
+	}
+#endif
+}
+
+/* ---- rss_stat: CO-RE read + per-tgid threshold-batched emission ----
+ *
+ * Attach path: tp_btf/rss_stat (BPF_PROG_TYPE_TRACING) is preferred. The
+ * classic tracepoint/kmem/rss_stat path routes every firing through the
+ * kernel's perf_trace_rss_stat glue, whose TP_fast_assign on >=6.2 calls
+ * percpu_counter_sum_positive() — an O(nr_cpus) cache-line walk per event.
+ * On fault-heavy nodes that glue alone has been measured at ~1% of on-CPU
+ * time during a capture window. tp_btf bypasses the glue entirely and reads
+ * the counter from mm directly. The classic prog is kept as a fallback
+ * (selected at load time; see systing_core.rs select_rss_stat_prog()) for
+ * kernels whose BTF lacks btf_trace_rss_stat.
+ *
+ * Threshold batching: the kernel fires rss_stat on every per-page counter
+ * update, so a fault storm produces one event per page. We emit only when
+ * the absolute value drifts >= tool_config.memory_rss_threshold_bytes from
+ * the last emitted value for (tgid, member), and flush any sub-threshold
+ * residual at last-thread-exit. memory_rss.size stays an absolute
+ * byte-valued counter sample; only the emission cadence changes.
+ */
+
+/* CO-RE flavor for <6.2 kernels where mm->rss_stat was still
+ * struct mm_rss_stat { atomic_long_t count[NR_MM_COUNTERS]; } rather than
+ * struct percpu_counter rss_stat[NR_MM_COUNTERS]. The ___pre62 suffix is
+ * stripped by CO-RE matching. */
+struct mm_rss_stat___pre62 {
+	atomic_long_t count[NR_MM_COUNTERS];
+};
+struct mm_struct___pre62 {
+	struct mm_rss_stat___pre62 rss_stat;
+};
+
+/* Read mm->rss_stat[member] as an absolute page count. On <6.2 (atomic
+ * array) this is exact. On >=6.2 (percpu_counter) this reads only .count,
+ * missing the per-CPU batch slots — error bounded by
+ * +-(percpu_counter_batch * nr_online_cpus) pages where the kernel sets
+ * batch = max(32, 2*nr_online_cpus) (lib/percpu_counter.c), so worst-case
+ * is quadratic in nr_cpus. In practice only the CPUs a given mm is actively
+ * faulting on carry unflushed drift, so typical error is a small multiple
+ * of batch.
+ *
+ * An exact sum would need bpf_per_cpu_ptr() over rss_stat[member].counters,
+ * but that helper requires ARG_PTR_TO_PERCPU_BTF_ID and a value read via
+ * BPF_CORE_READ arrives as SCALAR_VALUE; direct BTF-walk access preserves
+ * percpu-ness only on clang-built kernels with btf_type_tag("percpu") in
+ * vmlinux BTF — not portable across the fleet. The approximate read is the
+ * portable choice; the threshold absorbs the noise, and the classic
+ * fallback still emits exact values (from ctx->size) where tp_btf is
+ * unavailable. */
+static __always_inline s64 read_mm_rss_pages(struct mm_struct *mm, u32 member)
+{
+	struct mm_struct___pre62 *old = (void *)mm;
+	if (bpf_core_field_exists(old->rss_stat.count)) {
+		switch (member) {
+		case MM_FILEPAGES:  return BPF_CORE_READ(old, rss_stat.count[MM_FILEPAGES].counter);
+		case MM_ANONPAGES:  return BPF_CORE_READ(old, rss_stat.count[MM_ANONPAGES].counter);
+		case MM_SWAPENTS:   return BPF_CORE_READ(old, rss_stat.count[MM_SWAPENTS].counter);
+		case MM_SHMEMPAGES: return BPF_CORE_READ(old, rss_stat.count[MM_SHMEMPAGES].counter);
+		}
+		return 0;
+	}
+	switch (member) {
+	case MM_FILEPAGES:  return BPF_CORE_READ(mm, rss_stat[MM_FILEPAGES].count);
+	case MM_ANONPAGES:  return BPF_CORE_READ(mm, rss_stat[MM_ANONPAGES].count);
+	case MM_SWAPENTS:   return BPF_CORE_READ(mm, rss_stat[MM_SWAPENTS].count);
+	case MM_SHMEMPAGES: return BPF_CORE_READ(mm, rss_stat[MM_SHMEMPAGES].count);
+	}
+	return 0;
+}
+
+static __always_inline int emit_rss_stat_event(struct task_struct *task,
+					       u32 member, s64 size_bytes,
+					       u32 rss_flags)
+{
+	long flags;
+	struct memory_event_header *event = reserve_memory_event_header(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_RSS_STAT;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->member = member;
+	event->size = (u64)size_bytes;
+	event->flags = rss_flags;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+/* Threshold gate shared by both attach paths. Callers have already
+ * gated with trace_task() — the filter runs before any per-event work
+ * (counter reads, size math) so untraced tasks pay as close to zero as
+ * possible on this very hot tracepoint. */
+static __always_inline int handle_rss_stat(struct task_struct *task,
+					   u32 member, s64 size_bytes,
+					   u32 rss_flags)
+{
+	if (member >= NR_MM_COUNTERS)
+		return 0;
+
+	/* Threshold disabled (0): preserve pre-change behavior exactly. */
+	if (tool_config.memory_rss_threshold_bytes == 0)
+		return emit_rss_stat_event(task, member, size_bytes, rss_flags);
+
+	u32 tgid = BPF_CORE_READ(task, tgid);
+	struct rss_stat_state *st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
+	if (!st) {
+		struct rss_stat_state init;
+		__builtin_memset(&init, 0xff, sizeof(init)); /* all members = -1 (never seen) */
+		/* Map full, or lost the insert race to another thread of this
+		 * tgid: fall through to direct-submit so no sample is dropped.
+		 * BPF_NOEXIST (not BPF_ANY) so the race-loser doesn't clobber
+		 * the winner's populated state. */
+		if (bpf_map_update_elem(&rss_stat_last, &tgid, &init, BPF_NOEXIST) != 0)
+			return emit_rss_stat_event(task, member, size_bytes, rss_flags);
+		st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
+		if (!st)
+			return emit_rss_stat_event(task, member, size_bytes, rss_flags);
+	}
+
+	/* Re-bound the index AT THE USE, on the register the access uses.
+	 *
+	 * The entry check above is what the compiler compares, but which
+	 * register it compares is its choice: clang 21 at the default -mcpu
+	 * (v3) checks a 32-bit copy of the argument and later rebuilds the
+	 * index from the zero-extended raw argument in another register, two
+	 * map-helper calls later — and the verifier does not carry a bound
+	 * from a 32-bit copy of an unknown 64-bit value back to the original,
+	 * so it reaches the st->...[] stores with no bound on the index and
+	 * rejects the whole object ("R0 unbounded memory access, make sure to
+	 * bounds check any such access"). clang 18 at -mcpu=v1 happens to
+	 * compare the index register itself. Note that this store path is
+	 * live only when tool_config.memory_rss_threshold_bytes is non-zero:
+	 * at the object's default the verifier prunes it as dead code, so a
+	 * load test must set the threshold to exercise it at all.
+	 *
+	 * The barrier comes FIRST. With the entry check dominating, the
+	 * optimizer proves `member & (NR_MM_COUNTERS - 1) == member` and
+	 * deletes the mask; barrier_var() makes `idx` opaque, so the mask that
+	 * follows it cannot be folded and lands on the very register used as
+	 * the index. NR_MM_COUNTERS is a power of two (asserted at the struct),
+	 * so the mask is an exact bound (umax NR_MM_COUNTERS - 1). */
+	u64 idx = member;
+	barrier_var(idx);
+	idx &= (NR_MM_COUNTERS - 1);
+
+	/* Unsynchronized per-member s64 stores — multiple threads of a tgid
+	 * may race here. Benign: worst case is a duplicate emit or one stale
+	 * last_emitted (one extra emit); never a lost sample. */
+	st->latest_seen[idx] = size_bytes;
+	s64 last = st->last_emitted[idx];
+	/* First sighting for this member: always emit so consumers have a
+	 * baseline (last == -1 from the 0xff memset). */
+	s64 drift = last < 0 ? (s64)tool_config.memory_rss_threshold_bytes
+			     : size_bytes - last;
+	if (drift < 0)
+		drift = -drift;
+	if ((u64)drift < tool_config.memory_rss_threshold_bytes)
+		return 0;
+
+	st->last_emitted[idx] = size_bytes;
+	return emit_rss_stat_event(task, member, size_bytes, rss_flags);
+}
+
+SEC("tp_btf/rss_stat")
+int BPF_PROG(systing_rss_stat_btf, struct mm_struct *mm, int member)
+{
+	struct task_struct *current = (struct task_struct *)bpf_get_current_task_btf();
+	struct task_struct *task = current;
+	u32 rss_flags = 0;
+
+	/* Attribute by the tracepoint's mm, not by current. Reclaim fires
+	 * this tracepoint from a context whose current is the RECLAIMER --
+	 * kswapd, khugepaged, another process in direct reclaim, a
+	 * memory.reclaim / process_madvise writer -- while the counters
+	 * that moved belong to the mm's owner. Attributing by current
+	 * dropped those events in cgroup-targeted mode (the reclaimer
+	 * fails the filter) and misattributed them to the reclaimer in
+	 * whole-system mode (with the threshold state batched under the
+	 * wrong tgid). The common self-update case (fault, mmap, munmap)
+	 * keeps current: it is a thread of the mm's own thread group, so
+	 * attribution is identical and no mm->owner walk is paid. */
+	if (current->mm != mm) {
+		struct task_struct *owner = NULL;
+
+		if (bpf_core_field_exists(mm->owner))
+			owner = mm->owner;
+		if (owner) {
+			task = owner;
+			/* Same-tgid updates with current->mm detached are
+			 * the task's own exit teardown (exit_mm() nulls
+			 * current->mm before exit_mmap() drops the
+			 * counters): the process releasing its own memory,
+			 * not external reclaim. */
+			if (current->tgid != owner->tgid)
+				rss_flags |= MEMORY_RSS_FLAG_EXTERNAL;
+		} else if (!(current->flags & PF_KTHREAD) &&
+			   current->active_mm == mm) {
+			/* Last-user exit teardown: mm_update_next_owner()
+			 * NULLs mm->owner before exit_mmap() drops the
+			 * counters (and CONFIG_MEMCG=n kernels have no
+			 * owner field at all), but the exiting task still
+			 * carries the mm as active_mm. Keep the final
+			 * RSS fall self-attributed so per-process RSS
+			 * reaches zero at exit. */
+			task = current;
+		} else {
+			/* Unattributable: a reclaimer hit an mm whose
+			 * owner is gone. */
+			return 0;
+		}
+	}
+	if (!trace_task(task))
+		return 0;
+	s64 pages = read_mm_rss_pages(mm, (u32)member);
+	if (pages < 0)
+		pages = 0;
+	return handle_rss_stat(task, (u32)member,
+			       pages * (s64)tool_config.page_size, rss_flags);
+}
+
+SEC("tracepoint/kmem/rss_stat")
+int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	/* The raw tracepoint carries a hashed mm id (ctx->mm_id) plus a
+	 * curr flag -- no mm pointer -- so on this fallback path the victim
+	 * of a remote update (reclaim) cannot be resolved. curr==0 events
+	 * would be attributed to the reclaimer; drop them instead. Bounded
+	 * loss: this path is only selected on kernels whose BTF lacks
+	 * btf_trace_rss_stat, and such events were never correctly
+	 * attributed here anyway. */
+	if (!ctx->curr)
+		return 0;
+	if (!trace_task(task))
+		return 0;
+	/* ctx->size is the kernel's exact percpu_counter_sum_positive() already
+	 * shifted to bytes; this path pays that O(nr_cpus) cost per event but
+	 * is only selected when tp_btf is unavailable. Clamp transient
+	 * negatives (possible on <6.2 SPLIT_RSS_COUNTING kernels near zero) so
+	 * the threshold gate's last<0 sentinel stays unambiguous. */
+	s64 size = (s64)ctx->size;
+	if (size < 0)
+		size = 0;
+	return handle_rss_stat(task, (u32)ctx->member, size, 0);
+}
+
+/* Flush sub-threshold residual rss_stat state at last-thread-exit so a
+ * process that exits between thresholds still records its final counter
+ * values, then release the map entry. Separate program (not inlined into
+ * systing_sched_process_exit) so the memory_ringbufs reference stays
+ * confined to memory-recorder programs and the sched program can load when
+ * memory_ringbufs is autocreate=false. Multiple tp_btf progs on one
+ * tracepoint is fine. */
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(systing_rss_stat_exit_flush, struct task_struct *task)
+{
+	if (tool_config.memory_rss_threshold_bytes == 0)
+		return 0;
+	/* Filter first: this hook fires for every task exit on the host, so
+	 * untraced exits pay only the tool check and this. Trade: an entry
+	 * inserted while its task was traced is no longer deleted if the
+	 * task's filter answer changed before exit (e.g. cgroup migration in
+	 * cgroup-targeted mode) — bounded by the map's fall-through-on-full
+	 * semantics (batching degrades to direct-submit, correctness
+	 * unaffected) and impossible in whole-system mode where the filter
+	 * answer is constant. */
+	if (!trace_task(task))
+		return 0;
+	if (BPF_CORE_READ(task, signal, live.counter) != 0)
+		return 0;
+	u32 tgid = BPF_CORE_READ(task, tgid);
+	struct rss_stat_state *st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
+	if (!st)
+		return 0;
+
+	/* task->mm is NULL here (exit_mm() precedes this tracepoint), so
+	 * flush latest_seen[] captured on the rss_stat path rather than
+	 * re-reading mm. Flushed residuals aggregate updates from both the
+	 * process itself and any external reclaimer, so no external flag. */
+	for (u32 m = 0; m < NR_MM_COUNTERS; m++) {
+		s64 latest = st->latest_seen[m];
+		if (latest < 0)
+			continue; /* never seen */
+		if (latest != st->last_emitted[m])
+			emit_rss_stat_event(task, m, latest, 0);
+	}
+	bpf_map_delete_elem(&rss_stat_last, &tgid);
+	return 0;
+}
+
+/* Sample 1:N mmap/munmap/brk events. The map legs were originally
+ * unsampled on the assumption that map-call rates are low; allocator
+ * churn breaks that (workloads unmapping ~100/s sustained), and on such
+ * hosts unsampled map events dominate the memory lane end to end:
+ * per-event stack capture, ringbuf traffic, trace size, and the
+ * post-capture processing whose memory footprint scales with row
+ * volume. The decision is made at EXIT, on the successful-event stream,
+ * for two reasons: the enter/exit scratch pairing stays intact (every
+ * enter stashes, every exit consumes and deletes -- no sampled-out
+ * enter can leave a stash for a later exit to misread), and the count
+ * advances once per real event rather than per attempt. The expensive
+ * work (stack capture + emit) is what gets gated. `cnt` is the
+ * per-type counter, already looked up under a rate > 1 guard at the
+ * call site so the default path touches no map (the fault-sampling
+ * pattern). Returns true to keep this event. */
+static __always_inline bool memory_map_sample_hit(u64 *cnt)
+{
+	if (!cnt)
+		return true;
+	*cnt += 1;
+	return (*cnt % tool_config.memory_map_sample_rate) == 0;
+}
+
+/* Resident-set bytes of the task's mm (file + anon + shmem pages), the
+ * same approximate percpu_counter read the rss_stat handler uses, so the
+ * two share one error model (worst case ±(percpu batch x nr_cpus) pages).
+ * Returns -1 when the mm is unreadable so callers can mark the read
+ * absent rather than emitting a fake zero. */
+static __always_inline s64 current_task_rss_bytes(struct task_struct *task)
+{
+	struct mm_struct *mm = BPF_CORE_READ(task, mm);
+	if (!mm)
+		return -1;
+	s64 pages = read_mm_rss_pages(mm, MEMORY_MM_FILEPAGES) +
+		    read_mm_rss_pages(mm, MEMORY_MM_ANONPAGES) +
+		    read_mm_rss_pages(mm, MEMORY_MM_SHMEMPAGES);
+	if (pages < 0)
+		pages = 0;
+	return pages * (s64)tool_config.page_size;
+}
+
+/* Compute the map legs' signed rss-delta encoding for old_addr: the exit-
+ * side resident read minus the stashed enter-side read, or ABSENT when
+ * either side was unavailable. Concurrent faults or reclaim on other
+ * threads inside the syscall window land in the delta -- the window is
+ * microseconds, the drift is small, and the schema doc says so. */
+static __always_inline u64 map_rss_delta_enc(struct task_struct *task,
+					     s64 enter_rss)
+{
+	if (enter_rss < 0)
+		return (u64)MEMORY_RSS_DELTA_ABSENT;
+	s64 exit_rss = current_task_rss_bytes(task);
+	if (exit_rss < 0)
+		return (u64)MEMORY_RSS_DELTA_ABSENT;
+	return (u64)(exit_rss - enter_rss);
+}
+
+/* ---- mmap / munmap / brk: two attach forms, one body each ----
+ *
+ * The syscall hooks ship in two forms that share the bodies below. The
+ * classic form — the six `syscalls/sys_{enter,exit}_*` tracepoints through
+ * perf_event_open — is the default: its detach is one SRCU and one RCU
+ * grace period per program (serialized, six of them at every capture stop
+ * — hundreds of ms on a many-core host, seconds on the largest), and it
+ * keeps every task of the host on the SYSCALL_WORK_SYSCALL_TRACEPOINT slow
+ * path for the whole capture. The trampoline form — fentry/fexit on the
+ * arch syscall wrappers (`__x64_sys_mmap` and friends; the arch prefix is
+ * selected at compile time, and the compat wrappers `__ia32_sys_*` are a
+ * separate symbol never attached, so native-only semantics hold as they do
+ * at the syscalls tracepoints) — is opt-in (`--kernel-hooks trampoline`): a
+ * trampoline call replaces the perf-sample build the classic tracepoint
+ * runs per event and puts nothing on the entry path of the other syscalls,
+ * but dropping the last program on a function's trampoline runs
+ * ftrace_shutdown()'s two synchronous Tasks-RCU grace periods, once per
+ * hooked function (three here), serialized on the stop path — measured at
+ * about six times the classic set's "detach bpf programs" phase (see
+ * SCHEMA_CHANGES.md, schema 20). Under the trampoline form the classic set
+ * is loaded beside it and attached only when the trampoline set cannot be:
+ * userspace attaches the trampoline programs one by one after skel.attach()
+ * and falls back on the first error (a kernel without the wrappers in
+ * kallsyms or vmlinux BTF never tries; an arm64 kernel built without
+ * DYNAMIC_FTRACE_WITH_DIRECT_CALLS loads the programs and refuses the
+ * attach), recording which form ran in sysinfo.memory_syscall_leg. Both
+ * forms write memory_syscall_scratch and the memory ringbuf; neither is
+ * fenced by bpf_prog_active.
+ *
+ * The user stack a trampoline program captures is the same as the
+ * tracepoint's (bpf_get_stack walks task_pt_regs(current) for the user
+ * half); the kernel half at fentry/fexit is the trampoline's own frame
+ * above the wrapper — plumbing either way, see memory_capture_stack. */
+#if defined(__TARGET_ARCH_x86)
+#define SYSTING_SYSCALL_WRAPPER_PREFIX "__x64_sys_"
+#elif defined(__TARGET_ARCH_arm64)
+#define SYSTING_SYSCALL_WRAPPER_PREFIX "__arm64_sys_"
+#elif defined(__TARGET_ARCH_riscv)
+#define SYSTING_SYSCALL_WRAPPER_PREFIX "__riscv_sys_"
+#else
+#error "no syscall wrapper prefix for this BPF target arch"
+#endif
+
+/* The syscall numbers the raw-tracepoint form (systing_sys_enter /
+ * systing_sys_exit, below the three hook pairs) dispatches on: x86-64's
+ * own table; arm64 and riscv share the asm-generic table. An arch without
+ * a row here builds no raw pair and runs the classic set. */
+#if defined(__TARGET_ARCH_x86)
+#define SYSTING_NR_MMAP 9
+#define SYSTING_NR_MUNMAP 11
+#define SYSTING_NR_BRK 12
+#elif defined(__TARGET_ARCH_arm64) || defined(__TARGET_ARCH_riscv)
+#define SYSTING_NR_MMAP 222
+#define SYSTING_NR_MUNMAP 215
+#define SYSTING_NR_BRK 214
+#endif
+
+static __always_inline int memory_mmap_enter_common(struct task_struct *task, u64 addr,
+						    u64 size, u32 prot, u32 flags)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args args = {
+		.addr = addr,
+		.size = size,
+		.prot = prot,
+		.flags = flags,
+		.leg = MEMORY_SYSCALL_LEG_MMAP,
+		.enter_rss = current_task_rss_bytes(task),
+	};
+	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
+	return 0;
+}
+
+/* Take the thread's scratch entry for `leg`: NULL when there is none, or
+ * when the entry belongs to another leg (a stale enter-without-exit of
+ * that leg -- dropped and counted, never paired; see memory_syscall_leg).
+ * The entry is deleted either way; the caller copies what it needs first. */
+static __always_inline struct memory_syscall_args *
+memory_syscall_scratch_take(u64 tgidpid, u32 leg)
+{
+	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
+	if (!saved)
+		return NULL;
+	if (saved->leg != leg) {
+		bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
+		handle_missed_event(MISSED_MEMORY_XLEG_EVENT);
+		return NULL;
+	}
+	return saved;
+}
+
+static __always_inline int memory_mmap_exit_common(void *ctx, struct task_struct *task,
+						   long ret)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args *saved =
+		memory_syscall_scratch_take(tgidpid, MEMORY_SYSCALL_LEG_MMAP);
+	if (!saved)
+		return 0;
+	struct memory_syscall_args args = *saved;
+	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
+
+	/* mmap returns MAP_FAILED (-1) or -errno on failure; skip those. */
+	if (ret < 0 && ret > -4096)
+		return 0;
+
+	if (tool_config.memory_map_sample_rate > 1) {
+		u32 zero = 0;
+		if (!memory_map_sample_hit(bpf_map_lookup_elem(
+			    &memory_mmap_sample_counter, &zero)))
+			return 0;
+	}
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = MEMORY_MMAP;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = (u64)ret;
+	event->hdr.size = args.size;
+	event->hdr.member = args.prot;
+	event->hdr.flags = args.flags;
+	event->hdr.old_addr = map_rss_delta_enc(task, args.enter_rss);
+	memory_capture_stack(ctx, event, task, true);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_mmap")
+int systing_mmap_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_mmap_enter_common(task, (u64)ctx->args[0], (u64)ctx->args[1],
+					(u32)ctx->args[2], (u32)ctx->args[3]);
+}
+
+SEC("tracepoint/syscalls/sys_exit_mmap")
+int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_mmap_exit_common(ctx, task, ctx->ret);
+}
+
+SEC("fentry/" SYSTING_SYSCALL_WRAPPER_PREFIX "mmap")
+int BPF_PROG(systing_mmap_fentry, const struct pt_regs *regs)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_mmap_enter_common(task, (u64)PT_REGS_PARM1_CORE_SYSCALL(regs),
+					(u64)PT_REGS_PARM2_CORE_SYSCALL(regs),
+					(u32)PT_REGS_PARM3_CORE_SYSCALL(regs),
+					(u32)PT_REGS_PARM4_CORE_SYSCALL(regs));
+}
+
+SEC("fexit/" SYSTING_SYSCALL_WRAPPER_PREFIX "mmap")
+int BPF_PROG(systing_mmap_fexit, const struct pt_regs *regs, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_mmap_exit_common(ctx, task, ret);
+}
+
+static __always_inline int memory_munmap_enter_common(struct task_struct *task, u64 addr,
+						      u64 size)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args args = {
+		.addr = addr,
+		.size = size,
+		.leg = MEMORY_SYSCALL_LEG_MUNMAP,
+		.vm_limit = (u64)BPF_CORE_READ(task, mm, total_vm) *
+			    tool_config.page_size,
+		.enter_rss = current_task_rss_bytes(task),
+	};
+	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
+	return 0;
+}
+
+static __always_inline int memory_munmap_exit_common(void *ctx, struct task_struct *task,
+						     long ret)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args *saved =
+		memory_syscall_scratch_take(tgidpid, MEMORY_SYSCALL_LEG_MUNMAP);
+	if (!saved)
+		return 0;
+	struct memory_syscall_args args = *saved;
+	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
+
+	/* munmap returns 0 on success, -errno on failure. A failed call
+	 * unmaps nothing and its arguments are unvalidated caller input:
+	 * emitting at enter recorded address-magnitude garbage as the
+	 * unmap size (production callers pass pointer-scale values in the
+	 * length position, which the kernel EINVALs but the recorder
+	 * published as real unmaps). Gate on success like mmap and brk.
+	 *
+	 * Known capture limitation: a thread that unmaps its OWN stack
+	 * (musl's thread-exit path) reaches this exit with those pages
+	 * gone, so the user stack reads empty for that row class where
+	 * the old enter-time capture had frames. Accepted: the size field
+	 * (what aggregations consume) comes from the stash and stays
+	 * correct, and stashing full stacks per thread would multiply the
+	 * scratch map's footprint by the stack-buffer size. */
+	if (ret != 0)
+		return 0;
+
+	if (tool_config.memory_map_sample_rate > 1) {
+		u32 zero = 0;
+		if (!memory_map_sample_hit(bpf_map_lookup_elem(
+			    &memory_munmap_sample_counter, &zero)))
+			return 0;
+	}
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = MEMORY_MUNMAP;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = args.addr;
+	/* No munmap can remove more than the process has mapped in total;
+	 * bound the requested length by the enter-time mapped size. An upper
+	 * bound (the exact freed amount is the in-range mapped bytes), enough
+	 * to drop the physically-impossible values. Skip the bound if
+	 * total_vm read as 0 (kernel-thread edge) to avoid zeroing the size. */
+	event->hdr.size = (args.vm_limit && args.size > args.vm_limit)
+				  ? args.vm_limit
+				  : args.size;
+	event->hdr.old_addr = map_rss_delta_enc(task, args.enter_rss);
+	memory_capture_stack(ctx, event, task, true);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_munmap")
+int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_munmap_enter_common(task, (u64)ctx->args[0], (u64)ctx->args[1]);
+}
+
+SEC("tracepoint/syscalls/sys_exit_munmap")
+int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_munmap_exit_common(ctx, task, ctx->ret);
+}
+
+SEC("fentry/" SYSTING_SYSCALL_WRAPPER_PREFIX "munmap")
+int BPF_PROG(systing_munmap_fentry, const struct pt_regs *regs)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_munmap_enter_common(task, (u64)PT_REGS_PARM1_CORE_SYSCALL(regs),
+					  (u64)PT_REGS_PARM2_CORE_SYSCALL(regs));
+}
+
+SEC("fexit/" SYSTING_SYSCALL_WRAPPER_PREFIX "munmap")
+int BPF_PROG(systing_munmap_fexit, const struct pt_regs *regs, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_munmap_exit_common(ctx, task, ret);
+}
+
+static __always_inline int memory_brk_enter_common(struct task_struct *task)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	/* Stash the current brk so exit can compute the delta. */
+	struct memory_syscall_args args = {
+		.addr = BPF_CORE_READ(task, mm, brk),
+		.leg = MEMORY_SYSCALL_LEG_BRK,
+		.enter_rss = current_task_rss_bytes(task),
+	};
+	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
+	return 0;
+}
+
+static __always_inline int memory_brk_exit_common(void *ctx, struct task_struct *task,
+						  long ret)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	/* A stale entry of another leg (a munmap's unmapped address) read here
+	 * as the previous break is what recorded page-aligned negative deltas
+	 * of 13-46 TB on real hosts; the take drops it. */
+	struct memory_syscall_args *saved =
+		memory_syscall_scratch_take(tgidpid, MEMORY_SYSCALL_LEG_BRK);
+	if (!saved)
+		return 0;
+	u64 old_brk = saved->addr;
+	s64 enter_rss = saved->enter_rss;
+	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
+
+	/* The enter-side mm->brk read can yield 0 (the same mm edge the munmap
+	 * total_vm bound skips on). There is then no previous break to diff
+	 * against, and ret - 0 would record the new break ADDRESS as the
+	 * "delta": a page-aligned value in the tens of TB on a 47-bit VA,
+	 * observed in production as a count=1 brk row of ~92 TB on a process
+	 * that exited during the capture. An unknown previous break is not a
+	 * delta of that size; emit nothing, as a failed or query brk does. */
+	if (!old_brk)
+		return 0;
+
+	/* sys_brk returns an address or the unchanged break; the one error it
+	 * can return is -EINTR, when its mmap_write_lock_killable() fails
+	 * because a fatal signal is pending (the process is being killed). An
+	 * error carries no break: ret - old_brk would record -(old_brk + 4) as
+	 * a delta (a negative value of ~90 TB, seen in production as a
+	 * count=1 brk row with |bytes| ≡ 4 mod 4096). */
+	if ((s64)ret < 0)
+		return 0;
+
+	/* brk(0) queries the current break and failed brk returns it unchanged. */
+	if ((u64)ret == old_brk)
+		return 0;
+
+	if (tool_config.memory_map_sample_rate > 1) {
+		u32 zero = 0;
+		if (!memory_map_sample_hit(bpf_map_lookup_elem(
+			    &memory_brk_sample_counter, &zero)))
+			return 0;
+	}
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = MEMORY_BRK;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = (u64)ret;
+	event->hdr.size = (u64)((s64)ret - (s64)old_brk);
+	event->hdr.old_addr = map_rss_delta_enc(task, enter_rss);
+	memory_capture_stack(ctx, event, task, true);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_brk")
+int systing_brk_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_brk_enter_common(task);
+}
+
+SEC("tracepoint/syscalls/sys_exit_brk")
+int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_brk_exit_common(ctx, task, ctx->ret);
+}
+
+SEC("fentry/" SYSTING_SYSCALL_WRAPPER_PREFIX "brk")
+int BPF_PROG(systing_brk_fentry, const struct pt_regs *regs)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_brk_enter_common(task);
+}
+
+SEC("fexit/" SYSTING_SYSCALL_WRAPPER_PREFIX "brk")
+int BPF_PROG(systing_brk_fexit, const struct pt_regs *regs, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_brk_exit_common(ctx, task, ret);
+}
+
+/* The raw-tracepoint form of the mmap/munmap/brk hooks — the opt-in form
+ * under `--kernel-hooks raw-tracepoint`: one program on the sys_enter
+ * tracepoint and one on sys_exit, attached raw through their BTF-typed
+ * arguments (tp_btf) and dispatching on the syscall number, in place of the
+ * six classic syscalls/sys_{enter,exit}_* programs above, which stay in the
+ * object as the fallback and as the default form.
+ *
+ * What it buys is the DETACH. A perf-attached tracepoint program's link
+ * teardown runs perf_trace_event_unreg() -> tracepoint_synchronize_unregister()
+ * — one SRCU plus one RCU grace period, serialized, once per program, so
+ * six times for the classic set — while a raw tracepoint's last probe
+ * removal takes tracepoint_remove_func()'s RCU-state snapshot and frees the
+ * probe array through call_rcu, with no tasks-trace wait and, when the
+ * pair was the tracepoint's last probe, no wait at all on the stop path;
+ * when another probe stays registered on sys_enter / sys_exit, the 2->1
+ * branch of tracepoint_remove_func() may wait one classic-RCU + SRCU
+ * grace period (tp_rcu_cond_sync; kernel/tracepoint.c, the same on 6.6,
+ * 6.12 and 6.18) — once per tracepoint, against the classic set's six. The
+ * phase the difference lands in is the "detach bpf programs" stop phase,
+ * of which this set is the memory lane's share (see SCHEMA_CHANGES.md,
+ * schema 20). Both forms register the same two tracepoints, so the
+ * static-key flip and syscall_regfunc()'s task walk at the first
+ * registration and last removal are paid either way.
+ *
+ * What it costs is the ENTRY, and that cost is why the form is opt-in:
+ * every syscall of every task carrying TIF_SYSCALL_TRACEPOINT (all of them
+ * once sys_enter is registered, under either form) enters these two
+ * programs, where the classic form's perf_syscall_enter() returned on its
+ * enabled-syscall bitmap test. The syscall-number test is therefore each
+ * program's first act and every other syscall returns before any helper
+ * call or task filter — yet the entry itself is paid: on a 4-vCPU 6.12.0
+ * guest under TCG a four-thread getpid() storm ran at about half of its
+ * uncaptured rate under this pair against 84-88 % under the classic set,
+ * three runs (SCHEMA_CHANGES.md, schema 20). sys_exit carries only the
+ * return value, so the exit program reads the number from pt_regs (orig_ax
+ * on x86; the arm64 and riscv fields, below).
+ *
+ * The arguments are the pt_regs reads the trampoline form makes and the
+ * rows are built by the shared *_common helpers, so a row is byte-identical
+ * whichever form produced it — and a 32-bit compat task's syscalls are
+ * skipped under every form (systing_in_compat_syscall, below: the classic
+ * events skip them in the kernel, the trampoline form never attaches the
+ * compat wrappers). Selection: loaded only under the
+ * raw-tracepoint form and when vmlinux BTF has the btf_trace_sys_enter /
+ * btf_trace_sys_exit typedefs (a tp_btf target resolves at LOAD, and a
+ * missing one fails the whole object — the same gate systing_rss_stat_btf
+ * uses), attached one program at a time after skel.attach() with the
+ * classic set as the fallback, and recorded in sysinfo.memory_syscall_leg
+ * as `raw_tracepoint`. */
+#if defined(SYSTING_NR_MMAP)
+/* The number of the syscall that is exiting, read straight from the
+ * tracepoint's BTF-typed pt_regs (a direct load, no probe-read helper: this
+ * runs on every syscall exit while the pair is attached). */
+static __always_inline long systing_syscall_nr(const struct pt_regs *regs)
+{
+#if defined(__TARGET_ARCH_x86)
+	return (long)regs->orig_ax;
+#elif defined(__TARGET_ARCH_arm64)
+	return (long)regs->syscallno;
+#else
+	/* riscv keeps the number in a7 through the syscall; a7 is not a
+	 * return register, so it is intact at the exit tracepoint. */
+	return (long)regs->a7;
+#endif
+}
+
+/* Whether the syscall being entered or exited is a 32-bit COMPAT task's.
+ * The classic syscalls/sys_{enter,exit}_* events make this test for their
+ * programs — trace_get_syscall_nr() returns -1 for a compat syscall under
+ * ARCH_TRACE_IGNORE_COMPAT_SYSCALLS (kernel/trace/trace_syscalls.c; x86's
+ * arch_trace_is_compat_syscall() is in_32bit_syscall(), arm64's and
+ * riscv's is_compat_task()), so the six classic programs never see one —
+ * while the raw sys_enter / sys_exit tracepoints fire for a compat task
+ * with the COMPAT table's number (kernel/entry/common.c). The pair makes
+ * the same test itself, or an ia32 link (9) / execve (11) / chdir (12)
+ * would land as an mmap / munmap / brk row with the x86-64 argument
+ * registers read as addr / size, and an arm64 compat setgid32 (214) /
+ * setfsuid32 (215) as a brk / munmap row.
+ *
+ * x86: TS_COMPAT in thread_info.status, set by syscall_32_enter() before
+ * sys_enter fires and cleared by arch_exit_to_user_mode_prepare() after
+ * sys_exit has fired (arch/x86/entry/common.c, arch/x86/include/asm/
+ * entry-common.h, kernel/entry/common.c), so both programs read the same
+ * bit; a kernel built without IA32_EMULATION never sets it. x32 needs no
+ * test: its numbers carry __X32_SYSCALL_BIT and never pass the number
+ * test. arm64: TIF_32BIT in thread_info.flags, the flag is_compat_task()
+ * reads. riscv: the ISA's sstatus.UXL field in the saved status, which
+ * start_thread() sets to 32 for a compat task (arch/riscv/kernel/process.c)
+ * — used in place of riscv's TIF_32BIT, whose bit number moved between
+ * kernel series (11 at v6.12, 16 at v6.18). TS_COMPAT is 0x0002 and arm64's
+ * TIF_32BIT is 22 at v6.6, v6.12 and v6.18 alike (the macros are not in
+ * vmlinux.h, so the values are spelled here); every load is a direct read
+ * of a BTF-typed pointer, the shape systing_syscall_nr uses for orig_ax. */
+#if defined(__TARGET_ARCH_x86)
+#define SYSTING_TS_COMPAT 0x0002 /* arch/x86/include/asm/thread_info.h */
+#elif defined(__TARGET_ARCH_arm64)
+#define SYSTING_TIF_32BIT_MASK (1UL << 22) /* arch/arm64/include/asm/thread_info.h */
+#elif defined(__TARGET_ARCH_riscv)
+#define SYSTING_SR_UXL 0x300000000UL /* arch/riscv/include/asm/csr.h */
+#define SYSTING_SR_UXL_32 0x100000000UL
+#endif
+
+static __always_inline bool systing_in_compat_syscall(const struct task_struct *task,
+						      const struct pt_regs *regs)
+{
+#if defined(__TARGET_ARCH_x86)
+	return (task->thread_info.status & SYSTING_TS_COMPAT) != 0;
+#elif defined(__TARGET_ARCH_arm64)
+	return (task->thread_info.flags & SYSTING_TIF_32BIT_MASK) != 0;
+#elif defined(__TARGET_ARCH_riscv)
+	return (regs->status & SYSTING_SR_UXL) == SYSTING_SR_UXL_32;
+#else
+	return false;
+#endif
+}
+
+SEC("tp_btf/sys_enter")
+int BPF_PROG(systing_sys_enter, struct pt_regs *regs, long id)
+{
+	if (id != SYSTING_NR_MMAP && id != SYSTING_NR_MUNMAP && id != SYSTING_NR_BRK)
+		return 0;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (systing_in_compat_syscall(task, regs))
+		return 0;
+	if (!trace_task(task))
+		return 0;
+	if (id == SYSTING_NR_MMAP)
+		return memory_mmap_enter_common(task, (u64)PT_REGS_PARM1_CORE_SYSCALL(regs),
+						(u64)PT_REGS_PARM2_CORE_SYSCALL(regs),
+						(u32)PT_REGS_PARM3_CORE_SYSCALL(regs),
+						(u32)PT_REGS_PARM4_CORE_SYSCALL(regs));
+	if (id == SYSTING_NR_MUNMAP)
+		return memory_munmap_enter_common(task, (u64)PT_REGS_PARM1_CORE_SYSCALL(regs),
+						  (u64)PT_REGS_PARM2_CORE_SYSCALL(regs));
+	return memory_brk_enter_common(task);
+}
+
+SEC("tp_btf/sys_exit")
+int BPF_PROG(systing_sys_exit, struct pt_regs *regs, long ret)
+{
+	long id = systing_syscall_nr(regs);
+	if (id != SYSTING_NR_MMAP && id != SYSTING_NR_MUNMAP && id != SYSTING_NR_BRK)
+		return 0;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (systing_in_compat_syscall(task, regs))
+		return 0;
+	if (!trace_task(task))
+		return 0;
+	if (id == SYSTING_NR_MMAP)
+		return memory_mmap_exit_common(ctx, task, ret);
+	if (id == SYSTING_NR_MUNMAP)
+		return memory_munmap_exit_common(ctx, task, ret);
+	return memory_brk_exit_common(ctx, task, ret);
+}
+#endif /* SYSTING_NR_MMAP */
+
+#if defined(__TARGET_ARCH_x86)
+/* The x86 fault leg is the exceptions:page_fault_user tracepoint attached
+ * raw, through its BTF-typed arguments (tp_btf), not through perf_event_open:
+ * a raw tracepoint's probe is a direct call with no perf-sample build per
+ * fault, and its detach is tracepoint_probe_unregister's asynchronous
+ * call_rcu path instead of the perf tracepoint's synchronous SRCU + RCU
+ * grace periods (see the syscall hooks above). The tracepoint's own
+ * enable/disable is a static-key flip either way. No fallback set: every
+ * other raw tracepoint of the object (the scheduler, IRQ and network lanes)
+ * already requires the kernel's BTF, so a kernel that cannot attach this
+ * one cannot load the object at all. sysinfo.memory_fault_leg keeps reading
+ * `tracepoint` on x86 for this attach form. */
+SEC("tp_btf/page_fault_user")
+int BPF_PROG(systing_page_fault_user, unsigned long address, struct pt_regs *regs,
+	     unsigned long error_code)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	/* Sample 1:N page faults to bound overhead on fault-heavy workloads. */
+	if (tool_config.memory_fault_sample_rate > 1) {
+		u32 zero = 0;
+		u64 *cnt = bpf_map_lookup_elem(&memory_fault_counter, &zero);
+		if (cnt) {
+			*cnt += 1;
+			if (*cnt % tool_config.memory_fault_sample_rate != 0)
+				return 0;
+		}
+	}
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = MEMORY_PAGE_FAULT;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = address;
+	event->hdr.flags = (u32)error_code;
+	memory_capture_stack(ctx, event, task, false);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+#else
+/* Outside x86 there is no exceptions:page_fault_user tracepoint to attach to
+ * (trace_page_fault_user() is called from arch/x86/mm/fault.c and, from 6.18,
+ * arch/riscv/mm/fault.c; arch/arm64/mm/fault.c never fires it), so the fault
+ * leg rides the perf software event PERF_COUNT_SW_PAGE_FAULTS instead. The
+ * events are opened per CPU from userspace (attach_page_fault_sw_events in
+ * systing_core.rs) with exclude_kernel=1 — user-mode faults only, the same
+ * population the x86 tracepoint sees — and sample_period =
+ * memory_fault_sample_rate, so the kernel does the 1:N sampling and no BPF-side
+ * counter is needed. The program runs in the faulting task's own context (the
+ * software event fires synchronously from the fault path, not from an NMI or
+ * a timer), so it writes the memory ringbuf like every other memory program.
+ * ctx->addr is the faulting address (perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS,
+ * 1, regs, address) in the arch fault handlers; the event is opened with
+ * PERF_SAMPLE_ADDR so the field reads 0, not stale stack, for a fault at
+ * address 0). The x86 error_code has no portable equivalent, so flags is 0 on
+ * this path; the user stack is walked from the sample's registers, i.e. from
+ * the faulting user frame. */
+SEC("perf_event")
+int systing_page_fault_sw(struct bpf_perf_event_data *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = MEMORY_PAGE_FAULT;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = ctx->addr;
+	event->hdr.flags = 0;
+	memory_capture_stack(ctx, event, task, false);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+#endif
+
+/* ---- VFIO DMA regions: kprobes on the vfio_iommu_type1 ioctl handlers ----
+ *
+ * vfio_dma_do_map(struct vfio_iommu *, struct vfio_iommu_type1_dma_map *)
+ * vfio_dma_do_unmap(struct vfio_iommu *, struct vfio_iommu_type1_dma_unmap *, ...)
+ * take the uapi argument struct already copied into kernel memory by the
+ * ioctl handler, so arg2 is a kernel pointer to a fixed uapi layout
+ * (include/uapi/linux/vfio.h; the same at 6.6, 6.12 and 6.18). The functions
+ * are static in drivers/vfio/vfio_iommu_type1.c and live in a module, so
+ * userspace only loads and attaches these programs when kallsyms carries the
+ * symbol (attach_memory_vfio_legs in systing_core.rs) and records the leg as
+ * off in sysinfo.memory_vfio_leg otherwise — the other memory legs run
+ * regardless. One event per DMA region (a model load is tens to thousands
+ * of regions), so no sampling. The pin/unpin cost of the region is charged
+ * to the calling task in the same ioctl, which is why the stacks are kept:
+ * they name the runtime thread doing the mapping.
+ */
+struct vfio_iommu_type1_dma_map_uapi {
+	u32 argsz;
+	u32 flags;
+	u64 vaddr;
+	u64 iova;
+	u64 size;
+};
+
+struct vfio_iommu_type1_dma_unmap_uapi {
+	u32 argsz;
+	u32 flags;
+	u64 iova;
+	u64 size;
+};
+
+/* include/uapi/linux/vfio.h: VFIO_DMA_UNMAP_FLAG_ALL — unmap every region. */
+#define MEMORY_VFIO_DMA_UNMAP_FLAG_ALL (1 << 1)
+/* Not a uapi flag: the unmap row stands for a container teardown
+ * (vfio_iommu_type1_release), which unmaps every region without an ioctl. */
+#define MEMORY_VFIO_FLAG_TEARDOWN (1u << 31)
+
+/* Open the window the iommu:map/unmap histogram counts in: the runs this
+ * task maps or unmaps inside [iova, iova + size) until the matching
+ * kretprobe closes it. A window that cannot be opened (the inflight hash is
+ * full: more than 1024 traced tasks inside a VFIO path at once) leaves
+ * this path's runs uncounted — counted under memory_iommu_overflow so the
+ * histogram reads as a floor rather than silently short. The other way a
+ * window goes wrong is not counted: a kretprobe that misses its return
+ * (the kernel's per-probe pool of pending returns exhausted — an ioctl
+ * holds an instance for seconds, and the pool is sized per probe by the
+ * kernel) leaves the window open, so this task's later runs inside that
+ * range count until its next VFIO path re-opens the window or the capture
+ * ends; a perf-attached kretprobe's miss count is not exported, so the
+ * case is a documented bound rather than a counter. */
+static __always_inline void memory_vfio_open_window(u64 iova, u64 size)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_vfio_inflight inflight = { .iova = iova, .size = size };
+	if (bpf_map_update_elem(&memory_vfio_inflight, &tgidpid, &inflight, BPF_ANY)) {
+		u32 zero = 0;
+		u64 *dropped = bpf_map_lookup_elem(&memory_iommu_overflow, &zero);
+		if (dropped)
+			*dropped += 1;
+	}
+}
+
+static __always_inline int memory_vfio_emit(void *ctx, enum memory_event_type type,
+					    u64 iova, u64 size, u64 vaddr, u32 uflags)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	if (type == MEMORY_VFIO_UNMAP && (uflags & MEMORY_VFIO_DMA_UNMAP_FLAG_ALL))
+		memory_vfio_open_window(0, ~0ULL);
+	else
+		memory_vfio_open_window(iova, size);
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = type;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = iova;
+	event->hdr.size = size;
+	event->hdr.old_addr = vaddr;
+	event->hdr.member = 0;
+	event->hdr.flags = uflags;
+	memory_capture_stack(ctx, event, task, true);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("kprobe/vfio_dma_do_map")
+int BPF_KPROBE(systing_vfio_dma_map, void *iommu, struct vfio_iommu_type1_dma_map_uapi *map)
+{
+	struct vfio_iommu_type1_dma_map_uapi args;
+	if (bpf_probe_read_kernel(&args, sizeof(args), map))
+		return 0;
+	return memory_vfio_emit(ctx, MEMORY_VFIO_MAP, args.iova, args.size, args.vaddr, args.flags);
+}
+
+SEC("kprobe/vfio_dma_do_unmap")
+int BPF_KPROBE(systing_vfio_dma_unmap, void *iommu, struct vfio_iommu_type1_dma_unmap_uapi *unmap)
+{
+	struct vfio_iommu_type1_dma_unmap_uapi args;
+	if (bpf_probe_read_kernel(&args, sizeof(args), unmap))
+		return 0;
+	return memory_vfio_emit(ctx, MEMORY_VFIO_UNMAP, args.iova, args.size, 0, args.flags);
+}
+
+static __always_inline int memory_vfio_close_window(void)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&memory_vfio_inflight, &tgidpid);
+	return 0;
+}
+
+SEC("kretprobe/vfio_dma_do_map")
+int BPF_KRETPROBE(systing_vfio_dma_map_ret)
+{
+	return memory_vfio_close_window();
+}
+
+SEC("kretprobe/vfio_dma_do_unmap")
+int BPF_KRETPROBE(systing_vfio_dma_unmap_ret)
+{
+	return memory_vfio_close_window();
+}
+
+/* ---- Teardown without an ioctl: container release and group detach ----
+ *
+ * Closing the last file of a VFIO container runs vfio_iommu_type1_release,
+ * which unmaps and unpins every region (vfio_iommu_unmap_unpin_all); a
+ * group detaching from a domain (vfio_iommu_type1_detach_group) unmaps the
+ * regions from that domain, every one of them when it was the domain's last
+ * group. Neither passes vfio_dma_do_unmap, so without these probes a model
+ * unload that simply closes its device files would leave no unmap row and
+ * its iommu:unmap runs outside any window. The release pair opens a
+ * [0, ~0) window and writes one unmap row flagged MEMORY_VFIO_FLAG_TEARDOWN
+ * (iova 0, size ~0: "everything"); the detach pair only opens the window,
+ * because how much a detach unmaps is known only from the runs the
+ * histogram then counts. Both functions are static ops callbacks of the
+ * vfio_iommu_type1 module (out-of-line, so kallsyms lists them while the
+ * module is loaded); the release runs in the closing task, so trace_task()
+ * decides attribution exactly as for the ioctls.
+ */
+SEC("kprobe/vfio_iommu_type1_release")
+int BPF_KPROBE(systing_vfio_release, void *iommu_data)
+{
+	return memory_vfio_emit(ctx, MEMORY_VFIO_UNMAP, 0, ~0ULL, 0,
+				MEMORY_VFIO_DMA_UNMAP_FLAG_ALL | MEMORY_VFIO_FLAG_TEARDOWN);
+}
+
+SEC("kretprobe/vfio_iommu_type1_release")
+int BPF_KRETPROBE(systing_vfio_release_ret)
+{
+	return memory_vfio_close_window();
+}
+
+SEC("kprobe/vfio_iommu_type1_detach_group")
+int BPF_KPROBE(systing_vfio_detach_group, void *iommu_data, void *iommu_group)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	memory_vfio_open_window(0, ~0ULL);
+	return 0;
+}
+
+SEC("kretprobe/vfio_iommu_type1_detach_group")
+int BPF_KRETPROBE(systing_vfio_detach_group_ret)
+{
+	return memory_vfio_close_window();
+}
+
+/* ---- IOMMU map/unmap run-size histogram: iommu:map / iommu:unmap ----
+ *
+ * Classic tracepoint programs reading the event record by the fixed layout
+ * of the iommu events (the common 8-byte header, then the u64 fields in
+ * TP_STRUCT__entry order — unchanged since the tracepoints were added). See
+ * the memory_iommu_hist comment for why these count instead of emitting.
+ *
+ * What one event is, read at vfio_iommu_type1.c (v6.12): a map is pinned
+ * one physically contiguous run at a time and vfio_iommu_map() issues one
+ * iommu_map() per run PER DOMAIN in the container's domain_list, so a
+ * container whose devices sit in two IOMMU domains counts every map run
+ * twice; on unmap (vfio_unmap_unpin) only the first domain is unmapped run
+ * by run — each further domain gets ONE iommu_unmap() of the whole region,
+ * one event of the region's size. The order key is floor(log2(size)): a run
+ * that is not a power of two (three contiguous pages, 12 KiB) counts under
+ * the order below it (13, 8 KiB) with its exact size added to bytes, so
+ * bytes is exact per bucket and count-by-order is a floor histogram.
+ */
+struct systing_iommu_map_args {
+	u64 common;
+	u64 iova;
+	u64 paddr;
+	u64 size;
+};
+
+struct systing_iommu_unmap_args {
+	u64 common;
+	u64 iova;
+	u64 size;
+	u64 unmapped_size;
+};
+
+/* floor(log2(v)) by binary search — a fixed six-step sequence the verifier
+ * reads as straight-line code (no clz instruction on BPF). 0 for v == 0. */
+static __always_inline u32 memory_log2_u64(u64 v)
+{
+	u32 r = 0;
+	if (v >> 32) { v >>= 32; r += 32; }
+	if (v >> 16) { v >>= 16; r += 16; }
+	if (v >> 8) { v >>= 8; r += 8; }
+	if (v >> 4) { v >>= 4; r += 4; }
+	if (v >> 2) { v >>= 2; r += 2; }
+	if (v >> 1) { r += 1; }
+	return r;
+}
+
+static __always_inline void memory_iommu_account(u32 op, u64 iova, u64 size)
+{
+	/* Host-wide hot path: one small-hash miss for every iommu_map() that
+	 * is not a traced task's VFIO region (the only entries the vfio
+	 * kprobes create are for tasks that passed trace_task). */
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_vfio_inflight *in = bpf_map_lookup_elem(&memory_vfio_inflight, &tgidpid);
+	if (!in)
+		return;
+	if (iova < in->iova || iova - in->iova >= in->size)
+		return;
+
+	struct memory_iommu_key key = {
+		.tgid = (u32)(tgidpid >> 32),
+		.op = op,
+		.iova_gib = (u32)(iova >> 30),
+		.order = memory_log2_u64(size),
+	};
+	struct memory_iommu_value *v = bpf_map_lookup_elem(&memory_iommu_hist, &key);
+	if (!v) {
+		struct memory_iommu_value init = {};
+		bpf_map_update_elem(&memory_iommu_hist, &key, &init, BPF_NOEXIST);
+		v = bpf_map_lookup_elem(&memory_iommu_hist, &key);
+		if (!v) {
+			u32 zero = 0;
+			u64 *dropped = bpf_map_lookup_elem(&memory_iommu_overflow, &zero);
+			if (dropped)
+				*dropped += 1;
+			return;
+		}
+	}
+	__sync_fetch_and_add(&v->count, 1);
+	__sync_fetch_and_add(&v->bytes, size);
+}
+
+SEC("tracepoint/iommu/map")
+int systing_iommu_map(struct systing_iommu_map_args *ctx)
+{
+	memory_iommu_account(1, ctx->iova, ctx->size);
+	return 0;
+}
+
+SEC("tracepoint/iommu/unmap")
+int systing_iommu_unmap(struct systing_iommu_unmap_args *ctx)
+{
+	memory_iommu_account(2, ctx->iova, ctx->unmapped_size ? ctx->unmapped_size : ctx->size);
+	return 0;
+}
+
+/* ---- THP splits: sampled kprobes on the split paths ----
+ *
+ * Two kinds, matching /proc/vmstat. thp_split_pmd (a PMD mapping split into
+ * PTEs, the folio intact) is counted in the static worker
+ * __split_huge_pmd_locked, which every PMD split reaches — the
+ * split_huge_pmd() callers through __split_huge_pmd, and the rmap paths
+ * (try_to_unmap / try_to_migrate on 6.10+) through split_huge_pmd_locked.
+ * When kallsyms lists the worker, the probe sits there and counts exactly
+ * what vmstat counts. When the build inlined it, the probe falls back to
+ * the global funnel split_huge_pmd_locked (6.10+, a T symbol): on 6.12 and
+ * 6.18 both __split_huge_pmd and the rmap paths call it, and it calls the
+ * worker once the PMD is huge (or a migration entry) — so it covers every
+ * split the worker does, but it is also reached for a PMD that is NOT huge
+ * (the huge check is inside it), so it over-counts on VMA churn; userspace
+ * records that tier as sysinfo.memory_thp_leg on:pmd-global. On a kernel
+ * without the funnel (before 6.10, where the rmap paths still go through
+ * __split_huge_pmd) the last fallback probes the public entry
+ * __split_huge_pmd, which over-counts the same way — and on a 6.10+ kernel
+ * whose kallsyms lacked the funnel it would also miss the rmap paths
+ * (sysinfo.memory_thp_leg on:pmd-entry). thp_split_page /
+ * thp_split_page_failed count at the end of
+ * the folio split whose entry is split_huge_page_to_list (<= 6.8) or
+ * split_huge_page_to_list_to_order (>= 6.9; at 6.18 the counter sits in its
+ * static callee __folio_split); the entry's return value is the result: 0
+ * split, -EBUSY/-EAGAIN failed. On 6.9+ every large-folio split goes through
+ * that entry, file and shmem folios included, so its rows are a superset of
+ * the vmstat thp_split_page family; on 6.15+ the folio_split() path splits
+ * without passing it, so the vmstat delta stays the host-wide truth and the
+ * rows are the sampled, attributed subset. Userspace loads the programs
+ * whose symbols the running kernel has and records the leg in
+ * sysinfo.memory_thp_leg.
+ * Splits run in task context (madvise, munmap, reclaim, migration), so the
+ * memory ring is written as usual; the leg is 1:N sampled
+ * (memory_thp_sample_rate, 0 = off) because reclaim storms can split
+ * thousands of folios a second.
+ */
+static __always_inline bool memory_thp_sample_hit(void)
+{
+	if (tool_config.memory_thp_sample_rate <= 1)
+		return true;
+	u32 zero = 0;
+	u64 *cnt = bpf_map_lookup_elem(&memory_thp_counter, &zero);
+	if (!cnt)
+		return true;
+	*cnt += 1;
+	return (*cnt % tool_config.memory_thp_sample_rate) == 0;
+}
+
+static __always_inline int memory_thp_emit(void *ctx, u32 kind, u64 address, u32 result)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	if (!memory_thp_sample_hit())
+		return 0;
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = MEMORY_THP_SPLIT;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = address;
+	event->hdr.size = 0;
+	event->hdr.old_addr = 0;
+	event->hdr.member = kind;
+	event->hdr.flags = result;
+	memory_capture_stack(ctx, event, task, true);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("kprobe/__split_huge_pmd")
+int BPF_KPROBE(systing_thp_split_pmd, void *vma, void *pmd, unsigned long address)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, address, 0);
+}
+
+/* The worker every PMD split reaches (see above); `freeze` is set when the
+ * PTEs are written as migration entries — the migrate path
+ * (try_to_migrate_one, and the folio split's own unmap of anon folios);
+ * reclaim's try_to_unmap_one splits with it clear, like a plain split —
+ * carried in the row's `result` column. The worker runs inside the PMD's
+ * page-table lock (pmd_lock in __split_huge_pmd, IRQs on, preemption off),
+ * so this probe's ringbuf reserve and user+kernel stack capture sit inside
+ * that spinlock hold too, bounded by the 1-in-N sample rate; the entry
+ * probe above fires before the lock is taken. The `bool` argument arrives
+ * as a full register whose upper bits the ABIs leave unspecified, and a
+ * `bool` parameter here would test the whole register: take it as the raw
+ * register and test the low byte only. */
+SEC("kprobe/__split_huge_pmd_locked")
+int BPF_KPROBE(systing_thp_split_pmd_locked, void *vma, void *pmd, unsigned long haddr,
+	       unsigned long freeze)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, haddr, ((u8)freeze) ? 1 : 0);
+}
+
+/* The global funnel on 6.10+ (`split_huge_pmd_locked`, the middle tier —
+ * see above): reached by __split_huge_pmd AND the rmap paths, inside the
+ * PMD's page-table lock like the worker, and before its own huge check,
+ * so it also fires for a PMD that is not huge. Its parameters are
+ * (vma, address, pmd, freeze, folio) on 6.12 and (vma, address, pmd,
+ * freeze) on 6.18: the first four are the same on both, with `address`
+ * and `pmd` swapped relative to the worker, and `freeze` the fourth
+ * register — masked to its low byte as in the worker probe. A build that
+ * also inlined the funnel into its same-file caller __split_huge_pmd
+ * (the symbol stays exported for rmap.c) would leave this probe with the
+ * rmap paths only; the memory_recorder e2e's madvise split check is what
+ * catches that on a test kernel. */
+SEC("kprobe/split_huge_pmd_locked")
+int BPF_KPROBE(systing_thp_split_pmd_global, void *vma, unsigned long address, void *pmd,
+	       unsigned long freeze)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, address, ((u8)freeze) ? 1 : 0);
+}
+
+SEC("kretprobe/split_huge_page_to_list_to_order")
+int BPF_KRETPROBE(systing_thp_split_page, int ret)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PAGE, 0, (u32)ret);
+}
+
+/* The same entry under its pre-6.9 name (the 6.6 series). */
+SEC("kretprobe/split_huge_page_to_list")
+int BPF_KRETPROBE(systing_thp_split_page_legacy, int ret)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PAGE, 0, (u32)ret);
+}
+
+/* ---- memory-alloc: libc allocator uprobes ----
+ *
+ * Attached manually from userspace (per unique libc path, pid=-1); BPF-side
+ * trace_task() enforces the pid/cgroup filter. Sampling keeps overhead bounded
+ * on malloc-heavy workloads: the entry probe decides whether to record, and the
+ * retprobe only emits if the entry stashed args. */
+
+static __always_inline bool memory_alloc_sample(void)
+{
+	if (tool_config.memory_alloc_sample_rate <= 1)
+		return true;
+	u32 zero = 0;
+	u64 *cnt = bpf_map_lookup_elem(&memory_alloc_counter, &zero);
+	if (!cnt)
+		return true;
+	*cnt += 1;
+	return (*cnt % tool_config.memory_alloc_sample_rate) == 0;
+}
+
+static __always_inline int memory_alloc_enter(struct pt_regs *ctx, u64 size, u64 old_addr)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	if (!memory_alloc_sample())
+		return 0;
+
+	u32 zero = 0;
+	struct memory_alloc_args *args =
+		bpf_map_lookup_elem(&memory_alloc_args_tmp, &zero);
+	if (!args)
+		return 0;
+	args->size = size;
+	args->old_addr = old_addr;
+	long len = bpf_get_stack(ctx, args->user_stack, sizeof(args->user_stack),
+				 BPF_F_USER_STACK);
+	args->user_stack_length = len > 0 ? len / sizeof(u64) : 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	bpf_map_update_elem(&memory_alloc_scratch, &tgidpid, args, BPF_ANY);
+	memory_alloc_count(&memory_alloc_enter_count);
+	return 0;
+}
+
+/* Emit a MEMORY_ALLOC event from a saved entry-time args record. Scratch is
+ * always deleted. addr==0 (failed allocation) is dropped. Kernel stack is not
+ * captured — at uretprobe time it is just the trampoline dispatch path. */
+static __always_inline int memory_alloc_emit(struct task_struct *task, u64 tgidpid,
+					     struct memory_alloc_args *saved, u64 addr,
+					     u64 old_addr, enum memory_alloc_op op)
+{
+	if (addr == 0) {
+		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
+		return 0;
+	}
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+	}
+
+	event->hdr.type = MEMORY_ALLOC;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = addr;
+	event->hdr.size = saved->size;
+	event->hdr.old_addr = old_addr;
+	event->hdr.member = op;
+	event->hdr.kernel_stack_length = 0;
+	event->hdr.user_stack_length = saved->user_stack_length;
+	__builtin_memcpy(event->user_stack, saved->user_stack, sizeof(event->user_stack));
+	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
+#ifdef SYSTING_PYSTACKS
+	if (tool_config.collect_pystacks) {
+		struct pt_regs *pt_regs = (struct pt_regs *)bpf_task_pt_regs(task);
+		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
+	}
+#endif
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
+					     enum memory_alloc_op op)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_alloc_args *saved =
+		bpf_map_lookup_elem(&memory_alloc_scratch, &tgidpid);
+	if (!saved)
+		return 0;
+	memory_alloc_count(&memory_alloc_exit_count);
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	return memory_alloc_emit(task, tgidpid, saved, addr, saved->old_addr, op);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_malloc_enter, size_t size)
+{
+	return memory_alloc_enter(ctx, (u64)size, 0);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_malloc_exit, void *ret)
+{
+	return memory_alloc_exit(ctx, (u64)ret, MEMORY_OP_MALLOC);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_calloc_enter, size_t nmemb, size_t size)
+{
+	return memory_alloc_enter(ctx, (u64)nmemb * (u64)size, 0);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_calloc_exit, void *ret)
+{
+	return memory_alloc_exit(ctx, (u64)ret, MEMORY_OP_CALLOC);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_realloc_enter, void *ptr, size_t size)
+{
+	return memory_alloc_enter(ctx, (u64)size, (u64)ptr);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_realloc_exit, void *ret)
+{
+	return memory_alloc_exit(ctx, (u64)ret, MEMORY_OP_REALLOC);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_aligned_alloc_enter, size_t alignment, size_t size)
+{
+	return memory_alloc_enter(ctx, (u64)size, 0);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_aligned_alloc_exit, void *ret)
+{
+	return memory_alloc_exit(ctx, (u64)ret, MEMORY_OP_ALIGNED_ALLOC);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_posix_memalign_enter, void **memptr, size_t alignment,
+	       size_t size)
+{
+	return memory_alloc_enter(ctx, (u64)size, (u64)memptr);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_posix_memalign_exit, int ret)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_alloc_args *saved =
+		bpf_map_lookup_elem(&memory_alloc_scratch, &tgidpid);
+	if (!saved)
+		return 0;
+	memory_alloc_count(&memory_alloc_exit_count);
+
+	u64 addr = 0;
+	if (ret == 0)
+		bpf_probe_read_user(&addr, sizeof(addr), (void *)saved->old_addr);
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	return memory_alloc_emit(task, tgidpid, saved, addr, 0, MEMORY_OP_POSIX_MEMALIGN);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_free_enter, void *ptr)
+{
+	if (ptr == NULL)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	if (!memory_alloc_sample())
+		return 0;
+
+	long flags;
+	struct memory_event_header *event = reserve_memory_event_header(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_FREE;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->addr = (u64)ptr;
+	event->member = MEMORY_OP_FREE;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";

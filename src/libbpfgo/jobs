@@ -1,0 +1,27 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+selftest_attachgenericfd-main: selftest/attachgenericfd/main.bpf.c | $F -Iselftest/attachgenericfd -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+libbpfgo_test: selftest/build/libbpfgo_test.bpf.c | $F -Iselftest/build -Iselftest -I. -Iselftest/common -I../../include
+selftest_cgroup-legacy-main: selftest/cgroup-legacy/main.bpf.c | $F -Iselftest/cgroup-legacy -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_cgroup-main: selftest/cgroup/main.bpf.c | $F -Iselftest/cgroup -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_create-map-main: selftest/create-map/main.bpf.c | $F -Iselftest/create-map -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_error-handling-main: selftest/error-handling/main.bpf.c | $F -Iselftest/error-handling -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_global-variable-main: selftest/global-variable/main.bpf.c | $F -Iselftest/global-variable -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_iter-main: selftest/iter/main.bpf.c | $F -Iselftest/iter -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_log-callbacks-main: selftest/log-callbacks/main.bpf.c | $F -Iselftest/log-callbacks -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_map-update-main: selftest/map-update/main.bpf.c | $F -Iselftest/map-update -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_module-attach-detach-main: selftest/module-attach-detach/main.bpf.c | $F -Iselftest/module-attach-detach -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_netns-main: selftest/netns/main.bpf.c | $F -Iselftest/netns -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_perfbuffers-main: selftest/perfbuffers/main.bpf.c | $F -Iselftest/perfbuffers -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_probe-features-main: selftest/probe-features/main.bpf.c | $F -Iselftest/probe-features -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_prog-run-main: selftest/prog-run/main.bpf.c | $F -Iselftest/prog-run -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_ringbuffers-main: selftest/ringbuffers/main.bpf.c | $F -Iselftest/ringbuffers -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_set-attach-main: selftest/set-attach/main.bpf.c | $F -Iselftest/set-attach -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_tc-main: selftest/tc/main.bpf.c | $F -Iselftest/tc -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_tracing-by-offset-main: selftest/tracing-by-offset/main.bpf.c | $F -Iselftest/tracing-by-offset -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_uprobe-cookie-main: selftest/uprobe-cookie/main.bpf.c | $F -Iselftest/uprobe-cookie -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_uprobe-multi-main: selftest/uprobe-multi/main.bpf.c | $F -Iselftest/uprobe-multi -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_uprobe-main: selftest/uprobe/main.bpf.c | $F -Iselftest/uprobe -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_usdt-main: selftest/usdt/main.bpf.c | $F -Iselftest/usdt -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_userringbuf-main: selftest/userringbuf/main.bpf.c | $F -Iselftest/userringbuf -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap
+selftest_xdp-main: selftest/xdp/main.bpf.c | $F -Iselftest/xdp -Iselftest -I. -Iselftest/common -I../../include | !nc?secprog:foobar=fentry/__x64_sys_mmap

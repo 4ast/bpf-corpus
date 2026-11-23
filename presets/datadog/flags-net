@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+# Constants of the network, USM, GPU and check programs of the Datadog agent.
+# Each protocol and option is on. The maps are perf event arrays, so ring buffers are off.
+ringbuffers_enabled 0
+use_ring_buffer 0
+use_direct_consumer 0
+ringbuffer_wakeup_size 0
+bypass_program 0
+telemetry_program_id_key 7
+systemprobe_pid 4242
+tcpv4_enabled 1
+tcpv6_enabled 1
+udpv4_enabled 1
+udpv6_enabled 1
+udp_send_page_enabled 1
+tcp_failed_connections_enabled 1
+protocol_classification_enabled 1
+ephemeral_range_begin 32768
+ephemeral_range_end 60999
+dns_stats_enabled 1
+dns_port_0 53
+dns_port_1 5353
+fl4_offsets 1
+fl6_offsets 1
+http_monitoring_enabled 1
+http2_monitoring_enabled 1
+terminated_http2_monitoring_enabled 1
+kafka_monitoring_enabled 1
+postgres_monitoring_enabled 1
+redis_monitoring_enabled 1
+redis_with_key_monitoring_enabled 1
+test_monitoring_enabled 1
+libc_libset_enabled 1
+gpu_libset_enabled 1
+crypto_libset_enabled 1
+emit_cgroup_memory_stats 1
+# What offset guessing finds. The values are from include/vmlinux.btf.xz.
+offset_family 16	# sock_common.skc_family
+offset_saddr 4	# sock_common.skc_rcv_saddr
+offset_daddr 0	# sock_common.skc_daddr
+offset_daddr_ipv6 56	# sock_common.skc_v6_daddr
+offset_sport 1414	# inet_sock.inet_sport
+offset_dport 12	# sock_common.skc_dport
+offset_netns 48	# sock_common.skc_net
+offset_ino 472	# net.ns.inum
+offset_rtt 2552	# tcp_sock.srtt_us
+offset_rtt_var 2448	# tcp_sock.mdev_us
+offset_socket_sk 24	# socket.sk
+offset_sk_buff_sock 24	# sk_buff.sk
+offset_sk_buff_transport_header 178	# sk_buff.transport_header
+offset_sk_buff_head 200	# sk_buff.head
+offset_saddr_fl4 40	# flowi4.saddr
+offset_daddr_fl4 44	# flowi4.daddr
+offset_sport_fl4 50	# flowi4.uli.ports.sport
+offset_dport_fl4 48	# flowi4.uli.ports.dport
+offset_saddr_fl6 56	# flowi6.saddr
+offset_daddr_fl6 40	# flowi6.daddr
+offset_sport_fl6 78	# flowi6.uli.ports.sport
+offset_dport_fl6 76	# flowi6.uli.ports.dport
+offset_ct_origin 96	# nf_conn.tuplehash[0].tuple
+offset_ct_reply 152	# nf_conn.tuplehash[1].tuple
+offset_ct_netns 200	# nf_conn.ct_net
+offset_ct_ino 472	# net.ns.inum

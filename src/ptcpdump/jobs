@@ -1,0 +1,1 @@
+ptcpdump: bpf/ptcpdump.c | -D__TARGET_ARCH_x86 -D__x86_64__ -Ibpf -Ibpf/headers/amd64 -Ibpf/headers -I../../include

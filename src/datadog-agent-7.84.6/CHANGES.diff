@@ -1,0 +1,26 @@
+--- a/pkg/network/ebpf/c/sk/maps.h
++++ b/pkg/network/ebpf/c/sk/maps.h
+@@ -10,7 +10,7 @@
+ BPF_SK_STORAGE_MAP(sk_tcp_stats, sk_tcp_stats_t);
+ BPF_SK_STORAGE_MAP(sk_udp_stats, sk_udp_stats_t);
+ // will always be upgraded to ringbuffer
+-BPF_PERF_EVENT_ARRAY_MAP(conn_close_event, __u32);
++BPF_RINGBUF_MAP(conn_close_event, 1);
+ BPF_HASH_MAP(port_bindings, port_binding_t, __u32, 0)
+ BPF_HASH_MAP(udp_port_bindings, port_binding_t, __u32, 0)
+ 
+--- a/pkg/security/ebpf/c/include/maps.h
++++ b/pkg/security/ebpf/c/include/maps.h
+@@ -169,7 +169,11 @@
+ BPF_PROG_ARRAY(span_fill_progs, 3)
+ BPF_PROG_ARRAY(span_fill_tp_progs, 2)
+ 
+-BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 33554432); } events SEC(".maps");
++#else
++ BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#endif
+ BPF_PERCPU_ARRAY_MAP(events_stats, struct perf_map_stats_t, EVENT_MAX)
+ 
+ #if USE_RING_BUFFER == 1

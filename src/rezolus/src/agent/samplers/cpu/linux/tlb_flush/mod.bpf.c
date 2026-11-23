@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: GPL-2.0
+// Copyright (c) 2025 The Rezolus Authors
+
+// This BPF program tracks tlb_flush events
+//
+// On x86_64: Uses the tlb_flush tracepoint which provides detailed reason codes
+// On ARM64: Uses kprobe on tlb_finish_mmu for basic TLB flush counting
+//           (ARM64 doesn't emit the tlb_flush tracepoint)
+
+#include <vmlinux.h>
+#include "../../../agent/bpf/cgroup.h"
+#include "../../../agent/bpf/helpers.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+
+#define COUNTER_GROUP_WIDTH 8
+#define MAX_CPUS 1024
+
+// Per-cgroup attribution is the config option `cgroup_attribution`, on by
+// default for this sampler. Written into read-only data before load, so with
+// it off the verifier removes the per-cgroup path (the task-group read, the
+// new-cgroup check and the per-cgroup adds) rather than testing a flag on
+// every event.
+const volatile __u8 cgroup_attribution = 0;
+
+#define REASON_TASK_SWITCH 0
+#define REASON_REMOTE_SHOOTDOWN 1
+#define REASON_LOCAL_SHOOTDOWN 2
+#define REASON_LOCAL_MM_SHOOTDOWN 3
+#define REASON_REMOTE_SEND_IPI 4
+// ARM64 uses "unknown" since reason breakdown is unavailable
+#define REASON_UNKNOWN 5
+
+// counters for tlb_flush events
+// 0 - task_switch
+// 1 - remote shootdown
+// 2 - local shootdown
+// 3 - local mm shootdown
+// 4 - remote send ipi
+// 5 - unknown (ARM64: reason breakdown unavailable)
+//
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, MAX_CPUS* COUNTER_GROUP_WIDTH);
+} events SEC(".maps");
+
+/*
+ * cgroup instrumentation
+ */
+
+// dummy instance for skeleton to generate definition
+struct cgroup_info _cgroup_info = {};
+
+// ringbuf to pass cgroup info
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(key_size, 0);
+    __uint(value_size, 0);
+    __uint(max_entries, RINGBUF_CAPACITY);
+} cgroup_info SEC(".maps");
+
+// holds known cgroup serial numbers to help determine new or changed groups
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, MAX_CGROUPS);
+} cgroup_serial_numbers SEC(".maps");
+
+// counters for various events
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, MAX_CGROUPS * CGROUP_SHARDS);
+} cgroup_task_switch SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, MAX_CGROUPS * CGROUP_SHARDS);
+} cgroup_remote_shootdown SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, MAX_CGROUPS * CGROUP_SHARDS);
+} cgroup_local_shootdown SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, MAX_CGROUPS * CGROUP_SHARDS);
+} cgroup_local_mm_shootdown SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, MAX_CGROUPS * CGROUP_SHARDS);
+} cgroup_remote_send_ipi SEC(".maps");
+
+// `btf` is a compile-time constant: true in the tp_btf program, which can read
+// the current task through a BTF pointer (see current_task_group() in
+// cgroup.h).
+static __always_inline int account_tlb_flush(int reason, bool btf) {
+    u32 offset, idx;
+
+    // defensive bounds check: a future kernel could add reason codes beyond
+    // the slots in this CPU's counter bank
+    if (reason < 0 || reason >= COUNTER_GROUP_WIDTH) {
+        return 0;
+    }
+
+    offset = COUNTER_GROUP_WIDTH * bpf_get_smp_processor_id();
+
+    idx = reason + offset;
+
+    array_incr(&events, idx);
+
+    u32 cgroup_id = 0;
+    u64 serial_nr = 0;
+    struct task_group* tg =
+        cgroup_attribution ? current_task_group(btf, &cgroup_id, &serial_nr) : NULL;
+    if (tg) {
+        if (cgroup_id < MAX_CGROUPS) {
+            int ret = handle_new_cgroup_read(&tg->css, cgroup_id, serial_nr, &cgroup_serial_numbers,
+                                             &cgroup_info);
+
+            if (ret == 0) {
+                // New cgroup detected, zero the counters
+                cgroup_zero(&cgroup_task_switch, cgroup_id);
+                cgroup_zero(&cgroup_remote_shootdown, cgroup_id);
+                cgroup_zero(&cgroup_local_shootdown, cgroup_id);
+                cgroup_zero(&cgroup_local_mm_shootdown, cgroup_id);
+                cgroup_zero(&cgroup_remote_send_ipi, cgroup_id);
+            }
+
+            // update cgroup counter
+
+            switch (reason) {
+            case REASON_TASK_SWITCH:
+                cgroup_incr(&cgroup_task_switch, cgroup_id);
+                break;
+            case REASON_REMOTE_SHOOTDOWN:
+                cgroup_incr(&cgroup_remote_shootdown, cgroup_id);
+                break;
+            case REASON_LOCAL_SHOOTDOWN:
+                cgroup_incr(&cgroup_local_shootdown, cgroup_id);
+                break;
+            case REASON_LOCAL_MM_SHOOTDOWN:
+                cgroup_incr(&cgroup_local_mm_shootdown, cgroup_id);
+                break;
+            case REASON_REMOTE_SEND_IPI:
+                cgroup_incr(&cgroup_remote_send_ipi, cgroup_id);
+                break;
+            }
+        }
+    }
+
+    return 0;
+}
+
+SEC("tp_btf/tlb_flush")
+int BPF_PROG(tlb_flush_btf, int reason, u64 pages) {
+    return account_tlb_flush(reason, true);
+}
+
+SEC("raw_tp/tlb_flush")
+int BPF_PROG(tlb_flush_raw, int reason, u64 pages) {
+    return account_tlb_flush(reason, false);
+}
+
+// ARM64 kprobe version - tlb_finish_mmu is called after TLB batch operations
+// This provides basic TLB flush counting without reason breakdown
+SEC("kprobe/tlb_finish_mmu")
+int BPF_KPROBE(tlb_finish_mmu) {
+    u32 offset, idx;
+
+    offset = COUNTER_GROUP_WIDTH * bpf_get_smp_processor_id();
+    idx = REASON_UNKNOWN + offset;
+
+    array_incr(&events, idx);
+
+    u32 cgroup_id = 0;
+    u64 serial_nr = 0;
+    struct task_group* tg =
+        cgroup_attribution ? current_task_group(false, &cgroup_id, &serial_nr) : NULL;
+    if (tg) {
+        if (cgroup_id < MAX_CGROUPS) {
+            int ret = handle_new_cgroup_read(&tg->css, cgroup_id, serial_nr, &cgroup_serial_numbers,
+                                             &cgroup_info);
+
+            if (ret == 0) {
+                // New cgroup detected, zero the counters
+                cgroup_zero(&cgroup_task_switch, cgroup_id);
+            }
+
+            // On ARM64, count all flushes in the task_switch bucket
+            // (we don't have reason breakdown)
+            cgroup_incr(&cgroup_task_switch, cgroup_id);
+        }
+    }
+
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";

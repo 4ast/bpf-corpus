@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: GPL-2.0
+// Copyright (c) 2021 Wenbo Zhang
+// Copyright (c) 2023 The Rezolus Authors
+
+// NOTICE: this file is based off `tcprtt.bpf.c` from the BCC project
+// <https://github.com/iovisor/bcc/> and has been modified for use within
+// Rezolus.
+
+// This BPF program probes TCP receive path to gather statistics for jitter and
+// srtt.
+
+#include <vmlinux.h>
+#include "../../../agent/bpf/helpers.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_endian.h>
+
+#define HISTOGRAM_BUCKETS HISTOGRAM_BUCKETS_POW_3
+#define HISTOGRAM_POWER 3
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, HISTOGRAM_BUCKETS * HISTOGRAM_SLICES);
+} jitter SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, HISTOGRAM_BUCKETS * HISTOGRAM_SLICES);
+} srtt SEC(".maps");
+
+// fentry/kprobe twins share this handler; only the attach mechanism differs.
+// fentry is the cheaper dispatch (see
+// docs/journal/2026-09-04-fentry-vs-kprobe-dispatch.md) but needs BTF, so the
+// kprobe twin is the fallback and one is disabled at load time on
+// kernel_can_fentry() (see disabled_programs in mod.rs).
+static __always_inline int handle_tcp_rcv_established(struct sock* sk) {
+    struct tcp_sock* ts;
+    u32 mdev_us, srtt_us;
+    u64 mdev_ns, srtt_ns;
+
+    ts = (struct tcp_sock*)(sk);
+    srtt_us = BPF_CORE_READ(ts, srtt_us);
+    mdev_us = BPF_CORE_READ(ts, mdev_us);
+
+    // NOTE: srtt is stored as 8x the value in microseconds but we want to
+    // record nanoseconds.
+    srtt_ns = 1000 * (u64)srtt_us >> 3;
+
+    histogram_incr(&srtt, HISTOGRAM_POWER, srtt_ns);
+
+    // NOTE: mdev is stored as 4x the value in microseconds but we want to
+    // record nanoseconds.
+    mdev_ns = 1000 * (u64)mdev_us >> 2;
+
+    histogram_incr(&jitter, HISTOGRAM_POWER, mdev_ns);
+
+    return 0;
+}
+
+SEC("fentry/tcp_rcv_established")
+int BPF_PROG(tcp_rcv_fentry, struct sock* sk) {
+    return handle_tcp_rcv_established(sk);
+}
+
+SEC("kprobe/tcp_rcv_established")
+int BPF_KPROBE(tcp_rcv_kprobe, struct sock* sk) {
+    return handle_tcp_rcv_established(sk);
+}
+
+char LICENSE[] SEC("license") = "GPL";

@@ -1,0 +1,6 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -D__KERNEL__ -DBPF_DEBUG_TRACE=0 -Icontrib/vmlinux/x86_64
+
+EventProbe: GPL/Events/EventProbe.bpf.c | $F -IGPL/Events -IGPL -I../../include/vmlinux -I../../include
+KprobeConnectHook: GPL/HostIsolation/KprobeConnectHook/KprobeConnectHook.bpf.c | $F -IGPL/HostIsolation/KprobeConnectHook -IGPL/HostIsolation -IGPL -I../../include/vmlinux -I../../include
+EventProbe+dbg: GPL/Events/EventProbe.bpf.c | $F -IGPL/Events -IGPL -I../../include/vmlinux -I../../include -UBPF_DEBUG_TRACE -DBPF_DEBUG_TRACE=1
+KprobeConnectHook+dbg: GPL/HostIsolation/KprobeConnectHook/KprobeConnectHook.bpf.c | $F -IGPL/HostIsolation/KprobeConnectHook -IGPL/HostIsolation -IGPL -I../../include/vmlinux -I../../include -UBPF_DEBUG_TRACE -DBPF_DEBUG_TRACE=1

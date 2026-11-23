@@ -1,0 +1,155 @@
+#ifndef _HOOKS_SETSOCKOPT_H_
+#define _HOOKS_SETSOCKOPT_H_
+
+#include "constants/syscall_macro.h"
+#include "helpers/span_fill.h"
+#include "helpers/syscalls.h"
+#include "helpers/process.h"
+#include <uapi/linux/filter.h>
+#include "helpers/approvers.h"
+
+static long __attribute__((always_inline)) trace__sys_setsock_opt(void *ctx, u8 async, int socket_fd, int level, int optname) {
+    if (is_discarded_by_pid()) {
+        return 0;
+    }
+
+    struct policy_t policy = fetch_policy(EVENT_SETSOCKOPT);
+    struct syscall_cache_t syscall = {
+        .type = EVENT_SETSOCKOPT,
+        .policy = policy,
+        .async = async,
+        .setsockopt = {
+            .level = level,
+            .optname = optname,
+        }
+    };
+
+    cache_syscall_update_cgroup(ctx, &syscall);
+    return 0;
+}
+
+static int __attribute__((always_inline)) sys_set_sock_opt_ret_impl(void *ctx, int retval, enum TAIL_CALL_PROG_TYPE prog_type) {
+    struct syscall_cache_t *syscall = peek_syscall(EVENT_SETSOCKOPT);
+    if (!syscall) {
+        return 0;
+    }
+    if (approve_syscall(syscall, setsockopt_approvers) == DISCARDED) {
+        goto pop_and_exit;
+    }
+    int key = 0;
+    struct setsockopt_event_t *event = bpf_map_lookup_elem(&setsockopt_event,&key);
+
+    if (!event) {
+        goto pop_and_exit;
+    }
+    event->syscall.retval = retval;
+    event->event.flags = syscall->async ? EVENT_FLAGS_ASYNC : 0;
+    event->socket_type = syscall->setsockopt.socket_type;
+    event->socket_protocol = syscall->setsockopt.socket_protocol;
+    event->socket_family = syscall->setsockopt.socket_family;
+    event->level = syscall->setsockopt.level;
+    event->optname = syscall->setsockopt.optname;
+    event->filter_len = syscall->setsockopt.filter_len;
+    event->truncated = syscall->setsockopt.truncated;
+    struct proc_cache_t *entry = fill_process_context(&event->process);
+    fill_cgroup_context(entry, &event->cgroup);
+    // Pass the bounds-checked local to bpf_probe_read and keep it dead after the
+    // call: otherwise clang reloads it or copies it before the check, and older
+    // verifiers (e.g. 4.14) then see a size that may be 0.
+    event->sent_size = 0;
+    u32 filter_size = syscall->setsockopt.filter_size_to_send;
+    if (filter_size >= MAX_BPF_FILTER_SIZE) {
+        if (bpf_probe_read(&event->bpf_filters_buffer, MAX_BPF_FILTER_SIZE, syscall->setsockopt.filter) == 0) {
+            event->sent_size = MAX_BPF_FILTER_SIZE;
+        }
+    }
+    else if (filter_size >= sizeof(struct sock_filter)) {
+        event->sent_size = filter_size;
+        if (bpf_probe_read(&event->bpf_filters_buffer, filter_size, syscall->setsockopt.filter) < 0) {
+            event->sent_size = 0;
+        }
+    }
+    pop_syscall(EVENT_SETSOCKOPT);
+
+    // The span context is attached and the event emitted (with its partial
+    // header+filter size, read back from event->sent_size) by the setsockopt
+    // span-fill program matching this caller's program type.
+    span_fill_tail_call_key(ctx, prog_type, SPAN_FILL_KEY_SETSOCKOPT);
+
+pop_and_exit:
+    pop_syscall(EVENT_SETSOCKOPT);
+    return 0;
+}
+
+static int __attribute__((always_inline)) sys_set_sock_opt_ret(void *ctx, int retval) {
+    return sys_set_sock_opt_ret_impl(ctx, retval, KPROBE_OR_FENTRY_TYPE);
+}
+
+HOOK_SYSCALL_ENTRY3(setsockopt, int, socket, int, level, int, optname) {
+    return trace__sys_setsock_opt(ctx, SYNC_SYSCALL, socket, level, optname);
+}
+
+HOOK_SYSCALL_EXIT(setsockopt) {
+    int retval = SYSCALL_PARMRET(ctx);
+    return sys_set_sock_opt_ret(ctx, retval);
+}
+HOOK_ENTRY("sk_attach_filter")
+static int hook_sk_attach_filter(ctx_t *ctx) {
+    struct syscall_cache_t *syscall = peek_syscall(EVENT_SETSOCKOPT);
+    if (!syscall) {
+        return 0;
+    }
+    if (syscall->setsockopt.optname != SO_ATTACH_FILTER) {
+        return 0;
+    }
+    struct sock_fprog prog;
+    int ret = bpf_probe_read(&prog, sizeof(struct sock_fprog), (struct sock_fprog *)CTX_PARM1(ctx));
+
+    if (ret < 0) {
+        return 0;
+    }
+    syscall->setsockopt.filter_len = (unsigned short) prog.len;
+    // prog.filter points to user memory the kernel has not copied yet: the copy
+    // is deferred to the syscall exit, once the kernel has faulted it in.
+    syscall->setsockopt.filter = prog.filter;
+
+    syscall->setsockopt.filter_size_to_send = (sizeof(struct sock_filter) * prog.len);
+    if (syscall->setsockopt.filter_size_to_send >= MAX_BPF_FILTER_SIZE) {
+        syscall->setsockopt.truncated = 1;
+        syscall->setsockopt.filter_size_to_send = MAX_BPF_FILTER_SIZE;
+    }
+    else if (syscall->setsockopt.filter_size_to_send < sizeof(struct sock_filter)) {
+        syscall->setsockopt.filter_size_to_send = 0;
+    }
+
+    return 0;
+}
+
+HOOK_ENTRY("security_socket_setsockopt")
+static int hook_security_socket_setsockopt(ctx_t *ctx) {
+    struct syscall_cache_t *syscall = peek_syscall(EVENT_SETSOCKOPT);
+
+    if (!syscall) {
+        return 0;
+    }
+    struct socket *sock = (struct socket *)CTX_PARM1(ctx);
+    short socket_type;
+    u64 socket_type_offset;
+    LOAD_CONSTANT("socket_type_offset", socket_type_offset);
+    bpf_probe_read(&socket_type, sizeof(socket_type), (char *)sock + socket_type_offset);
+    if (socket_type) {
+        syscall->setsockopt.socket_type = socket_type;
+    }
+
+    struct sock *sk = get_sock_from_socket(sock);
+    if (sk) {
+        syscall->setsockopt.socket_family = get_family_from_sock_common((struct sock_common *)sk);
+        syscall->setsockopt.socket_protocol = get_protocol_from_sock(sk);
+    }
+    return 0;
+}
+
+TAIL_CALL_TRACEPOINT_FNC(handle_sys_setsockopt_exit, struct tracepoint_raw_syscalls_sys_exit_t *args) {
+    return sys_set_sock_opt_ret_impl(args, args->ret, TRACEPOINT_TYPE);
+}
+#endif

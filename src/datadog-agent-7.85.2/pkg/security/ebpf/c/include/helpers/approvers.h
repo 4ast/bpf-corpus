@@ -1,0 +1,898 @@
+#ifndef _APPROVERS_H
+#define _APPROVERS_H
+
+#include "constants/offsets/filesystem.h"
+#include "constants/enums.h"
+#include "maps.h"
+#include "rate_limiter.h"
+
+// has to be in sync with the userspace definition
+#define PATTERN_PREFIX_SIZE 3
+
+static struct approver_stats_t * __attribute__((always_inline)) get_active_approver_stats(u64 event_type) {
+    struct bpf_map_def *approver_stats = select_buffer(&fb_approver_stats, &bb_approver_stats, APPROVER_MONITOR_KEY);
+    if (approver_stats == NULL) {
+        return NULL;
+    }
+
+    u32 key = event_type;
+    return bpf_map_lookup_elem(approver_stats, &key);
+}
+
+static void __attribute__((always_inline)) monitor_event_approved(u64 event_type, u32 approver_type) {
+    struct approver_stats_t *stats = get_active_approver_stats(event_type);
+    if (stats == NULL) {
+        return;
+    }
+
+    if (approver_type == POLICY_APPROVER_TYPE) {
+        __sync_fetch_and_add(&stats->event_approved_by_policy, 1);
+    } else if (approver_type == BASENAME_APPROVER_TYPE) {
+        __sync_fetch_and_add(&stats->event_approved_by_basename, 1);
+    } else if (approver_type == FLAG_APPROVER_TYPE) {
+        __sync_fetch_and_add(&stats->event_approved_by_flag, 1);
+    } else if (approver_type == AUID_APPROVER_TYPE) {
+        __sync_fetch_and_add(&stats->event_approved_by_auid, 1);
+    } else if (approver_type == IN_UPPER_LAYER_APPROVER_TYPE) {
+        __sync_fetch_and_add(&stats->event_approved_by_in_upper_layer, 1);
+    }
+}
+
+static void __attribute__((always_inline)) monitor_event_rejected(u64 event_type) {
+    struct approver_stats_t *stats = get_active_approver_stats(event_type);
+    if (stats == NULL) {
+        return;
+    }
+    __sync_fetch_and_add(&stats->event_rejected, 1);
+}
+
+static struct event_sample_stats_t * __attribute__((always_inline)) get_active_event_sample_stats(u64 event_type) {
+    struct bpf_map_def *sample_stats = select_buffer(&fb_event_sample_stats, &bb_event_sample_stats, EVENT_SAMPLE_MONITOR_KEY);
+    if (sample_stats == NULL) {
+        return NULL;
+    }
+
+    u32 key = event_type;
+    return bpf_map_lookup_elem(sample_stats, &key);
+}
+
+static void __attribute__((always_inline)) monitor_event_sample_total(u64 event_type) {
+    struct event_sample_stats_t *stats = get_active_event_sample_stats(event_type);
+    if (stats == NULL) {
+        return;
+    }
+    __sync_fetch_and_add(&stats->events_total, 1);
+}
+
+static void __attribute__((always_inline)) monitor_event_sample_sampled(u64 event_type) {
+    struct event_sample_stats_t *stats = get_active_event_sample_stats(event_type);
+    if (stats == NULL) {
+        return;
+    }
+    __sync_fetch_and_add(&stats->events_sampled, 1);
+}
+
+
+static __always_inline u8 sampling_admission_check(u32 limiter_key, u16 rate, u8 threshold) {
+    u64 dynamic_sampling_enabled = 0;
+    LOAD_CONSTANT("dynamic_sampling_enabled", dynamic_sampling_enabled);
+    if (!dynamic_sampling_enabled) {
+        return (rate == 0) || global_limiter_allow(limiter_key, rate, 1);
+    }
+
+#if USE_RING_BUFFER == 1
+    u64 use_ring_buffer;
+    LOAD_CONSTANT("use_ring_buffer", use_ring_buffer);
+    if (use_ring_buffer) {
+        u64 usage = bpf_ringbuf_query(&events, 0);
+        u64 ring_buffer_size = 0;
+        LOAD_CONSTANT("ring_buffer_size", ring_buffer_size);
+
+        if (ring_buffer_size > 0) {
+            u8 pressure_pct = (u8)(usage * 100 / ring_buffer_size);
+
+            // per-cpu map, so a plain store is enough. An atomic cmpxchg here would
+            // emit a BPF_ATOMIC instruction that kernels older than 5.12 reject.
+            struct event_sample_stats_t *stats = get_active_event_sample_stats(0);
+            if (stats != NULL && (u64)pressure_pct > stats->max_pressure) {
+                stats->max_pressure = (u64)pressure_pct;
+            }
+
+            if (pressure_pct > SAMPLING_PRESSURE_CRITICAL) {
+                return 0;
+            }
+            if (pressure_pct < threshold) {
+                return 1;
+            }
+        }
+    }
+#endif
+
+    return (rate == 0) || global_limiter_allow(limiter_key, rate, 1);
+}
+
+// gen_sample_cookie returns a non-zero 64-bit cookie (0 is reserved as "unset").
+static __always_inline u64 gen_sample_cookie(void) {
+    return ((u64)bpf_get_prandom_u32() << 32) | (bpf_get_prandom_u32() | 1);
+}
+
+// sample_entry_is_stale reports whether userspace has aged out the node this entry points
+// at, in which case the tuple must be re-sampled rather than refreshed.
+static __always_inline int sample_entry_is_stale(struct sample_entry_t *entry, u64 now) {
+    u64 sample_entry_ttl_ns = 0;
+    LOAD_CONSTANT("sample_entry_ttl_ns", sample_entry_ttl_ns);
+
+    return sample_entry_ttl_ns > 0 && (now - entry->last_refresh_ns) >= sample_entry_ttl_ns;
+}
+
+// approve_syscall_sample dedups (exec_cookie, syscall_id) tuples via an LRU map:
+// first hit is sampled, later hits only emit a refresh heartbeat.
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_syscall_sample(u64 exec_cookie, u32 syscall_id, u64 *out_cookie, u32 *out_refresh_needed) {
+    // Sampling only feeds v2 profiles.
+    if (!is_security_profile_v2_enabled()) {
+        return DISCARDED;
+    }
+
+    u64 event_sampling_syscalls_enabled = 0;
+    LOAD_CONSTANT("event_sampling_syscalls_enabled", event_sampling_syscalls_enabled);
+    u64 event_sampling_syscalls_rate = 0;
+    LOAD_CONSTANT("event_sampling_syscalls_rate", event_sampling_syscalls_rate);
+    u64 event_sampling_syscalls_threshold = 60;
+    LOAD_CONSTANT("event_sampling_syscalls_threshold", event_sampling_syscalls_threshold);
+    u64 sample_refresh_period_ns = 0;
+    LOAD_CONSTANT("sample_refresh_period_ns", sample_refresh_period_ns);
+
+    if (!event_sampling_syscalls_enabled) {
+        return DISCARDED;
+    }
+
+    // No exec cookie means we cannot correlate the syscall to a workload in userspace.
+    if (exec_cookie == 0) {
+        return DISCARDED;
+    }
+
+    monitor_event_sample_total(EVENT_SYSCALLS);
+
+    struct syscall_sample_key_t key = {
+        .exec_cookie = exec_cookie,
+        .syscall_id = syscall_id,
+    };
+
+    u64 now = bpf_ktime_get_ns();
+
+    struct sample_entry_t *existing = bpf_map_lookup_elem(&syscall_samples, &key);
+    if (existing != NULL) {
+        if (sample_entry_is_stale(existing, now)) {
+            if (!sampling_admission_check(SYSCALLS_SAMPLE_LIMITER, event_sampling_syscalls_rate, (u8)event_sampling_syscalls_threshold)) {
+                return DISCARDED;
+            }
+            existing->cookie = gen_sample_cookie();
+            existing->last_refresh_ns = now;
+            if (out_cookie != NULL) {
+                *out_cookie = existing->cookie;
+            }
+            monitor_event_sample_sampled(EVENT_SYSCALLS);
+            return SAMPLED;
+        }
+        if (sample_refresh_period_ns > 0 && out_cookie != NULL && out_refresh_needed != NULL &&
+            (now - existing->last_refresh_ns) >= sample_refresh_period_ns) {
+            existing->last_refresh_ns = now;
+            *out_cookie = existing->cookie;
+            *out_refresh_needed = 1;
+        }
+        return DISCARDED;
+    }
+
+    if (!sampling_admission_check(SYSCALLS_SAMPLE_LIMITER, event_sampling_syscalls_rate, (u8)event_sampling_syscalls_threshold)) {
+        return DISCARDED;
+    }
+
+    struct sample_entry_t new_entry = {
+        .cookie = gen_sample_cookie(),
+        .last_refresh_ns = now,
+    };
+    if (bpf_map_update_elem(&syscall_samples, &key, &new_entry, BPF_NOEXIST) < 0) {
+        return DISCARDED;
+    }
+
+    if (out_cookie != NULL) {
+        *out_cookie = new_entry.cookie;
+    }
+
+    monitor_event_sample_sampled(EVENT_SYSCALLS);
+    return SAMPLED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_connect_sample(struct bind_connect_sample_key_t *key, struct syscall_cache_t *syscall) {
+    // Sampling only feeds v2 profiles.
+    if (!is_security_profile_v2_enabled()) {
+        return DISCARDED;
+    }
+
+    u64 event_sampling_connect_enabled = 0;
+    LOAD_CONSTANT("event_sampling_connect_enabled", event_sampling_connect_enabled);
+    u64 event_sampling_connect_rate = 0;
+    LOAD_CONSTANT("event_sampling_connect_rate", event_sampling_connect_rate);
+    u64 event_sampling_connect_threshold = 40;
+    LOAD_CONSTANT("event_sampling_connect_threshold", event_sampling_connect_threshold);
+    u64 sample_refresh_period_ns = 0;
+    LOAD_CONSTANT("sample_refresh_period_ns", sample_refresh_period_ns);
+
+    if (!event_sampling_connect_enabled) {
+        return DISCARDED;
+    }
+
+    if (key->family != AF_INET && key->family != AF_INET6) {
+        return DISCARDED;
+    }
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    // ignore kworkers
+    if (IS_KERNEL_THREAD(pid)) {
+        return DISCARDED;
+    }
+
+    monitor_event_sample_total(EVENT_CONNECT);
+
+    u64 now = bpf_ktime_get_ns();
+
+    struct sample_entry_t *existing = bpf_map_lookup_elem(&connect_samples, key);
+    if (existing != NULL) {
+        if (sample_entry_is_stale(existing, now)) {
+            if (!sampling_admission_check(CONNECT_SAMPLE_LIMITER, event_sampling_connect_rate, (u8)event_sampling_connect_threshold)) {
+                return DISCARDED;
+            }
+            existing->cookie = gen_sample_cookie();
+            existing->last_refresh_ns = now;
+            if (syscall != NULL) {
+                syscall->sample_cookie = existing->cookie;
+            }
+            monitor_event_sample_sampled(EVENT_CONNECT);
+            return SAMPLED;
+        }
+        if (sample_refresh_period_ns > 0 && syscall != NULL &&
+            (now - existing->last_refresh_ns) >= sample_refresh_period_ns) {
+            existing->last_refresh_ns = now;
+            syscall->sample_cookie = existing->cookie;
+            syscall->resolver.flags |= SAMPLE_REFRESH_NEEDED;
+        }
+        return DISCARDED;
+    }
+
+    if (!sampling_admission_check(CONNECT_SAMPLE_LIMITER, event_sampling_connect_rate, (u8)event_sampling_connect_threshold)) {
+        return DISCARDED;
+    }
+
+    struct sample_entry_t new_entry = {
+        .cookie = gen_sample_cookie(),
+        .last_refresh_ns = now,
+    };
+    if (bpf_map_update_elem(&connect_samples, key, &new_entry, BPF_NOEXIST) < 0) {
+        return DISCARDED;
+    }
+
+    if (syscall != NULL) {
+        syscall->sample_cookie = new_entry.cookie;
+    }
+
+    monitor_event_sample_sampled(EVENT_CONNECT);
+    return SAMPLED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_by_auid(struct syscall_cache_t *syscall, u64 event_type) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pid_cache_t *pid_entry = (struct pid_cache_t *)bpf_map_lookup_elem(&pid_cache, &pid);
+    if (!pid_entry || !pid_entry->credentials.is_auid_set) {
+        return DISCARDED;
+    }
+
+    u32 auid = pid_entry->credentials.auid;
+
+    struct event_mask_filter_t *mask_filter = bpf_map_lookup_elem(&auid_approvers, &auid);
+    if (mask_filter && mask_filter->event_mask & (1 << (event_type - 1))) {
+        monitor_event_approved(syscall->type, AUID_APPROVER_TYPE);
+        return ACCEPTED;
+    }
+
+    struct u32_range_filter_t *range_filter = bpf_map_lookup_elem(&auid_range_approvers, &event_type);
+    if (range_filter && auid >= range_filter->min && auid <= range_filter->max) {
+        monitor_event_approved(syscall->type, AUID_APPROVER_TYPE);
+        return ACCEPTED;
+    }
+
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) flag_approver (struct u64_flags_filter_t *filter, u32 type, u64 value) {
+    if (filter == NULL || !filter->is_set) {
+        return DISCARDED;
+    }
+    if (((1 << (value % 64)) & filter->flags) > 0) {
+        monitor_event_approved(type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static int __attribute__((always_inline)) is_basename_in_map(struct basename_t *basename, u64 event_type) {
+    struct event_mask_filter_t *filter = bpf_map_lookup_elem(&basename_approvers, basename);
+    return filter && filter->event_mask & (1 << (event_type - 1));
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_by_basename(struct dentry *dentry, u64 event_type) {
+    struct basename_t basename = {
+        .type = LEAF_BASENAME,
+    };
+    get_dentry_name(dentry, basename.value, sizeof(basename.value));
+
+    if (is_basename_in_map(&basename, event_type)) {
+        monitor_event_approved(event_type, BASENAME_APPROVER_TYPE);
+        return APPROVED;
+    }
+
+    // prefix fallback: build a key from the first PATTERN_PREFIX_SIZE bytes of
+    // the event basename with type=LEAF_BASENAME_PREFIX. Userspace inserts the
+    // same shape for any rule whose basename contains '*' (e.g. rule
+    // "abc*xyz" -> key {LEAF_BASENAME_PREFIX, "abc"}), so this matches every
+    // event whose basename shares that prefix — broader than the rule. The
+    // userspace re-evaluation rejects the false positives; distinct rules
+    // sharing an N-byte prefix collide on a single map entry.
+    struct basename_t prefix = {
+        .type = LEAF_BASENAME_PREFIX,
+    };
+    #ifndef USE_FENTRY
+    #pragma unroll
+    #endif
+    for (int i = 0; i != PATTERN_PREFIX_SIZE; i++) {
+        prefix.value[i] = basename.value[i];
+    }
+
+    if (is_basename_in_map(&prefix, event_type)) {
+        monitor_event_approved(event_type, BASENAME_APPROVER_TYPE);
+        return APPROVED;
+    }
+
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_by_in_upper_layer(u64 event_type, struct file_t *file) {
+    u32 key = 0;
+    struct event_mask_filter_t *filter = bpf_map_lookup_elem(&in_upper_layer_approvers, &key);
+    if (filter && filter->event_mask & (1 << (event_type - 1)) && (file->flags & UPPER_LAYER) > 0) {
+        monitor_event_approved(event_type, IN_UPPER_LAYER_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) chmod_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->setattr.dentry, EVENT_CHMOD);
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_CHMOD);
+    }
+
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) chown_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->setattr.dentry, EVENT_CHOWN);
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_CHOWN);
+    }
+
+    return state;
+}
+
+static int __attribute__((always_inline)) lookup_u32_flags(void *map, u32 *flags) {
+    u32 key = 0;
+    struct u32_flags_filter_t *filter = bpf_map_lookup_elem(map, &key);
+    if (filter == NULL || !filter->is_set) {
+        return 0;
+    }
+    *flags = filter->flags;
+
+    return 1;
+}
+
+static int __attribute__((always_inline)) approve_mmap_by_flags(struct syscall_cache_t *syscall) {
+    u32 flags = 0;
+
+    int exists = lookup_u32_flags(&mmap_flags_approvers, &flags);
+    if (!exists) {
+        return DISCARDED;
+    }
+
+    if ((syscall->mmap.flags & flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_mmap_by_protection_flags(struct syscall_cache_t *syscall) {
+    u32 flags = 0;
+
+    int exists = lookup_u32_flags(&mmap_protection_approvers, &flags);
+    if (!exists) {
+        return DISCARDED;
+    }
+
+    if ((flags == 0 && syscall->mmap.protection == 0) || (syscall->mmap.protection & flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) mmap_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = DISCARDED;
+
+    if (syscall->mmap.dentry != NULL) {
+        state = approve_by_basename(syscall->mmap.dentry, EVENT_MMAP);
+    }
+
+    if (state == DISCARDED) {
+        state = approve_mmap_by_protection_flags(syscall);
+    }
+    if (state == DISCARDED) {
+        state = approve_mmap_by_flags(syscall);
+    }
+
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) link_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->link.src_dentry, EVENT_LINK);
+    if (state == DISCARDED) {
+        state = approve_by_basename(syscall->link.target_dentry, EVENT_LINK);
+    }
+
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) mkdir_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->mkdir.dentry, EVENT_MKDIR);
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_MKDIR);
+    }
+
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) chdir_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->chdir.dentry, EVENT_CHDIR);
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_CHDIR);
+    }
+
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_mprotect_by_vm_protection(struct syscall_cache_t *syscall) {
+    u32 flags = 0;
+
+    int exists = lookup_u32_flags(&mprotect_vm_protection_approvers, &flags);
+    if (!exists) {
+        return DISCARDED;
+    }
+
+    if ((syscall->mprotect.vm_protection & flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_mprotect_by_req_protection(struct syscall_cache_t *syscall) {
+    u32 flags = 0;
+
+    int exists = lookup_u32_flags(&mprotect_req_protection_approvers, &flags);
+    if (!exists) {
+        return DISCARDED;
+    }
+
+    if ((syscall->mprotect.req_protection & flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) mprotect_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_mprotect_by_vm_protection(syscall);
+    if (state == DISCARDED) {
+        state = approve_mprotect_by_req_protection(syscall);
+    }
+
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_open_by_flags(struct syscall_cache_t *syscall) {
+    u32 key = 0;
+    u8 *rdonly_approver = bpf_map_lookup_elem(&open_flags_rdonly_approver, &key);
+    if (rdonly_approver && *rdonly_approver && ((syscall->open.flags & O_ACCMODE) == O_RDONLY)) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+
+    u32 flags = 0;
+    int exists = lookup_u32_flags(&open_flags_approvers, &flags);
+    if (!exists) {
+        return DISCARDED;
+    }
+
+    if ((syscall->open.flags & flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+
+#if defined(DEBUG_APPROVERS)
+        bpf_printk("open flags %d approved", syscall->open.flags);
+#endif
+
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_open_sample(struct dentry *dentry, struct file_t *file, struct syscall_cache_t *syscall) {
+    // Sampling only feeds v2 profiles.
+    if (!is_security_profile_v2_enabled()) {
+        return DISCARDED;
+    }
+
+    u64 event_sampling_open_enabled = 0;
+    LOAD_CONSTANT("event_sampling_open_enabled", event_sampling_open_enabled);
+
+    u64 event_sampling_open_rate = 0;
+    LOAD_CONSTANT("event_sampling_open_rate", event_sampling_open_rate);
+    u64 event_sampling_open_threshold = 80;
+    LOAD_CONSTANT("event_sampling_open_threshold", event_sampling_open_threshold);
+
+    u64 sample_refresh_period_ns = 0;
+    LOAD_CONSTANT("sample_refresh_period_ns", sample_refresh_period_ns);
+
+    if (!event_sampling_open_enabled) {
+        return DISCARDED;
+    }
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    // ignore kworkers
+    if (IS_KERNEL_THREAD(pid)) {
+        return DISCARDED;
+    }
+
+    // Track total open events that hit the sampling logic
+    monitor_event_sample_total(EVENT_OPEN);
+
+    // Discard sampled open events from procfs, sysfs, cgroupfs, or devpts
+    if (is_procfs(dentry) || is_sysfs(dentry) || is_cgroupfs(dentry) || is_cgroup2fs(dentry) || is_devpts(dentry)) {
+        return DISCARDED;
+    }
+
+    struct path_key_t *process_path_key = bpf_map_lookup_elem(&pid_path_keys, &pid);
+    if (process_path_key == NULL) {
+        return DISCARDED;
+    }
+
+    u32 ppid = get_current_ppid();
+
+    struct process_path_key_t key = {
+        .ppid = ppid,
+        .process_path_key = *process_path_key,
+        .file_path_key = file->path_key,
+    };
+
+    u64 now = bpf_ktime_get_ns();
+
+    struct sample_entry_t *existing = bpf_map_lookup_elem(&open_samples, &key);
+    if (existing != NULL) {
+        if (sample_entry_is_stale(existing, now)) {
+            if (!sampling_admission_check(OPEN_SAMPLE_LIMITER, event_sampling_open_rate, (u8)event_sampling_open_threshold)) {
+                return DISCARDED;
+            }
+            existing->cookie = gen_sample_cookie();
+            existing->last_refresh_ns = now;
+            if (syscall != NULL) {
+                syscall->sample_cookie = existing->cookie;
+            }
+            monitor_event_sample_sampled(EVENT_OPEN);
+            return SAMPLED;
+        }
+        if (sample_refresh_period_ns > 0 && syscall != NULL &&
+            (now - existing->last_refresh_ns) >= sample_refresh_period_ns) {
+            existing->last_refresh_ns = now;
+            syscall->sample_cookie = existing->cookie;
+            syscall->resolver.flags |= SAMPLE_REFRESH_NEEDED;
+        }
+        return DISCARDED;
+    }
+
+    if (!sampling_admission_check(OPEN_SAMPLE_LIMITER, event_sampling_open_rate, (u8)event_sampling_open_threshold)) {
+        return DISCARDED;
+    }
+
+    struct sample_entry_t new_entry = {
+        .cookie = gen_sample_cookie(),
+        .last_refresh_ns = now,
+    };
+    if (bpf_map_update_elem(&open_samples, &key, &new_entry, BPF_NOEXIST) < 0) {
+        return DISCARDED;
+    }
+
+    if (syscall != NULL) {
+        syscall->sample_cookie = new_entry.cookie;
+    }
+
+    monitor_event_sample_sampled(EVENT_OPEN);
+
+    return SAMPLED;
+}
+
+
+static enum SYSCALL_STATE __attribute__((always_inline)) open_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->open.dentry, EVENT_OPEN);
+    if (state == DISCARDED) {
+        state = approve_open_by_flags(syscall);
+    }
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_OPEN);
+    }
+    if (state == DISCARDED) {
+        state = approve_by_in_upper_layer(EVENT_OPEN, &syscall->open.file);
+    }
+
+    if (state == DISCARDED && approve_open_sample(syscall->open.dentry, &syscall->open.file, syscall) == SAMPLED) {
+        return SAMPLED;
+    }
+
+    return state;
+}
+
+enum SYSCALL_STATE __attribute__((always_inline)) rename_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->rename.src_dentry, EVENT_RENAME);
+    if (state == DISCARDED) {
+        state = approve_by_basename(syscall->rename.target_dentry, EVENT_RENAME);
+    }
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_RENAME);
+    }
+
+    return state;
+}
+
+enum SYSCALL_STATE __attribute__((always_inline)) rmdir_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->rmdir.dentry, EVENT_RMDIR);
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_RMDIR);
+    }
+    return state;
+}
+
+enum SYSCALL_STATE __attribute__((always_inline)) approve_splice_by_entry_flags(struct syscall_cache_t *syscall) {
+    u32 flags = 0;
+
+    int exists = lookup_u32_flags(&splice_entry_flags_approvers, &flags);
+    if (!exists) {
+        return DISCARDED;
+    }
+
+    if ((syscall->splice.pipe_entry_flag & flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+enum SYSCALL_STATE __attribute__((always_inline)) approve_splice_by_exit_flags(struct syscall_cache_t *syscall) {
+    u32 flags = 0;
+
+    int exists = lookup_u32_flags(&splice_exit_flags_approvers, &flags);
+    if (!exists) {
+        return DISCARDED;
+    }
+
+    if ((syscall->splice.pipe_exit_flag & flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) splice_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = DISCARDED;
+
+    if (syscall->splice.dentry != NULL) {
+        state = approve_by_basename(syscall->splice.dentry, EVENT_SPLICE);
+    }
+
+    if (state == DISCARDED) {
+        state = approve_splice_by_exit_flags(syscall);
+    }
+    if (state == DISCARDED) {
+        state = approve_splice_by_entry_flags(syscall);
+    }
+
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) unlink_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->unlink.dentry, EVENT_UNLINK);
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_UNLINK);
+    }
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) utime_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_basename(syscall->setattr.dentry, EVENT_UTIME);
+    if (state == DISCARDED) {
+        state = approve_by_auid(syscall, EVENT_UTIME);
+    }
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) bpf_approvers(struct syscall_cache_t *syscall) {
+    u32 key = 0;
+    struct u64_flags_filter_t *filter = bpf_map_lookup_elem(&bpf_cmd_approvers, &key);
+    u64 cmd = syscall->bpf.cmd;
+    return flag_approver(filter, syscall->type, cmd);
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) sysctl_approvers(struct syscall_cache_t *syscall) {
+    u32 key = 0;
+    struct u32_flags_filter_t *filter = bpf_map_lookup_elem(&sysctl_action_approvers, &key);
+    if (filter == NULL || !filter->is_set) {
+        return DISCARDED;
+    }
+
+    if ((syscall->sysctl.action & filter->flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) connect_approvers(struct syscall_cache_t *syscall) {
+    u32 key = 0;
+    struct u64_flags_filter_t *filter = bpf_map_lookup_elem(&connect_addr_family_approvers, &key);
+    u64 family = syscall->connect.family;
+    enum SYSCALL_STATE state = flag_approver(filter, syscall->type, family);
+
+    if (state == DISCARDED) {
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        struct bind_connect_sample_key_t conn_key;
+        __builtin_memset(&conn_key, 0, sizeof(conn_key));
+        conn_key.pid = pid;
+        conn_key.family = syscall->connect.family;
+        conn_key.port = syscall->connect.port;
+        conn_key.protocol = syscall->connect.protocol;
+        conn_key.addr[0] = syscall->connect.addr[0];
+        conn_key.addr[1] = syscall->connect.addr[1];
+
+        if (approve_connect_sample(&conn_key, syscall) == SAMPLED) {
+            return SAMPLED;
+        }
+    }
+
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) prctl_approvers(struct syscall_cache_t *syscall) {
+    u32 key = 0;
+    struct u64_flags_filter_t *filter = bpf_map_lookup_elem(&prctl_option_approvers, &key);
+    u64 option = syscall->prctl.option;
+    return flag_approver(filter, syscall->type, option);
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_by_optname(struct syscall_cache_t *syscall) {
+    u32 key = 1;
+    struct u64_flags_filter_t *filter = bpf_map_lookup_elem(&setsockopt_level_or_optname_approvers, &key);
+    u64 optname = syscall->setsockopt.optname;
+    return flag_approver(filter, syscall->type, optname);
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_by_sock_level(struct syscall_cache_t *syscall) {
+    u32 key = 0;
+    struct u64_flags_filter_t *filter = bpf_map_lookup_elem(&setsockopt_level_or_optname_approvers, &key);
+    u64 level = syscall->setsockopt.level;
+    return flag_approver(filter, syscall->type, level);
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) setsockopt_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_by_sock_level(syscall);
+    if (state == DISCARDED) {
+        state = approve_by_optname(syscall);
+    }
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_socket_by_domain(struct syscall_cache_t *syscall) {
+    u32 key = SOCKET_DOMAIN_APPROVER_KEY;
+    struct u64_flags_filter_t *filter = bpf_map_lookup_elem(&socket_field_approvers, &key);
+    return flag_approver(filter, syscall->type, (u64)syscall->socket.domain);
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_socket_by_type(struct syscall_cache_t *syscall) {
+    u32 key = SOCKET_TYPE_APPROVER_KEY;
+    struct u64_flags_filter_t *filter = bpf_map_lookup_elem(&socket_field_approvers, &key);
+    return flag_approver(filter, syscall->type, (u64)syscall->socket.type);
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_socket_by_protocol(struct syscall_cache_t *syscall) {
+    u32 key = SOCKET_PROTOCOL_APPROVER_KEY;
+    struct u64_flags_filter_t *filter = bpf_map_lookup_elem(&socket_field_approvers, &key);
+    return flag_approver(filter, syscall->type, (u64)syscall->socket.protocol);
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) socket_approvers(struct syscall_cache_t *syscall) {
+    enum SYSCALL_STATE state = approve_socket_by_type(syscall);
+    if (state == DISCARDED) {
+        state = approve_socket_by_domain(syscall);
+    }
+    if (state == DISCARDED) {
+        state = approve_socket_by_protocol(syscall);
+    }
+    return state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) unshare_approvers(struct syscall_cache_t *syscall) {
+    u32 flags = 0;
+
+    int exists = lookup_u32_flags(&unshare_flags_approvers, &flags);
+    if (!exists) {
+        return DISCARDED;
+    }
+
+    if ((flags == 0 && syscall->mount.unshare_flags == 0) || (syscall->mount.unshare_flags & flags) > 0) {
+        monitor_event_approved(syscall->type, FLAG_APPROVER_TYPE);
+        return APPROVED;
+    }
+    return DISCARDED;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_syscall_with_tgid(u32 tgid, struct syscall_cache_t *syscall, enum SYSCALL_STATE (*check_approvers)(struct syscall_cache_t *syscall)) {
+    if (syscall->policy.mode != DENY) {
+        monitor_event_approved(syscall->type, POLICY_APPROVER_TYPE);
+        return syscall->state = APPROVED;
+    }
+
+    syscall->state = check_approvers(syscall);
+    if (syscall->state == DISCARDED) {
+        monitor_event_rejected(syscall->type);
+    }
+
+    u64 *cookie = bpf_map_lookup_elem(&traced_pids, &tgid);
+    if (cookie != NULL) {
+        u64 now = bpf_ktime_get_ns();
+        struct activity_dump_config *config = lookup_or_delete_traced_pid(tgid, now, cookie);
+        if (config != NULL) {
+            // is this event type traced ?
+            if (mask_has_event(config->event_mask, syscall->type) && activity_dump_rate_limiter_allow(config->events_rate, *cookie, now, 0)) {
+                if (syscall->state == DISCARDED) {
+                    syscall->resolver.flags |= RESOLVER_FLAG_SAVED_BY_ACTIVITY_DUMP;
+                }
+
+                // force to be accepted as this event will be part of a dump
+                syscall->state = ACCEPTED;
+            }
+        }
+    }
+
+    if (syscall->state == SAMPLED) {
+        syscall->resolver.flags |= RESOLVER_FLAG_SAVED_BY_ACTIVITY_DUMP;
+
+        // force to be accepted as this event will be part of a dump
+        syscall->state = ACCEPTED;
+    }
+
+    return syscall->state;
+}
+
+static enum SYSCALL_STATE __attribute__((always_inline)) approve_syscall(struct syscall_cache_t *syscall, enum SYSCALL_STATE (*check_approvers)(struct syscall_cache_t *syscall)) {
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    return approve_syscall_with_tgid(tgid, syscall, check_approvers);
+}
+
+#endif

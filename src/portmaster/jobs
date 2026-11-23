@@ -1,0 +1,5 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Iservice/firewall/interception/ebpf/programs -Iservice/firewall/interception/ebpf -Iservice/firewall/interception -Iservice/firewall -Iservice -I. -I../../include/vmlinux -I../../include
+
+bandwidth: service/firewall/interception/ebpf/programs/bandwidth.c | $F
+exec: service/firewall/interception/ebpf/programs/exec.c | $F
+monitor: service/firewall/interception/ebpf/programs/monitor.c | $F

@@ -1,0 +1,6 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+features: lightswitch-capabilities/src/bpf/features.bpf.c | $F -Ilightswitch-capabilities/src/bpf -Ilightswitch-capabilities/src -Ilightswitch-capabilities -I. -Isrc/bpf -I../../include
+noprealloc_test: lightswitch-capabilities/src/bpf/noprealloc_test.bpf.c | $F -Ilightswitch-capabilities/src/bpf -Ilightswitch-capabilities/src -Ilightswitch-capabilities -I. -Isrc/bpf -I../../include
+profiler: src/bpf/profiler.bpf.c | $F -Isrc/bpf -Isrc -I. -I../../include
+tracers: src/bpf/tracers.bpf.c | $F -Isrc/bpf -Isrc -I. -I../../include

@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
+/* Copyright 2024 Leon Hwang */
+#include "vmlinux.h"
+#include "bpf_helpers.h"
+#include "bpf_tracing.h"
+#include "bpf_map_helpers.h"
+
+#include "bpfsnoop.h"
+#include "bpfsnoop_arg_filter.h"
+#include "bpfsnoop_arg_output.h"
+#include "bpfsnoop_cfg.h"
+#include "bpfsnoop_comm_filter.h"
+#include "bpfsnoop_event.h"
+#include "bpfsnoop_event_output.h"
+#include "bpfsnoop_fgraph_active.h"
+#include "bpfsnoop_fn_args_output.h"
+#include "bpfsnoop_lbr.h"
+#include "bpfsnoop_mode.h"
+#include "bpfsnoop_pkt_filter.h"
+#include "bpfsnoop_pkt_output.h"
+#include "bpfsnoop_sess.h"
+#include "bpfsnoop_session.h"
+#include "bpfsnoop_stack.h"
+#include "bpfsnoop_tracing.h"
+
+volatile const __u32 PID = -1;
+volatile const __u32 CPU_MASK = 0xFFFF;
+volatile const __u64 FUNC_IP = 0;
+
+__u32 ready SEC(".data.ready") = 0;
+
+static __always_inline bool
+filter(__u64 *args, __u64 session_id)
+{
+    return filter_arg(args) && filter_pkt(args, session_id);
+}
+
+static __always_inline __u64
+get_tracee_caller_fp(void *ctx, bool retval)
+{
+    u64 fp, fp_caller;
+
+    if (cfg->flags.is_tp)
+        return FUNC_IP;
+
+    fp = get_tramp_fp(ctx, get_tramp_args_nr(ctx), retval); /* read tramp fp */
+    (void) bpf_probe_read_kernel(&fp_caller, sizeof(fp_caller), (void *) fp); /* fp of tracee caller */
+    return fp_caller;
+}
+
+static __always_inline __u64
+gen_session_id(__u64 fp)
+{
+    __u32 rnd = bpf_get_prandom_u32();
+
+    return ((__u64) rnd) << 32 | (fp & 0xFFFFFFFF);
+}
+
+static __always_inline int
+emit_bpfsnoop_event(void *ctx)
+{
+    struct bpfsnoop_lbr_data *lbr;
+    __u64 args[MAX_FN_ARGS + 1];
+    __u64 fp, session_id = 0;
+    enum bpfsnoop_mode mode;
+    bool filter_pass = true;
+    __u64 pid_tgid, func_ip;
+    bool can_output_lbr;
+    __u64 retval = 0;
+    __u16 event_type;
+    bool output_pkt;
+    __u32 cpu, pid;
+    __u8 comm[16];
+
+    if (!ready)
+        return BPF_OK;
+
+    cpu = bpf_get_smp_processor_id() & CPU_MASK;
+    lbr = &bpfsnoop_lbr_buff[has_percpu_data ? 0 : cpu];
+
+    mode = get_bpfsnoop_mode(ctx);
+
+    can_output_lbr = !cfg->flags.both_entry_exit || (mode == BPFSNOOP_MODE_SESSION_ENTRY);
+    can_output_lbr &= cfg->flags.output_lbr;
+    if (can_output_lbr)
+        lbr->nr_bytes = bpf_get_branch_snapshot(lbr->entries, sizeof(lbr->entries), 0); /* required 5.16 kernel. */
+    else
+        lbr->nr_bytes = 0;
+
+    /* Other filters must be after bpf_get_branch_snapshot() to avoid polluting
+     * LBR entries.
+     */
+    func_ip = FUNC_IP;
+    pid_tgid = bpf_get_current_pid_tgid();
+    pid = pid_tgid >> 32;
+    if (pid == PID)
+        return BPF_OK;
+    if (cfg->pid && pid != cfg->pid)
+        return BPF_OK;
+
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (!filter_comm(comm))
+        return BPF_OK;
+
+    (void) bpf_probe_read_kernel(args, 8*cfg->fn_args.args_nr, ctx);
+    if (cfg->fn_args.with_retval && (mode == BPFSNOOP_MODE_EXIT ||
+                                     mode == BPFSNOOP_MODE_SESSION_EXIT))
+        (void) bpf_probe_read_kernel(&retval, sizeof(retval), ctx + 8*get_tramp_args_nr(ctx));
+    args[cfg->fn_args.args_nr] = retval;
+
+    /* fp of tracee caller */
+    fp = get_tracee_caller_fp(ctx, cfg->flags.both_entry_exit || cfg->fn_args.with_retval);
+
+    switch (mode) {
+    case BPFSNOOP_MODE_SESSION_ENTRY:
+        session_id = gen_session_id(fp);
+        filter_pass = cfg->flags.deferred_filter ? true : filter(args, session_id);
+        if (!bpfsnoop_session_enter(ctx, pid_tgid, func_ip, session_id, filter_pass,
+                                    &session_id, cfg->flags.is_session,
+                                    cfg->flags.graph_mode || cfg->flags.insn_mode))
+            return BPF_OK;
+
+        event_type = BPFSNOOP_EVENT_TYPE_FUNC_ENTRY;
+        break;
+
+    case BPFSNOOP_MODE_SESSION_EXIT:
+        if (!bpfsnoop_session_exit(ctx, pid_tgid, func_ip, &session_id, cfg->flags.is_session,
+                                   cfg->flags.graph_mode || cfg->flags.insn_mode))
+            return BPF_OK;
+        if (cfg->flags.deferred_filter)
+            filter_pass = filter(args, session_id);
+
+        event_type = BPFSNOOP_EVENT_TYPE_FUNC_EXIT;
+        break;
+
+    case BPFSNOOP_MODE_ENTRY:
+    case BPFSNOOP_MODE_EXIT:
+        session_id = gen_session_id(fp);
+        filter_pass = filter(args, session_id);
+        if (!filter_pass)
+            return BPF_OK;
+
+        event_type = (mode == BPFSNOOP_MODE_ENTRY) ? BPFSNOOP_EVENT_TYPE_FUNC_ENTRY
+                                                   : BPFSNOOP_EVENT_TYPE_FUNC_EXIT;
+        break;
+    }
+
+    if (cfg->flags.graph_mode) {
+        struct task_struct *tsk = (typeof(tsk))bpf_get_current_task();
+
+        if (event_type == BPFSNOOP_EVENT_TYPE_FUNC_ENTRY)
+            mark_fgraph_active(tsk);
+        else
+            unset_fgraph_active(tsk);
+    }
+
+    output_pkt = cfg->flags.output_pkt;
+    output_pkt = output_pkt && (event_type == BPFSNOOP_EVENT_TYPE_FUNC_EXIT || !cfg->flags.pkt_retval);
+    return output_event(ctx, event_type, session_id, func_ip, cpu, pid, comm,
+                        lbr, can_output_lbr, args, retval, output_pkt,
+                        cfg->flags.output_arg, filter_pass);
+}
+
+SEC("fexit")
+int BPF_PROG(bpfsnoop_fn)
+{
+    return emit_bpfsnoop_event(ctx);
+}
+
+char __license[] SEC("license") = "GPL";

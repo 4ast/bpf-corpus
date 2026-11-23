@@ -1,0 +1,1 @@
+dnswatch: dnswatch/bpf/dnswatch.bpf.c | -D__TARGET_ARCH_x86 -D__x86_64__ -Idnswatch/bpf -Idnswatch -I. -I../../include/vmlinux -I../../include

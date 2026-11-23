@@ -1,0 +1,50 @@
+F = -fno-builtin -DBPF_NO_KFUNC_PROTOTYPES -D__x86_64__ -D__TARGET_ARCH_x86 -DENABLE_ATOMICS_TESTS -DBPFJ_OSS_BUILD -I../linux/tools/testing/selftests/bpf/libarena/include -I../../include/vmlinux -I../../include -I.
+X0 = core-local:btrfs_* ksym:btrfs_dir_inode_operations=0xffffffffffffe000
+
+bpf_enforce: bpfj/enforce/bpf/bpf_enforce.bpf.c | $F
+enroll: bpfj/enforce/bpf/enroll.bpf.c | $F
+enroll@thread: bpfj/enforce/bpf/enroll.bpf.c | $F | set:@presets/enroll.thread
+enroll@all: bpfj/enforce/bpf/enroll.bpf.c | $F | set:@presets/enroll.all
+jailer: bpfj/enforce/bpf/jailer.bpf.c | $F
+jailer@xattr: bpfj/enforce/bpf/jailer.bpf.c | $F | set:@presets/jailer.xattr
+jailer@base: bpfj/enforce/bpf/jailer.bpf.c | $F | set:@presets/jailer.base
+jailer@xattr-base: bpfj/enforce/bpf/jailer.bpf.c | $F | set:@presets/jailer.xattr+base
+kill_enforce: bpfj/enforce/bpf/kill_enforce.bpf.c | $F
+lkm_enforce: bpfj/enforce/bpf/lkm_enforce.bpf.c | $F
+matcher_state: bpfj/enforce/bpf/matcher_state.bpf.c | $F
+mq_enforce: bpfj/enforce/bpf/mq_enforce.bpf.c | $F
+proc_enforce: bpfj/enforce/bpf/proc_enforce.bpf.c | $F
+ptrace_enforce: bpfj/enforce/bpf/ptrace_enforce.bpf.c | $F
+shm_enforce: bpfj/enforce/bpf/shm_enforce.bpf.c | $F
+verity_enforce: bpfj/enforce/bpf/verity_enforce.bpf.c | $F
+const_map_test: tests/bpf/const_map_test.bpf.c | $F
+const_map_test@seed2: tests/bpf/const_map_test.bpf.c | $F | set:@presets/const_map_test.seed2
+const_map_test@key16: tests/bpf/const_map_test.bpf.c | $F | set:@presets/const_map_test.key16
+const_map_test@max4: tests/bpf/const_map_test.bpf.c | $F | set:@presets/const_map_test.max4
+dyn_lru_test: tests/bpf/dyn_lru_test.bpf.c | $F
+dyn_map_test: tests/bpf/dyn_map_test.bpf.c | $F
+dyn_map_test@lookup-seed2: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.lookup-seed2
+dyn_map_test@lookup-key16: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.lookup-key16
+dyn_map_test@insert: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.insert
+dyn_map_test@insert-seed1: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.insert-seed1
+dyn_map_test@delete: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.delete
+dyn_map_test@destroy: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.destroy
+dyn_map_test@insert-shared: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.insert-shared
+dyn_map_test@delete-unique: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.delete-unique
+dyn_map_test@delete-held: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.delete-held
+dyn_map_test@insert-fixed: tests/bpf/dyn_map_test.bpf.c | $F | set:@presets/dyn_map_test.insert-fixed
+glob_map_test: tests/bpf/glob_map_test.bpf.c | $F
+heap_bpf_test: tests/bpf/heap_bpf_test.bpf.c | $F
+lock_test: tests/bpf/lock_test.bpf.c | $F
+mount_snapshot_test: tests/bpf/mount_snapshot_test.bpf.c | $F
+perf_map_test: tests/bpf/perf_map_test.bpf.c | $F
+perf_map_test@key5: tests/bpf/perf_map_test.bpf.c | $F | set:@presets/perf_map_test.key5
+shared_ptr_test: tests/bpf/shared_ptr_test.bpf.c | $F
+str_map_test: tests/bpf/str_map_test.bpf.c | $F
+str_map_test@size3: tests/bpf/str_map_test.bpf.c | $F | set:@presets/str_map_test.size3
+vec_test: tests/bpf/vec_test.bpf.c | $F
+vec_test@push33: tests/bpf/vec_test.bpf.c | $F | set:@presets/vec_test.push33
+vec_test@push33-assign: tests/bpf/vec_test.bpf.c | $F | set:@presets/vec_test.push33-assign
+vec_test@reserve40: tests/bpf/vec_test.bpf.c | $F | set:@presets/vec_test.reserve40
+vec_test@clear: tests/bpf/vec_test.bpf.c | $F | set:@presets/vec_test.clear
+vec_test@pop: tests/bpf/vec_test.bpf.c | $F | set:@presets/vec_test.pop

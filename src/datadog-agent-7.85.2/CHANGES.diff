@@ -1,0 +1,39 @@
+--- a/pkg/network/ebpf/c/sk/maps.h
++++ b/pkg/network/ebpf/c/sk/maps.h
+@@ -10,7 +10,7 @@
+ BPF_SK_STORAGE_MAP(sk_tcp_stats, sk_tcp_stats_t);
+ BPF_SK_STORAGE_MAP(sk_udp_stats, sk_udp_stats_t);
+ // will always be upgraded to ringbuffer
+-BPF_PERF_EVENT_ARRAY_MAP(conn_close_event, __u32);
++BPF_RINGBUF_MAP(conn_close_event, 1);
+ BPF_HASH_MAP(port_bindings, port_binding_t, __u32, 0)
+ BPF_HASH_MAP(udp_port_bindings, port_binding_t, __u32, 0)
+ 
+--- a/pkg/security/ebpf/c/include/maps.h
++++ b/pkg/security/ebpf/c/include/maps.h
+@@ -109,7 +109,11 @@
+ BPF_LRU_MAP(otel_process_ctx_naming, u64, u8, 512) // in-flight prctl(PR_SET_VMA_ANON_NAME) calls naming a mapping OTEL_CTX, keyed by pid_tgid
+ 
+ BPF_LRU_MAP_FLAGS(tasks_in_coredump, u64, u8, 64, BPF_F_NO_COMMON_LRU)
+-BPF_LRU_MAP_FLAGS(syscalls, u64, struct syscall_cache_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime. Will be changed to BPF_TASK_STORAGE_MAP if USE_SYSCALL_TASK_STORAGE is set to 1 at runtime
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_TASK_STORAGE); __uint(map_flags, 1 /* BPF_F_NO_PREALLOC */); __type(key, int); __type(value, struct syscall_cache_t); } syscalls SEC(".maps");
++#else
++ BPF_LRU_MAP_FLAGS(syscalls, u64, struct syscall_cache_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime. Will be changed to BPF_TASK_STORAGE_MAP if USE_SYSCALL_TASK_STORAGE is set to 1 at runtime
++#endif
+ BPF_LRU_MAP_FLAGS(pathnames, struct path_key_t, struct path_leaf_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime
+ BPF_LRU_MAP_FLAGS(capabilities_contexts, u32, struct capabilities_context_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime
+ BPF_LRU_MAP_FLAGS(open_samples, struct process_path_key_t, struct sample_entry_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime
+@@ -174,7 +178,11 @@
+ BPF_PROG_ARRAY(span_fill_progs, 3)
+ BPF_PROG_ARRAY(span_fill_tp_progs, 2)
+ 
+-BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 33554432); } events SEC(".maps");
++#else
++ BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#endif
+ BPF_PERCPU_ARRAY_MAP(events_stats, struct perf_map_stats_t, EVENT_MAX)
+ 
+ #if USE_RING_BUFFER == 1

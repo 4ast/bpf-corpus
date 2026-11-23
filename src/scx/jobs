@@ -1,0 +1,65 @@
+# The flags are those of rust/scx_cargo, the sources those of each build.rs.
+F = -D__TARGET_ARCH_x86 -D__SCX_TARGET_ARCH_x86 -Ischeds/vmlinux/arch/x86 -Ischeds/include \
+    -Ischeds/include/bpf-compat -I../../include \
+    clang-1[89]?-mllvm=-disable-ldsx clang-2?-mllvm=-disable-ldsx \
+    clang-2[2-9]?-mllvm=-disable-gotox
+R = scheds/rust
+X = scheds/experimental
+A = rust/scx_arena/scx_arena/bpf
+LA = ../linux/tools/testing/selftests/bpf/libarena
+
+lib_alloc_selftests: lib/selftests/alloc/selftest.bpf.c lib/selftests/alloc/st_asan.bpf.c \
+    lib/selftests/alloc/st_buddy.bpf.c lib/selftests/alloc/st_bump.bpf.c lib/alloc/asan.bpf.c \
+    lib/alloc/buddy.bpf.c lib/alloc/bump.bpf.c lib/alloc/stack.bpf.c lib/common.bpf.c | \
+    -Ischeds/include/lib -Ischeds/include/lib/alloc $F -DENABLE_ATOMICS_TESTS
+scx_arena: rust/scx_arena/scx_arena/src/bpf/main.bpf.c lib/arena.bpf.c lib/common.bpf.c \
+    lib/atq.bpf.c lib/bitmap.bpf.c lib/cpumask.bpf.c lib/minheap.bpf.c lib/rbtree.bpf.c \
+    lib/sdt_alloc.bpf.c lib/sdt_task.bpf.c lib/topology.bpf.c | $F
+scx_arena_libarena_selftests: rust/scx_arena/libarena_selftests/src/bpf/main.bpf.c \
+    $LA/src/common.bpf.c $LA/src/buddy.bpf.c $LA/src/bitmap.bpf.c corpus/rbtree.bpf.c \
+    $A/src/arena.bpf.c $A/src/atq.bpf.c $A/src/cpumask.bpf.c $A/src/dhq.bpf.c $A/src/btree.bpf.c \
+    $A/src/lvqueue.bpf.c $A/src/minheap.bpf.c $A/src/urcu.bpf.c $A/src/sdt_cgroup.bpf.c \
+    $A/src/sdt_task.bpf.c $A/src/topology.bpf.c $A/src/selftests/st_*.bpf.c | -I$LA/include \
+    -I$A/include $F -DENABLE_ATOMICS_TESTS -fno-strict-aliasing
+scx_arena_selftests: rust/scx_arena/selftests/src/bpf/main.bpf.c lib/arena.bpf.c \
+    lib/common.bpf.c lib/atq.bpf.c lib/dhq.bpf.c lib/bitmap.bpf.c lib/btree.bpf.c \
+    lib/lvqueue.bpf.c lib/minheap.bpf.c lib/rbtree.bpf.c lib/sdt_alloc.bpf.c lib/sdt_task.bpf.c \
+    lib/topology.bpf.c lib/selftests/selftest.bpf.c lib/selftests/st_arena_topology_timer.bpf.c \
+    lib/selftests/st_atq.bpf.c lib/selftests/st_dhq.bpf.c lib/selftests/st_bitmap.bpf.c \
+    lib/selftests/st_btree.bpf.c lib/selftests/st_lvqueue.bpf.c lib/selftests/st_minheap.bpf.c \
+    lib/selftests/st_rbtree.bpf.c lib/selftests/st_topology.bpf.c | $F
+scx_beerland: $R/scx_beerland/src/bpf/main.bpf.c | $F
+scx_bpf_compat: rust/scx_bpf_compat/src/bpf/main.bpf.c | $F
+scx_bpfland: $R/scx_bpfland/src/bpf/main.bpf.c | $F
+scx_cake: $R/scx_cake/src/bpf/cake.bpf.c | $F
+scx_chaos: $R/scx_chaos/src/bpf/main.bpf.c lib/arena.bpf.c lib/common.bpf.c lib/atq.bpf.c \
+    lib/bitmap.bpf.c lib/dhq.bpf.c lib/minheap.bpf.c lib/rbtree.bpf.c lib/sdt_alloc.bpf.c \
+    lib/sdt_task.bpf.c lib/topology.bpf.c | $F
+scx_characterize: tools/scx_characterize/src/bpf/hints_tls.bpf.c | $F
+scx_cosmos: $R/scx_cosmos/src/bpf/main.bpf.c lib/pmu.bpf.c | $F
+scx_eevdf: corpus/scx_eevdf.bpf.c lib/edq.bpf.c lib/common.bpf.c lib/ravg.bpf.c \
+    lib/sdt_alloc.bpf.c | $F -I$R/scx_eevdf/src/bpf
+scx_flash: $R/scx_flash/src/bpf/main.bpf.c | $F
+scx_flow: $X/scx_flow/src/bpf/main.bpf.c | $F
+scx_forge: $R/scx_forge/src/bpf/main.bpf.c lib/pmu.bpf.c | $F
+scx_lavd: $R/scx_lavd/src/bpf/main.bpf.c $R/scx_lavd/src/bpf/balance.bpf.c \
+    $R/scx_lavd/src/bpf/idle.bpf.c $R/scx_lavd/src/bpf/introspec.bpf.c \
+    $R/scx_lavd/src/bpf/lat_cri.bpf.c $R/scx_lavd/src/bpf/lock.bpf.c \
+    $R/scx_lavd/src/bpf/power.bpf.c $R/scx_lavd/src/bpf/preempt.bpf.c \
+    $R/scx_lavd/src/bpf/sys_stat.bpf.c $R/scx_lavd/src/bpf/util.bpf.c lib/arena.bpf.c \
+    lib/common.bpf.c lib/atq.bpf.c lib/bitmap.bpf.c lib/cgroup_bw.bpf.c lib/cpumask.bpf.c \
+    lib/rbtree.bpf.c lib/minheap.bpf.c lib/sdt_alloc.bpf.c lib/sdt_task.bpf.c lib/topology.bpf.c \
+    lib/ravg.bpf.c | $F
+scx_layered: $R/scx_layered/src/bpf/main.bpf.c $R/scx_layered/src/bpf/timer.bpf.c \
+    $R/scx_layered/src/bpf/util.bpf.c lib/pmu.bpf.c | $F
+scx_mitosis: $R/scx_mitosis/src/bpf/mitosis.bpf.c | $F
+scx_mlfq: $X/scx_mlfq/src/bpf/main.bpf.c | $F
+scx_p2dq: $R/scx_p2dq/src/bpf/main.bpf.c lib/arena.bpf.c lib/common.bpf.c lib/atq.bpf.c \
+    lib/dhq.bpf.c lib/bitmap.bpf.c lib/cpumask.bpf.c lib/minheap.bpf.c lib/rbtree.bpf.c \
+    lib/sdt_alloc.bpf.c lib/sdt_task.bpf.c lib/topology.bpf.c | $F
+scx_pandemonium: $R/scx_pandemonium/src/bpf/main.bpf.c | $F
+scx_rustland: rust/scx_rustland_core/assets/bpf/main.bpf.c | $F
+scx_rusty: $R/scx_rusty/src/bpf/main.bpf.c $R/scx_rusty/src/bpf/sdt_task.bpf.c \
+    $R/scx_rusty/src/bpf/sdt_alloc.bpf.c | $F
+scx_tickless: $R/scx_tickless/src/bpf/main.bpf.c | $F
+scxtop: tools/scxtop/src/bpf/main.bpf.c | $F | drop:on_gpu_memory_total,on_hw_pressure_update

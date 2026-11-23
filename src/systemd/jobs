@@ -1,0 +1,11 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+F1 = $F -Isrc/bpf -Isrc -I../../include/vmlinux -I../../include
+
+bind-iface: src/bpf/bind-iface.bpf.c | $F1
+monitor-varlink: src/bpf/monitor-varlink.bpf.c | $F1
+restrict-fs: src/bpf/restrict-fs.bpf.c | $F1
+restrict-fsaccess: src/bpf/restrict-fsaccess.bpf.c | $F1
+restrict-ifaces: src/bpf/restrict-ifaces.bpf.c | $F1
+socket-bind: src/bpf/socket-bind.bpf.c | $F1
+sysctl-monitor: src/bpf/sysctl-monitor.bpf.c | $F1
+userns-restrict: src/bpf/userns-restrict.bpf.c | $F -DDYNAMIC_UID_MIN=61184 -DDYNAMIC_UID_MAX=65519 -DCONTAINER_UID_BASE_MIN=524288 -DCONTAINER_UID_BASE_MAX=1878982656 -Isrc/bpf -Isrc -I../../include/vmlinux -I../../include

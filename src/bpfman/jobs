@@ -1,0 +1,14 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+F1 = $F -Itests/integration-test/bpf -Itests/integration-test -Itests -I. -I../../include/vmlinux -I../../include
+
+tc_counter: examples/go-tc-counter/bpf/tc_counter.c | $F -Iexamples/go-tc-counter/bpf -Iexamples/go-tc-counter -Iexamples -I. -I../../include/vmlinux -I../../include
+tcx_counter: examples/go-tcx-counter/bpf/tcx_counter.c | $F -Iexamples/go-tcx-counter/bpf -Iexamples/go-tcx-counter -Iexamples -I. -I../../include/vmlinux -I../../include
+xdp_counter: examples/go-xdp-counter/bpf/xdp_counter.c | $F -Iexamples/go-xdp-counter/bpf -Iexamples/go-xdp-counter -Iexamples -I. -I../../include/vmlinux -I../../include
+app-test: tests/integration-test/bpf/app-test.bpf.c | $F1
+kprobe: tests/integration-test/bpf/kprobe.bpf.c | $F1
+kprobe_globals: tests/integration-test/bpf/kprobe_globals.bpf.c | $F1
+tc_pass: tests/integration-test/bpf/tc_pass.bpf.c | $F1
+tcx_test: tests/integration-test/bpf/tcx_test.bpf.c | $F1
+tp_openat: tests/integration-test/bpf/tp_openat.bpf.c | $F1
+uprobe: tests/integration-test/bpf/uprobe.bpf.c | $F1
+xdp_pass: tests/integration-test/bpf/xdp_pass.bpf.c | $F1

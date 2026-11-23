@@ -1,0 +1,6 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Ibpf -I../../include/vmlinux -I../../include
+
+fd_to_address_tracepoints: bpf/fd_to_address_tracepoints.c | $F | license:GPL
+fd_tracepoints: bpf/fd_tracepoints.c | $F | license:GPL
+pids_probes: bpf/pids_probes.c | $F | license:GPL
+tcp_kprobes: bpf/tcp_kprobes.c | $F | license:GPL

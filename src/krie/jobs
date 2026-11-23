@@ -1,0 +1,4 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Iebpf -Iebpf/include -I../../include
+
+top-main: ebpf/main.c | $F | pl,ni?hidden
+zero-main: ebpf/main.c | $F -DRC_CONST_ZERO | pl,ni?hidden

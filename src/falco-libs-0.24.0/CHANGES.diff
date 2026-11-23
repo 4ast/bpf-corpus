@@ -1,0 +1,12 @@
+Not in the upstream tree: driver/driver_config.h
+--- a/driver/modern_bpf/maps/maps.h
++++ b/driver/modern_bpf/maps/maps.h
+@@ -214,7 +214,7 @@
+  * (`ringbuf_maps`)
+  */
+ struct ringbuf_map {
+-	__uint(type, BPF_MAP_TYPE_RINGBUF);
++	__uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 8388608);
+ };
+ 
+ /**

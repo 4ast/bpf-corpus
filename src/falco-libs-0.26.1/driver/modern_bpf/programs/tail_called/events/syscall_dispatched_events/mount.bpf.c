@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Copyright (C) 2023 The Falco Authors.
+ *
+ * This file is dual licensed under either the MIT or GPL 2. See MIT.txt
+ * or GPL2.txt for full copies of the license.
+ */
+
+#include <helpers/interfaces/fixed_size_event.h>
+#include <helpers/interfaces/variable_size_event.h>
+
+/*=============================== EXIT EVENT ===========================*/
+
+SEC("tp_btf/sys_exit")
+int BPF_PROG(mount_x, struct pt_regs *regs, long ret) {
+	struct auxiliary_map *auxmap = auxmap__get();
+	if(!auxmap) {
+		return 0;
+	}
+
+	auxmap__preload_event_header(auxmap, PPME_SYSCALL_MOUNT_X);
+
+	/*=============================== COLLECT PARAMETERS  ===========================*/
+
+	/* Parameter 1: res (type: PT_ERRNO) */
+	auxmap__store_s64_param(auxmap, ret);
+
+	/* Parameter 2: dev (type: PT_CHARBUF) */
+	unsigned long source_pointer = extract__syscall_argument(regs, 0);
+	auxmap__store_charbuf_param(auxmap, source_pointer, MAX_PATH, USER);
+
+	/* Parameter 3: dir (type: PT_FSPATH) */
+	unsigned long target_pointer = extract__syscall_argument(regs, 1);
+	auxmap__store_charbuf_param(auxmap, target_pointer, MAX_PATH, USER);
+
+	/* Parameter 4: type (type: PT_CHARBUF) */
+	unsigned long fstype_pointer = extract__syscall_argument(regs, 2);
+	auxmap__store_charbuf_param(auxmap, fstype_pointer, MAX_PARAM_SIZE, USER);
+
+	/* Parameter 5: flags (type: PT_FLAGS32) */
+	uint32_t flags = (uint32_t)extract__syscall_argument(regs, 3);
+
+	/* The `mountflags` argument may have the magic number 0xC0ED
+	 * (MS_MGC_VAL) in the top 16 bits. (All of the other flags
+	 * occupy the low order 16 bits of `mountflags`.)
+	 * Specifying MS_MGC_VAL was required in kernel
+	 * versions prior to 2.4, but since Linux 2.4 is no longer required
+	 * and is ignored if specified.
+	 */
+	/* Check the magic number 0xC0ED in the top 16 bits and ignore it if specified. */
+	if((flags & PPM_MS_MGC_MSK) == PPM_MS_MGC_VAL) {
+		flags &= ~PPM_MS_MGC_MSK;
+	}
+	auxmap__store_u32_param(auxmap, flags);
+
+	/*=============================== COLLECT PARAMETERS  ===========================*/
+
+	auxmap__finalize_event_header(auxmap);
+
+	auxmap__submit_event(auxmap);
+
+	return 0;
+}
+
+/*=============================== EXIT EVENT ===========================*/

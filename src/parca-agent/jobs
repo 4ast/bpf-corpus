@@ -1,0 +1,1 @@
+probe: probes/bpf/probe.bpf.c | -D__TARGET_ARCH_x86 -D__x86_64__ -Iprobes/bpf -Iprobes -I. -I../../include/vmlinux -I../../include

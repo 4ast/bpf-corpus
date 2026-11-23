@@ -1,0 +1,5 @@
+max_entries = 4
+seed_count = 1
+seed_keys[0] = 1
+seed_vals[0] = 10
+lookup_key = 1

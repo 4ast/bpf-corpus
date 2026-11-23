@@ -1,0 +1,4 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+flows: bpf/flows/flows.c | $F -Ibpf/flows -Ibpf -Ibpf/headers -I../../include
+packets: bpf/packets/packets.c | $F -Ibpf/packets -Ibpf -Ibpf/headers -I../../include

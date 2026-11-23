@@ -1,0 +1,30 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+F1 = $F -Itestdata -I. -I../../include/vmlinux -I../../include
+
+relocs: btf/testdata/relocs.c | $F -Ibtf/testdata -Ibtf -I. -I../../include/vmlinux -I../../include
+relocs_enum: btf/testdata/relocs_enum.c | $F -Ibtf/testdata -Ibtf -I. -I../../include/vmlinux -I../../include
+minimal: cmd/bpf2go/testdata/minimal.c | $F -Icmd/bpf2go/testdata -Icmd/bpf2go -Icmd -I. -I../../include/vmlinux -I../../include
+docs: docs/examples/docs.c | $F -Idocs/examples -Idocs -I. -I../../include/vmlinux -I../../include
+kfuncs: docs/examples/kfuncs.c | $F -Idocs/examples -Idocs -I. -I../../include/vmlinux -I../../include
+counter: docs/examples/getting_started/counter.c | $F -Idocs/examples/getting_started -Idocs/examples -Idocs -I. -I../../include/vmlinux -I../../include
+docs_examples_variables-variables: docs/examples/variables/variables.c | $F -Idocs/examples/variables -Idocs/examples -Idocs -I. -I../../include/vmlinux -I../../include
+cgroup_skb: examples/cgroup_skb/cgroup_skb.c | $F -Iexamples/cgroup_skb -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+fentry: examples/fentry/fentry.c | $F -Iexamples/fentry -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+kprobe: examples/kprobe/kprobe.c | $F -Iexamples/kprobe -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+kprobe_percpu: examples/kprobe_percpu/kprobe_percpu.c | $F -Iexamples/kprobe_percpu -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+kprobe_pin: examples/kprobepin/kprobe_pin.c | $F -Iexamples/kprobepin -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+ringbuffer: examples/ringbuffer/ringbuffer.c | $F -Iexamples/ringbuffer -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+tcprtt: examples/tcprtt/tcprtt.c | $F -Iexamples/tcprtt -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+tcprtt_sockops: examples/tcprtt_sockops/tcprtt_sockops.c | $F -Iexamples/tcprtt_sockops -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Itestdata -Ibtf/testdata -I../../include
+tcx: examples/tcx/tcx.c | $F -Iexamples/tcx -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+tracepoint: examples/tracepoint_in_c/tracepoint.c | $F -Iexamples/tracepoint_in_c -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+uretprobe: examples/uretprobe/uretprobe.c | $F -Iexamples/uretprobe -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+examples_xdp-xdp: examples/xdp/xdp.c | $F -Iexamples/xdp -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+examples_xdp_live_frame-xdp: examples/xdp_live_frame/xdp.c | $F -Iexamples/xdp_live_frame -Iexamples -I. -I../../include/vmlinux -Iexamples/headers -Iexamples/tcprtt_sockops -Itestdata -Ibtf/testdata -I../../include
+atomics: testdata/atomics.c | $F1
+btf_map_init: testdata/btf_map_init.c | $F1
+fentry_fexit: testdata/fentry_fexit.c | $F1
+kconfig: testdata/kconfig.c | $F1
+kfunc: testdata/kfunc.c | $F1
+strings: testdata/strings.c | $F1
+testdata-variables: testdata/variables.c | $F1

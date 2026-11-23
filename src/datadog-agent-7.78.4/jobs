@@ -1,0 +1,45 @@
+PREBUILT = --x86-ir -D__KERNEL__ -D__BPF_TRACING__ '-DKBUILD_MODNAME="ddsysprobe"' -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-jump-tables -fmerge-all-constants -fms-extensions -D__TARGET_ARCH_x86 -D__x86_64__ -Ipkg/ebpf/c -DCONFIG_64BIT -DCOMPILE_PREBUILT -DCC_USING_FENTRY -std=gnu11 -include pkg/ebpf/c/asm_goto_workaround.h
+CORE = -D__KERNEL__ -D__BPF_TRACING__ '-DKBUILD_MODNAME="ddsysprobe"' -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-jump-tables -fmerge-all-constants -fms-extensions -D__TARGET_ARCH_x86 -D__x86_64__ -Ipkg/ebpf/c -DCOMPILE_CORE
+CORE_INC = -Ipkg/network/ebpf/c/co-re -Ipkg/gpu/ebpf/c -Ipkg/gpu/ebpf/c/runtime
+REAL = const:@../../presets/datadog/offsets,@../../presets/datadog/flags-modern,use_ring_buffer=0,use_syscall_task_storage=0,is_sk_storage_supported=0 xadd
+MODERN = const:@../../presets/datadog/offsets,@../../presets/datadog/flags-modern,is_sk_storage_supported=0 xadd
+MODERN_FENTRY = const:@../../presets/datadog/offsets,@../../presets/datadog/flags-modern,is_sk_storage_supported=1 xadd
+NET = const:@../../presets/datadog/flags-net xadd
+
+runtime-security@zero: pkg/security/ebpf/c/prebuilt/probe.c | $PREBUILT -Ipkg/security/ebpf/c/include -DUSE_SYSCALL_TASK_STORAGE=0 -DUSE_RING_BUFFER=0 | const:
+runtime-security@real: pkg/security/ebpf/c/prebuilt/probe.c | $PREBUILT -Ipkg/security/ebpf/c/include -DUSE_SYSCALL_TASK_STORAGE=0 -DUSE_RING_BUFFER=0 | $REAL
+runtime-security-syscall-wrapper@zero: pkg/security/ebpf/c/prebuilt/probe.c | $PREBUILT -Ipkg/security/ebpf/c/include -DUSE_SYSCALL_WRAPPER | const:
+runtime-security-syscall-wrapper@real: pkg/security/ebpf/c/prebuilt/probe.c | $PREBUILT -Ipkg/security/ebpf/c/include -DUSE_SYSCALL_WRAPPER | $REAL
+runtime-security-syscall-wrapper@modern: pkg/security/ebpf/c/prebuilt/probe.c | $PREBUILT -Ipkg/security/ebpf/c/include -DUSE_SYSCALL_WRAPPER -DCORPUS_MODERN_MAPS | $MODERN
+runtime-security-fentry@zero: pkg/security/ebpf/c/prebuilt/probe.c | $PREBUILT -Ipkg/security/ebpf/c/include -DUSE_SYSCALL_WRAPPER -DUSE_FENTRY | const:
+runtime-security-fentry@real: pkg/security/ebpf/c/prebuilt/probe.c | $PREBUILT -Ipkg/security/ebpf/c/include -DUSE_SYSCALL_WRAPPER -DUSE_FENTRY | $REAL
+runtime-security-fentry@modern: pkg/security/ebpf/c/prebuilt/probe.c | $PREBUILT -Ipkg/security/ebpf/c/include -DUSE_SYSCALL_WRAPPER -DUSE_FENTRY -DCORPUS_MODERN_MAPS | $MODERN_FENTRY
+runtime-security-offset-guesser@zero: pkg/security/ebpf/c/prebuilt/offset-guesser.c | $PREBUILT -Ipkg/security/ebpf/c/include | const:
+prebuilt-dns@zero: pkg/network/ebpf/c/prebuilt/dns.c | $PREBUILT -Ipkg/network/ebpf/c | const:
+prebuilt-dns@real: pkg/network/ebpf/c/prebuilt/dns.c | $PREBUILT -Ipkg/network/ebpf/c | $NET
+prebuilt-offset-guess@zero: pkg/network/ebpf/c/prebuilt/offset-guess.c | $PREBUILT -Ipkg/network/ebpf/c | const:
+prebuilt-offset-guess@real: pkg/network/ebpf/c/prebuilt/offset-guess.c | $PREBUILT -Ipkg/network/ebpf/c | $NET
+prebuilt-usm@zero: pkg/network/ebpf/c/prebuilt/usm.c | $PREBUILT -Ipkg/network/ebpf/c | const:
+prebuilt-usm@real: pkg/network/ebpf/c/prebuilt/usm.c | $PREBUILT -Ipkg/network/ebpf/c | $NET
+prebuilt-usm_events_test@zero: pkg/network/ebpf/c/prebuilt/usm_events_test.c | $PREBUILT -Ipkg/network/ebpf/c | const:
+prebuilt-usm_events_test@real: pkg/network/ebpf/c/prebuilt/usm_events_test.c | $PREBUILT -Ipkg/network/ebpf/c | $NET
+prebuilt-shared-libraries@zero: pkg/network/ebpf/c/prebuilt/shared-libraries.c | $PREBUILT -Ipkg/network/ebpf/c | const:
+prebuilt-shared-libraries@real: pkg/network/ebpf/c/prebuilt/shared-libraries.c | $PREBUILT -Ipkg/network/ebpf/c | $NET
+prebuilt-conntrack@zero: pkg/network/ebpf/c/prebuilt/conntrack.c | $PREBUILT -Ipkg/network/ebpf/c | const:
+prebuilt-conntrack@real: pkg/network/ebpf/c/prebuilt/conntrack.c | $PREBUILT -Ipkg/network/ebpf/c | $NET
+prebuilt-tracer@zero: pkg/network/ebpf/c/tracer.c | $PREBUILT -Ipkg/network/ebpf/c -Ipkg/network/ebpf/c/prebuilt | const:
+prebuilt-tracer@real: pkg/network/ebpf/c/tracer.c | $PREBUILT -Ipkg/network/ebpf/c -Ipkg/network/ebpf/c/prebuilt | $NET
+core-tracer: pkg/network/ebpf/c/tracer.c | $CORE -Ipkg/network/ebpf/c -Ipkg/network/ebpf/c $CORE_INC | $NET
+core-tracer-fentry: pkg/network/ebpf/c/co-re/tracer-fentry.c | $CORE -Ipkg/network/ebpf/c -Ipkg/network/ebpf/c/co-re $CORE_INC | $NET
+core-usm: pkg/network/ebpf/c/runtime/usm.c | $CORE -Ipkg/network/ebpf/c -Ipkg/network/ebpf/c/runtime $CORE_INC | $NET
+core-shared-libraries: pkg/network/ebpf/c/runtime/shared-libraries.c | $CORE -Ipkg/network/ebpf/c -Ipkg/network/ebpf/c/runtime $CORE_INC | $NET
+core-conntrack: pkg/network/ebpf/c/runtime/conntrack.c | $CORE -Ipkg/network/ebpf/c -Ipkg/network/ebpf/c/runtime $CORE_INC | $NET
+core-gpu: pkg/gpu/ebpf/c/runtime/gpu.c | $CORE -Ipkg/network/ebpf/c -Ipkg/gpu/ebpf/c/runtime $CORE_INC | $NET
+core-lock_contention: pkg/ebpf/c/lock_contention.c | $CORE -Ipkg/network/ebpf/c -Ipkg/ebpf/c $CORE_INC | $NET
+core-ksyms_iter: pkg/ebpf/c/ksyms_iter.c | $CORE -Ipkg/network/ebpf/c -Ipkg/ebpf/c $CORE_INC | $NET
+core-ebpf-kern: pkg/collector/corechecks/ebpf/c/runtime/ebpf-kern.c | $CORE -Ipkg/network/ebpf/c -Ipkg/collector/corechecks/ebpf/c/runtime $CORE_INC | $NET
+core-noisy-neighbor-kern: pkg/collector/corechecks/ebpf/c/runtime/noisy-neighbor-kern.c | $CORE -Ipkg/network/ebpf/c -Ipkg/collector/corechecks/ebpf/c/runtime $CORE_INC | $NET
+core-oom-kill-kern: pkg/collector/corechecks/ebpf/c/runtime/oom-kill-kern.c | $CORE -Ipkg/network/ebpf/c -Ipkg/collector/corechecks/ebpf/c/runtime $CORE_INC | $NET
+core-tcp-queue-length-kern: pkg/collector/corechecks/ebpf/c/runtime/tcp-queue-length-kern.c | $CORE -Ipkg/network/ebpf/c -Ipkg/collector/corechecks/ebpf/c/runtime $CORE_INC | $NET
+core-dyninst_event: pkg/dyninst/ebpf/event.c | $CORE -Ipkg/dyninst/ebpf | $NET
+core-dyninst_event-debug: pkg/dyninst/ebpf/event.c | $CORE -Ipkg/dyninst/ebpf -DDEBUG=1 -DDYNINST_DEBUG=1 | $NET

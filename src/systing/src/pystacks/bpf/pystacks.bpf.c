@@ -1,0 +1,1487 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+#include <vmlinux.h>
+
+#ifndef int8_t
+typedef __s8 int8_t;
+#endif
+
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+#if __riscv64__
+// errno.h indirectly includes bits/wordsize.h. Define __riscv_xlen to avoid assertion failure.
+# define __riscv_xlen 64
+#endif
+
+#include <errno.h>
+
+#include "bpf_read_helpers.bpf.h"
+#include "common.h"
+#include "namespace_helpers.bpf.h"
+#include "pid_target_helpers.bpf.h"
+#include "pthread_helpers.bpf.h"
+#include "task_helpers.bpf.h"
+#include "binary_id.h"
+
+#include "pystacks.bpf.h"
+
+#include "PyPidData.h"
+
+#include "py_structs.h"
+
+/* Include helper .bpf.c files that define global variables and functions
+ * needed by pystacks. These are normally compiled separately in strobelight-libs
+ * but we include them here since they need to be in the same compilation unit. */
+#include "common.bpf.c"
+#include "task_helpers.bpf.c"
+#include "bpf_read_helpers.bpf.c"
+#include "pid_target_helpers.bpf.c"
+#include "pthread_helpers.bpf.c"
+#include "namespace_helpers.bpf.c"
+
+struct pystacks_msg_heap_map pystacks_msg_heap SEC(".maps");
+
+volatile struct {
+  bool read_leaf_frame;
+  uint32_t num_cpus;
+  bool enable_debug_msgs;
+  uint32_t stack_max_len;
+  int sample_interval;
+  bool enable_py_src_lines;
+} pystacks_prog_cfg = {};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, BPF_LIB_DEFAULT_MAP_SIZE);
+  __type(key, pid_t);
+  __type(value, PyPidData);
+} pystacks_pid_config SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, BPF_LIB_DEFAULT_MAP_SIZE);
+  __type(key, struct bpf_lib_binary_id);
+  __type(value, PyPidData);
+} pystacks_binaryid_config SEC(".maps");
+
+#define BPF_LIB_CO_COROUTINE 0x0080
+#define BPF_LIB_CO_ITERABLE_COROUTINE 0x0100
+#define BPF_LIB_CO_STATICALLY_COMPILED 0x4000000
+
+/*
+ * LOCKING RULE FOR THIS FILE: pystacks runs from probe contexts where IRQs
+ * are hard-off (sched_switch fires under the runqueue lock; the perf-event
+ * sampler runs in NMI context). bpf_map_update_elem on a HASH map takes a
+ * per-bucket raw spinlock; on a large guest under contention those waiters
+ * fall into the paravirt qspinlock slow path, where kvm_wait executes HLT
+ * with IF=0 and depends on the hypervisor's PV kick to ever wake up. AWS
+ * Nitro does not deliver that kick to an IF=0 halt, so a contended map
+ * update from these probes permanently halts the vCPU and wedges the node
+ * (rq lock never released). Therefore BPF code here may only do lock-free
+ * map *lookups* on shared hash maps; all inserts are done by userspace from
+ * process context (IF=1 waiters fall back to safe_halt and are woken by the
+ * timer tick even without a kick). Per-CPU array maps and ringbuf
+ * reserve/submit (short, low-duty-cycle critical section, NMI-safe trylock)
+ * are the only other map operations allowed on the probe paths.
+ */
+
+#define PYSYM_GATE_MAP_SIZE 65536
+#define PYSYM_CACHE_SLOTS 1024
+/* Minimum interval between re-emissions of the same un-interned symbol from
+ * one CPU (in the sleepable build, the window in which a repeat is skipped).
+ * Bounds duplicate ringbuf traffic; a dropped record can still be sent later. */
+#define PYSYM_REEMIT_NS (1ULL * 1000 * 1000 * 1000)
+
+/*
+ * Interned-symbol gate. Key is the 64-bit content hash of the symbol
+ * (== symbol_id), value is unused. BPF only ever does lock-free lookups
+ * here; userspace inserts an entry once it has consumed and resolved the
+ * corresponding pystacks_symbol_record, which stops further emission of
+ * that symbol. See the locking rule above for why BPF must never update it.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, PYSYM_GATE_MAP_SIZE);
+  __type(key, symbol_id_t);
+  __type(value, uint8_t);
+} pystacks_symbols SEC(".maps");
+
+/*
+ * Carries pystacks_symbol_record to userspace. A single (un-sharded) ringbuf
+ * is fine here: a probe emits at most one record per CPU per cache slot per
+ * PYSYM_REEMIT_NS, so the reserve spinlock's duty cycle is far too low to push
+ * waiters into the paravirt halt path even on very wide machines, and the
+ * sleepable build's copy has one writer, the thread that reads the iterator.
+ * ~470-byte records; 4MiB buffers ~8k in-flight symbols.
+ * Shrunk to one page at open time when pystacks is disabled.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 4 * 1024 * 1024 /* 4MiB */);
+} ringbuf_pysym_events SEC(".maps");
+
+/*
+ * Per-CPU emission rate limiter, direct-mapped by the low bits of the
+ * symbol id; each slot holds the timestamp of the last emission attempt
+ * that claimed it. A slot in cooldown suppresses emission for *any* symbol
+ * mapping to it, which hard-caps each CPU at PYSYM_CACHE_SLOTS ringbuf
+ * reserve attempts per PYSYM_REEMIT_NS no matter how many distinct
+ * un-interned symbols are in flight (deliberately slot-based, not id-based:
+ * an id-based check would let two aliasing symbols evict each other's claim
+ * and degenerate to per-frame reserve attempts on the shared ringbuf lock).
+ * A suppressed symbol is retried on its next *sighting*: another CPU with a
+ * free slot emits it, or this slot's cooldown expires and a later miss
+ * re-emits. Symbols that recur are therefore eventually interned; a one-shot
+ * frame (e.g. module-level import code seen exactly once) that loses the
+ * slot race on every CPU that saw it, or whose record is dropped by a full
+ * ringbuf, stays unresolved — an accepted trade for the hard cap.
+ * In the sleepable build a slot holds a claim per symbol and second instead,
+ * on a ringbuf of its own, under PYSYM_ITER_BUDGET: see emit_symbol_record().
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, PYSYM_CACHE_SLOTS);
+  __type(key, u32);
+  __type(value, uint64_t);
+} pystacks_emitted_cache SEC(".maps");
+
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+/* The task iterator's cap on symbol records per PYSYM_REEMIT_NS, over all CPUs
+ * (one thread reads the iterator). Its ringbuf is not the probes', so this
+ * bounds how fast userspace must take in new symbols, not a lock's load. */
+#define PYSYM_ITER_BUDGET (16 * PYSYM_CACHE_SLOTS)
+
+struct pystacks_iter_budget {
+  uint64_t window; /* the PYSYM_REEMIT_NS window that sent counts in */
+  uint64_t sent; /* records sent in that window */
+  uint64_t over; /* records not sent: over the cap */
+  uint64_t no_room; /* records not sent: the ringbuf was full */
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct pystacks_iter_budget);
+} pystacks_iter_budget SEC(".maps");
+#endif
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, BPF_LIB_DEFAULT_MAP_SIZE);
+  __type(key, struct pystacks_symbol);
+  __type(value, int8_t);
+} pystacks_ending_frames SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, BPF_LIB_DEFAULT_MAP_SIZE);
+  __type(key, struct read_qualified_name);
+  __type(value, int8_t);
+} pystacks_ending_frame_qualnames SEC(".maps");
+
+struct sample_state_t {
+  OffsetConfig offsets;
+  uint64_t cur_cpu;
+  void* frame_ptr;
+  bool sync_use_shadow_frame;
+  /* The frame just visited by pystacks_get_frame_data was a CPython 3.12+
+   * entry frame (see PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER): nothing was read
+   * from it and no symbol is to be emitted for it. */
+  bool frame_skipped;
+  char long_file_name[BPF_LIB_FILE_NAME_TRYGET];
+  struct pystacks_symbol sym;
+  struct pystacks_line_table linetable;
+  int32_t lasti;
+};
+
+/*
+ * _PyInterpreterFrame.owner values whose frame is the interpreter's own, not
+ * a Python function's. CPython 3.12+ pushes an entry frame onto the frame
+ * chain for every entry into _PyEval_EvalFrameDefault, i.e. at every
+ * C -> Python re-entry (PyObject_Call from C, a bound method's __call__,
+ * functools.partial, ...): owner = FRAME_OWNED_BY_CSTACK (3) and
+ * f_executable = None. 3.14 renames that value FRAME_OWNED_BY_INTERPRETER (3)
+ * and adds FRAME_OWNED_BY_CSTACK (4); both are non-Python frames. The values
+ * below it (THREAD 0, GENERATOR 1, FRAME_OBJECT 2) are real frames. Reading
+ * the (None) code object of an entry frame yields a "[Frame Error]"
+ * placeholder and spends a slot of the stack budget, so such frames are
+ * stepped over instead and only counted: each emitted symbol carries, in its
+ * spare word, how many entry frames sit between it and the next emitted
+ * symbol outward (stack_walker_frame.pad_), which is what user space needs
+ * to put each run of Python frames back where the interpreter ran it.
+ */
+#define PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER 3
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct sample_state_t);
+} pystacks_state_heap SEC(".maps");
+
+static __always_inline struct sample_state_t* get_state() {
+  return bpf_map_lookup_elem(&pystacks_state_heap, &zero);
+}
+
+#define BPF_LIB_GET_STATE()                   \
+  struct sample_state_t* state = get_state(); \
+  if (!state) {                               \
+    return 0; /* should never happen */       \
+  }
+
+static __always_inline void read_shadow_frame_data(
+    void* shadow_frame,
+    const OffsetConfig* const offsets,
+    void** data_ptr,
+    int64_t* ptr_kind,
+    struct task_struct* task) {
+  // The PyShadowFrame stores a variety of Py objects in its "data" field
+  // We determine the type using the bottom n bits in the "data" field
+  void* shadow_frame_data;
+  // If the read on shadow_frame->data is unsuccessful set everything to NULL
+  // and return early
+  if (bpf_probe_read_user_task(
+          &shadow_frame_data,
+          sizeof(void*),
+          (char*)shadow_frame + offsets->PyShadowFrame_data,
+          task) < 0) {
+    *ptr_kind = -1;
+    *data_ptr = NULL;
+    return;
+  }
+  // The bottom n bits are extracted using the ptr kind bit mask
+  // (PyShadowFrame_PtrKindMask)
+  *ptr_kind = (int64_t)((uintptr_t)shadow_frame_data &
+                        (uintptr_t)offsets->PyShadowFrame_PtrKindMask);
+  // The pointer to the object is stored in the top 64 - n bits of the "data"
+  // field We extract that pointer using the ptr bit mask
+  // (PyShadowFrame_PtrKindMask)
+  *data_ptr = (void*)((uintptr_t)shadow_frame_data &
+                      (uintptr_t)offsets->PyShadowFrame_PtrMask);
+}
+
+/*
+ * 64-bit FNV-style hash over the whole pystacks_symbol, folding 8 bytes per
+ * round (NOT byte-wise FNV-1a — mixing is coarser, but collision odds at
+ * realistic symbol counts are still negligible, ~1e-8 at 100k symbols).
+ * get_names() zeroes the struct before filling it, so unused bytes
+ * (including the explicit padding) hash deterministically. The result is
+ * the symbol ID: content-derived, so every CPU computes the same ID
+ * independently and no shared counter or map insert is needed from probe
+ * context. User space recomputes it (hash_symbol() in symbols.rs) and refuses
+ * a record that does not match, so change both together.
+ */
+static symbol_id_t hash_symbol(const struct pystacks_symbol* const sym) {
+  _Static_assert(
+      sizeof(struct pystacks_symbol) % sizeof(uint64_t) == 0,
+      "pystacks_symbol must be a multiple of 8 bytes for the word hash");
+  const uint64_t* words = (const uint64_t*)sym;
+  uint64_t hash = 0xcbf29ce484222325ULL;
+  for (uint32_t i = 0; i < sizeof(struct pystacks_symbol) / sizeof(uint64_t);
+       i++) {
+    hash ^= words[i];
+    hash *= 0x100000001b3ULL;
+  }
+  /* 0 is reserved as "no symbol" by userspace consumers. */
+  return hash ? hash : 1;
+}
+
+/*
+ * Send {id, symbol, line table} to userspace for interning, rate-limited by
+ * the per-CPU emitted cache. The slot is claimed *before* the reserve and,
+ * outside the sleepable build, kept on failure, so a full ringbuf backs us off
+ * for PYSYM_REEMIT_NS instead of hammering the shared reserve spinlock.
+ */
+static __noinline void emit_symbol_record(
+    symbol_id_t id,
+    const struct pystacks_symbol* const sym,
+    const struct pystacks_line_table* const linetable) {
+  u32 slot = (u32)(id & (PYSYM_CACHE_SLOTS - 1));
+  uint64_t* last_emit = bpf_map_lookup_elem(&pystacks_emitted_cache, &slot);
+  u64 now = bpf_ktime_get_ns();
+
+  /* Fail closed: emitting without rate limiting is the failure class this
+   * file exists to prevent. The lookup can only miss if the cache map was
+   * shrunk (pystacks disabled), where this path should be dead code anyway. */
+  if (!last_emit)
+    return;
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+  /* The task iterator sees a blocked thread's frame once, so skip only a repeat
+   * of this symbol in the same PYSYM_REEMIT_NS window; one that userspace did
+   * not intern can be sent again. Tries over PYSYM_ITER_BUDGET are counted. */
+  struct pystacks_iter_budget* budget =
+      bpf_map_lookup_elem(&pystacks_iter_budget, &zero);
+  uint64_t window = now / PYSYM_REEMIT_NS;
+  uint64_t claim = id ^ window;
+  if (!budget || *last_emit == claim)
+    return;
+  *last_emit = claim;
+  if (budget->window != window) {
+    budget->window = window;
+    budget->sent = 0;
+  }
+  if (budget->sent >= PYSYM_ITER_BUDGET) {
+    budget->over++;
+    return;
+  }
+  budget->sent++;
+#else
+  if (now - *last_emit < PYSYM_REEMIT_NS)
+    return;
+  *last_emit = now;
+#endif
+
+  /* In NMI context (perf-event sampler) reserve degrades to a trylock and
+   * may fail; outside the sleepable build, a retry waits PYSYM_REEMIT_NS. */
+  struct pystacks_symbol_record* rec =
+      bpf_ringbuf_reserve(&ringbuf_pysym_events, sizeof(*rec), 0);
+  if (!rec) {
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+    /* Not sent and not charged to the cap: the next frame with this symbol
+     * tries again. */
+    *last_emit = 0;
+    budget->sent--;
+    budget->no_room++;
+#endif
+    return;
+  }
+
+  rec->symbol_id = id;
+  rec->sym = *sym;
+  rec->linetable = *linetable;
+  bpf_ringbuf_submit(rec, 0);
+}
+
+static symbol_id_t get_py_symbol_id(struct sample_state_t* const state) {
+  symbol_id_t id = hash_symbol(&state->sym);
+
+  /* Lock-free lookup; see the locking rule above the map definitions for
+   * why this path must never bpf_map_update_elem a shared hash map. */
+  if (bpf_map_lookup_elem(&pystacks_symbols, &id))
+    return id;
+
+  emit_symbol_record(id, &state->sym, &state->linetable);
+  return id;
+}
+
+static __always_inline void* get_gen_ptr(
+    void* frame_ptr,
+    void* code_ptr,
+    const OffsetConfig* const offsets,
+    bool use_shadow_frame,
+    struct task_struct* task) {
+  if (!code_ptr) {
+    return NULL;
+  }
+
+  void* gen_ptr = NULL;
+  // code flags
+  int co_flags;
+  if (bpf_probe_read_user_task(
+          &co_flags,
+          sizeof(int),
+          (char*)code_ptr + offsets->PyCodeObject_co_flags,
+          task) < 0) {
+    return NULL;
+  }
+
+  if (use_shadow_frame) {
+    void* data_ptr;
+    int64_t ptr_kind;
+    read_shadow_frame_data(frame_ptr, offsets, &data_ptr, &ptr_kind, task);
+    if (!data_ptr || ptr_kind == -1) {
+      return NULL;
+    }
+    const int gen_flags = BPF_LIB_CO_COROUTINE | BPF_LIB_CO_ITERABLE_COROUTINE;
+    // JIT'd coroutines have their shadow frames embedded in the coroutine
+    // object
+    if (ptr_kind == offsets->PyShadowFrame_PYSF_CODE_RT &&
+        (co_flags & gen_flags)) {
+      gen_ptr =
+          (void*)((char*)frame_ptr - offsets->PyGenObject_gi_shadow_frame);
+    }
+    // Other coroutines have the PyFrameObject in the shadow frame data member
+    // We can then get the coroutine obejct using PyFrameObject->f_gen
+    else if (
+        ptr_kind == offsets->PyShadowFrame_PYSF_PYFRAME &&
+        (co_flags & BPF_LIB_CO_COROUTINE)) {
+      if (bpf_probe_read_user_task(
+              &gen_ptr,
+              sizeof(void*),
+              (char*)data_ptr + offsets->PyFrameObject_gen,
+              task) < 0) {
+        return NULL;
+      }
+    }
+    // ptr_kind == offsets->PyShadowFrame_PYSF_PYCODE
+    // returns NULL
+  }
+  // We check code flag first for old style coroutines, f_gen only exists in PY3
+  else if (co_flags & BPF_LIB_CO_COROUTINE) {
+    bpf_probe_read_user_task(
+        &gen_ptr,
+        sizeof(void*),
+        (char*)frame_ptr + offsets->PyFrameObject_gen,
+        task);
+  }
+  return gen_ptr;
+}
+
+static __always_inline void get_names(
+    struct sample_state_t* const state,
+    void* cur_frame,
+    void* code_ptr,
+    bool use_shadow_frame,
+    struct task_struct* task) {
+  const OffsetConfig* const offsets = &state->offsets;
+  const pid_t pid = task ? BPF_CORE_READ(task, tgid)
+                         : (pid_t)(bpf_get_current_pid_tgid() >> 32);
+  struct pystacks_symbol* const symbol = &state->sym;
+  struct pystacks_line_table* const linetable = &state->linetable;
+
+  // We re-use the same pystacks_symbol instance across loop iterations, which
+  // means we will have left-over data in the struct. Although this won't affect
+  // correctness of the result because we have '\0' at end of the strings
+  // read, it would affect effectiveness of the deduplication.
+  memset_zero(symbol, sizeof(struct pystacks_symbol));
+  memset_zero(linetable, sizeof(struct pystacks_line_table));
+  state->lasti = -1;
+
+  if (!code_ptr) {
+    // if we end up here, this means that reading of `PyCodeObject` for this
+    // frame was unsuccessful; annotate the passed-in symbol with an error tag
+    // and return
+    bpf_probe_read_kernel_str(
+        symbol->qualname.value,
+        sizeof(symbol->qualname.value),
+        "[Frame Error]");
+
+    // file name already empty string (zeroed)
+    return;
+  }
+
+  if (pystacks_prog_cfg.enable_py_src_lines &&
+      offsets->PyCodeObject_linetable != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyVarObject_size != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyBytesObject_data != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyCodeObject_firstlineno != BPF_LIB_DEFAULT_FIELD_OFFSET) {
+    void* linetable_ptr = 0;
+    if (bpf_probe_read_user_task(
+            &linetable_ptr,
+            sizeof(linetable_ptr),
+            code_ptr + offsets->PyCodeObject_linetable,
+            task) == 0) {
+      linetable->addr = (uintptr_t)linetable_ptr + offsets->PyBytesObject_data;
+
+      ssize_t linetable_length = 0;
+      bpf_probe_read_user_task(
+          &linetable_length,
+          sizeof(linetable_length),
+          linetable_ptr + offsets->PyVarObject_size,
+          task);
+      linetable->length = (uint32_t)linetable_length;
+
+      uint32_t first_line = 0;
+      bpf_probe_read_user_task(
+          &first_line,
+          sizeof(first_line),
+          code_ptr + offsets->PyCodeObject_firstlineno,
+          task);
+      linetable->first_line = first_line;
+      linetable->pid = pid;
+
+      int32_t lasti = -1;
+      if (offsets->PyVersion_major == 3 && offsets->PyVersion_minor < 11) {
+        if (use_shadow_frame) {
+          // If shadow frames are used then cur_frame points to a PyShadowFrame
+          // - not a PyFrameObject. The content of the `data` member of a
+          // PyShadowFrame varies according to `ptr_knd`.
+          void* data_ptr;
+          int64_t ptr_kind;
+          read_shadow_frame_data(
+              cur_frame, offsets, &data_ptr, &ptr_kind, task);
+          if (data_ptr && ptr_kind == offsets->PyShadowFrame_PYSF_PYFRAME) {
+            // data_ptr holds PyFrameObject*.
+            // See cinder/include/internal/pycore_shadow_frame_struct.h
+            bpf_probe_read_user_task(
+                &lasti,
+                sizeof(lasti),
+                data_ptr + offsets->PyFrameObject_lasti,
+                task);
+          } else {
+            state->lasti = -2; // unsupported ptr_kind
+          }
+        } else if (
+            offsets->PyFrameObject_lasti != BPF_LIB_DEFAULT_FIELD_OFFSET) {
+          bpf_probe_read_user_task(
+              &lasti,
+              sizeof(lasti),
+              cur_frame + offsets->PyFrameObject_lasti,
+              task);
+        }
+      } else {
+        // In Python 3.11+ lasti is caclulated from the _PyInterpreterFrame
+        // struct:
+        // ((int)((IF)->prev_instr - _PyCode_CODE((IF)->f_code)))
+        // See PyFrame_GetLasti() in cpython/Objects/frameobject.c
+        if (offsets->PyInterpreterFrame_prev_instr !=
+                BPF_LIB_DEFAULT_FIELD_OFFSET &&
+            offsets->PyInterpreterFrame_code != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+            offsets->PyCodeObject_code_adaptive !=
+                BPF_LIB_DEFAULT_FIELD_OFFSET) {
+          void* prev_instr_ptr = NULL;
+          bpf_probe_read_user_task(
+              &prev_instr_ptr,
+              sizeof(void*),
+              state->frame_ptr + offsets->PyInterpreterFrame_prev_instr,
+              task);
+          if (prev_instr_ptr) {
+            // sizeof(_Py_CODEUNIT) is 2 bytes
+            lasti = (uint16_t*)prev_instr_ptr -
+                (uint16_t*)(code_ptr + offsets->PyCodeObject_code_adaptive);
+          }
+        }
+      }
+      state->lasti = lasti;
+    }
+  }
+
+  // read PyCodeObject's qualname into symbol
+  // qualname should be a combination of classname and name
+  int qualname_len = 0;
+  if (offsets->PyCodeObject_qualname != BPF_LIB_DEFAULT_FIELD_OFFSET) {
+    void* qualname_ptr;
+    if (bpf_probe_read_user_task(
+            &qualname_ptr,
+            sizeof(void*),
+            code_ptr + offsets->PyCodeObject_qualname,
+            task) == 0 &&
+        IS_VALID_USER_SPACE_ADDRESS(qualname_ptr)) {
+      qualname_len = bpf_probe_read_user_str_task(
+          symbol->qualname.value,
+          sizeof(symbol->qualname.value),
+          qualname_ptr + offsets->String_data,
+          task);
+      symbol->qualname.value[BPF_LIB_PYSTACKS_CLASS_NAME_LEN] = '\0';
+      if (qualname_len == -EFAULT) {
+        symbol->fault_pid = pid;
+        symbol->qualname.fault_addr =
+            (uintptr_t)(qualname_ptr + offsets->String_data);
+      }
+    } else {
+      bpf_probe_read_kernel_str(
+          symbol->qualname.value,
+          sizeof(symbol->qualname.value),
+          "[Frame Error]");
+      return;
+    }
+  }
+
+  // Query classname and function name using old method if qualname is empty
+  // (qualname_len = 0 or 1) When qualname_len = 1, it is just the string
+  // termination character '\0' so we consider it empty We also want to fallback
+  // if there is a failure when reading qualname which will result in a negative
+  // qualname_len
+  if (!use_shadow_frame && qualname_len <= 1) {
+    // Figure out if we want to parse class name, basically checking the name of
+    // the first argument,
+    //   ((PyTupleObject*)$frame->f_code->co_varnames)->ob_item[0]
+    // If it's 'self', we get the type and its name, if it's cls, we just get
+    // the name. This is not perfect but there is no better way to figure this
+    // out from the code object.
+    void* args_ptr;
+    char ob_item[5];
+    bpf_probe_read_user_task(
+        &args_ptr,
+        sizeof(void*),
+        code_ptr + offsets->PyCodeObject_varnames,
+        task);
+    bpf_probe_read_user_task(
+        &args_ptr, sizeof(void*), args_ptr + offsets->PyTupleObject_item, task);
+    bpf_probe_read_user_str_task(
+        ob_item, sizeof(ob_item), args_ptr + offsets->String_data, task);
+
+    // compare strings as ints to save instructions
+    char self_str[4] = {'s', 'e', 'l', 'f'};
+    char cls_str[4] = {'c', 'l', 's', '\0'};
+    bool first_self = *(int32_t*)ob_item == *(int32_t*)self_str;
+    bool first_cls = *(int32_t*)ob_item == *(int32_t*)cls_str;
+
+    // Read class name from $frame->f_localsplus[0]->ob_type->tp_name.
+    if ((first_self || first_cls) && cur_frame) {
+      void* ptr;
+      bpf_probe_read_user_task(
+          &ptr,
+          sizeof(void*),
+          cur_frame + offsets->PyFrameObject_localsplus,
+          task);
+      if (first_self) {
+        // we are working with an instance, first we need to get type
+        bpf_probe_read_user_task(
+            &ptr, sizeof(void*), ptr + offsets->PyObject_type, task);
+      }
+      bpf_probe_read_user_task(
+          &ptr, sizeof(void*), ptr + offsets->PyTypeObject_name, task);
+      bpf_probe_read_user_str_task(
+          symbol->qualname.value, BPF_LIB_PYSTACKS_CLASS_NAME_LEN, ptr, task);
+      symbol->qualname.value[BPF_LIB_PYSTACKS_CLASS_NAME_LEN] = '\0';
+    }
+    // read PyCodeObject's name into symbol
+    void* name_ptr;
+    bpf_probe_read_user_task(
+        &name_ptr, sizeof(void*), code_ptr + offsets->PyCodeObject_name, task);
+    bpf_probe_read_user_str_task(
+        symbol->qualname.value + BPF_LIB_PYSTACKS_CLASS_NAME_LEN,
+        BPF_LIB_PYSTACKS_FUNCTION_NAME_LEN,
+        name_ptr + offsets->String_data,
+        task);
+  }
+
+  // read PyCodeObject's filename into symbol
+  void* filename_ptr;
+  if (bpf_probe_read_user_task(
+          &filename_ptr,
+          sizeof(void*),
+          code_ptr + offsets->PyCodeObject_filename,
+          task) == 0 &&
+      IS_VALID_USER_SPACE_ADDRESS(filename_ptr)) {
+    int len = bpf_probe_read_user_str_task(
+        state->long_file_name,
+        BPF_LIB_FILE_NAME_TRYGET,
+        filename_ptr + offsets->String_data,
+        task);
+
+    if (len > 0) {
+      void* src = len > BPF_LIB_PYSTACKS_FILE_NAME_LEN
+          ? state->long_file_name + len - BPF_LIB_PYSTACKS_FILE_NAME_LEN
+          : state->long_file_name;
+      bpf_probe_read_kernel_str(
+          &symbol->filename.value, sizeof(symbol->filename.value), src);
+    } else if (len == -EFAULT) {
+      symbol->fault_pid = pid;
+      symbol->filename.fault_addr =
+          (uintptr_t)(filename_ptr + offsets->String_data);
+    }
+  }
+}
+
+// Get the PyCodeObject from the frame pointer
+static __always_inline void* get_code_ptr(
+    void* frame_ptr,
+    const OffsetConfig* const offsets,
+    bool use_shadow_frame,
+    struct task_struct* task) {
+  long result = 0;
+  // The frame pointer can be either a PyFrameObject or a PyShadowFrame
+  void* code_ptr = NULL;
+  // If we are using shadow frames we know the frame pointer is a PyShadowFrame
+  if (use_shadow_frame) {
+    void* data_ptr;
+    int64_t ptr_kind;
+    read_shadow_frame_data(frame_ptr, offsets, &data_ptr, &ptr_kind, task);
+    if (!data_ptr || ptr_kind == -1) {
+      return NULL;
+    }
+    if (ptr_kind == offsets->PyShadowFrame_PYSF_CODE_RT) {
+      result = bpf_probe_read_user_task(
+          &code_ptr,
+          sizeof(void*),
+          (char*)data_ptr + offsets->CodeRuntime_py_code,
+          task);
+    } else if (ptr_kind == offsets->PyShadowFrame_PYSF_RTFS) {
+      result = bpf_probe_read_user_task(
+          &code_ptr,
+          sizeof(void*),
+          (char*)data_ptr + offsets->RuntimeFrameState_py_code,
+          task);
+    } else if (ptr_kind == offsets->PyShadowFrame_PYSF_PYFRAME) {
+      result = bpf_probe_read_user_task(
+          &code_ptr,
+          sizeof(void*),
+          (char*)data_ptr + offsets->PyFrameObject_code,
+          task);
+    } else if (ptr_kind == offsets->PyShadowFrame_PYSF_PYCODE) {
+      code_ptr = data_ptr;
+    }
+  }
+  // If we aren't using shadow frames then the frame pointer is a PyFrameObject
+  else {
+    if (offsets->PyVersion_major >= 3 && offsets->PyVersion_minor >= 11) {
+      result = bpf_probe_read_user_task(
+          &code_ptr,
+          sizeof(void*),
+          (char*)frame_ptr + offsets->PyInterpreterFrame_code,
+          task);
+    } else {
+      result = bpf_probe_read_user_task(
+          &code_ptr,
+          sizeof(void*),
+          (char*)frame_ptr + offsets->PyFrameObject_code,
+          task);
+    }
+  }
+  if (result != 0) {
+    code_ptr = NULL;
+  }
+  return code_ptr;
+}
+
+static __always_inline bool is_ending_frame(struct pystacks_symbol* sym) {
+  return bpf_map_lookup_elem(&pystacks_ending_frames, sym) != NULL ||
+      bpf_map_lookup_elem(&pystacks_ending_frame_qualnames, &sym->qualname) !=
+      NULL;
+}
+
+/*
+ * An entry frame was stepped over: count it on the symbol emitted last, the
+ * frame just inward of it, whose pad_ then says how many entry frames sit
+ * between it and the next symbol outward. An entry frame ahead of the first
+ * emitted symbol (the interpreter between two Python calls: as the outermost
+ * frame of an entry returns it is, for a few instructions, on the entry
+ * frame alone) has no symbol to count on and is dropped, as a walk that finds
+ * only entry frames yields no Python frames at all.
+ *
+ * The index is bounded on the register that indexes: `last` is made opaque
+ * before the check, so the compiler cannot compute the buffer offset from
+ * stack_len instead (a bound proved on `stack_len - 1` and an offset formed
+ * from `stack_len` is pointer arithmetic with an unbounded register, which
+ * the verifier rejects). A stack_len of zero wraps to the largest value and
+ * fails the same check.
+ */
+static __always_inline void note_entry_frame(void) {
+  struct pystacks_message* py_msg = pystacks_get_msg();
+  if (!py_msg) {
+    return; /* should never happen */
+  }
+  uint64_t last = py_msg->stack_len - 1;
+  barrier_var(last);
+  if (last >= BPF_LIB_MAX_STACK_DEPTH) {
+    return;
+  }
+  py_msg->buffer[last].pad_ += 1;
+}
+
+/*
+ * Read current PyFrameObject filename/name and update
+ * stack_info->frame_ptr with pointer to next PyFrameObject
+ */
+__noinline bool pystacks_get_frame_data(int pid) {
+  BPF_LIB_GET_STATE();
+
+  if (state == NULL) {
+    return false;
+  }
+
+  bool use_shadow_frame = state->sync_use_shadow_frame;
+  const OffsetConfig* const offsets = &state->offsets;
+
+  struct task_struct* task;
+  if (get_task(pid, &task)) {
+    return false;
+  }
+
+  /*
+   * CPython 3.12+ interleaves entry frames with the real ones on the
+   * `previous` chain; they carry no code object (see
+   * PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER). Read the frame's owner first and
+   * step over such a frame without reading names for it, counting it on the
+   * last symbol emitted. The owner byte is a `char` in CPython (signed on
+   * x86, unsigned on aarch64) whose values 0-4 are non-negative, so reading
+   * it unsigned is safe on both.
+   */
+  state->frame_skipped = false;
+  if (!use_shadow_frame && offsets->PyVersion_major >= 3 &&
+      offsets->PyVersion_minor >= 12 &&
+      offsets->PyFrameObject_owner != BPF_LIB_DEFAULT_FIELD_OFFSET) {
+    uint8_t owner = 0;
+    if (bpf_probe_read_user_task(
+            &owner,
+            sizeof(owner),
+            state->frame_ptr + offsets->PyFrameObject_owner,
+            task) == 0 &&
+        owner >= PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER) {
+      state->frame_skipped = true;
+      note_entry_frame();
+    }
+  }
+
+  if (!state->frame_skipped) {
+    void* code_ptr =
+        get_code_ptr(state->frame_ptr, offsets, use_shadow_frame, task);
+
+    get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+  }
+
+  int ret_code = 0;
+
+  // read next PyFrameObject/PyShadowFrame pointer
+  if (offsets->PyVersion_major >= 3 && offsets->PyVersion_minor >= 11) {
+    ret_code = bpf_probe_read_user_task(
+        &state->frame_ptr,
+        sizeof(void*),
+        state->frame_ptr + offsets->PyInterpreterFrame_previous,
+        task);
+
+  } else {
+    ret_code = bpf_probe_read_user_task(
+        &state->frame_ptr,
+        sizeof(void*),
+        state->frame_ptr +
+            (use_shadow_frame ? offsets->PyShadowFrame_prev
+                              : offsets->PyFrameObject_back),
+        task);
+  }
+
+  put_task(task);
+
+  return ret_code == 0;
+}
+
+static __noinline uint64_t
+add_symbol_to_buffer(struct pystacks_message* const py_msg) {
+  struct sample_state_t* const state = get_state();
+  if (!state || !py_msg) {
+    return 0; /* should never happen */
+  }
+
+  const symbol_id_t symbol_id = get_py_symbol_id(state);
+
+  uint64_t max_len = pystacks_prog_cfg.stack_max_len;
+  uint64_t max_offset = BPF_LIB_MAX_STACK_DEPTH;
+  uint64_t st_len = py_msg->stack_len;
+
+  if (st_len >= 0 && st_len < max_len && st_len < max_offset) {
+    py_msg->buffer[st_len].symbol_id = symbol_id;
+    py_msg->buffer[st_len].inst_idx = state->lasti;
+    py_msg->buffer[st_len].pad_ = 0;
+    py_msg->header.len += sizeof(struct stack_walker_frame);
+    ++st_len;
+  }
+
+  /* Line tables ride in the pystacks_symbol_record emitted by
+   * get_py_symbol_id; updating a shared hash map from here is forbidden
+   * (see the locking rule above the map definitions). */
+  py_msg->stack_len = st_len;
+  return st_len;
+}
+
+#ifdef STROBELIGHT_READ_LEAF_FRAME
+/*
+  *** Problem ***
+  The ready to run frame is passed as an argument to _PyEval_EvalFrameDefault,
+  but it isn't linked into the call stack until _PyEval_EvalFrameDefault
+  starts executing. As such, we're unable to retrieve the executing Python
+  function name using the usual process of constructing Python sync/async
+  stacks.
+
+  *** Solution ***
+  To read the leaf python function name, we inspect the passed-in
+  PyFrameObject frame (see function definition for implementation details).
+*/
+static __always_inline void read_leaf_frame(
+    struct pt_regs* ctx,
+    struct pystacks_message* const py_msg,
+    struct task_struct* task) {
+  struct sample_state_t* const state = get_state();
+  if (!state) {
+    return; /* should never happen */
+  }
+
+  const OffsetConfig* const offsets = &state->offsets;
+  void* pt1 = (void*)PT_REGS_PARM1(ctx);
+  void* pt2 = (void*)PT_REGS_PARM2(ctx);
+  void* frame_ptr =
+      (offsets->PyVersion_major >= 3 && offsets->PyVersion_minor >= 10) ? pt2
+                                                                        : pt1;
+  void* code_ptr = get_code_ptr(frame_ptr, &state->offsets, false, task);
+
+  /*
+  *** Problem ***
+  Functions called via `asyncio.gather` appear both in the register we're
+  reading `frame_ptr` from and in the bottom of the stack, so we want to
+  avoid adding a duplicated function to the buffer twice. This results in
+  weird-looking stacks, where non-recursive bottom functions are calling
+ themselves recursively.
+
+  *** Explanation by ther Cinder team ***
+  There's an inconsistency for generators. The generator `send` implementation
+  will link the shadow frame instead of _PyEval_EvalFrameDefault. The
+ generator `send` implementation ends up calling _PyEval_EvalFrameDefault, so
+ at the point where uprobe executes, `state->shadow_frame` will point to the
+ shadow frame for the ready-to-run PyFrameObject.
+
+  *** Solution ***
+  Do not add leaf symbol to the buffer in case the PyFrameObject read from the
+  register has a non-NULL generator object.
+  */
+  if (!get_gen_ptr(
+          frame_ptr,
+          code_ptr,
+          &state->offsets,
+          false /* this is not a shadow frame */,
+          task)) {
+    get_names(
+        state,
+        frame_ptr,
+        code_ptr,
+        false /* this is not a shadow frame */,
+        task);
+
+    add_symbol_to_buffer(py_msg);
+  }
+}
+#endif
+
+static int set_py_stack_status(
+    uint8_t* const stack_status,
+    long frame_ptr,
+    bool last_frame_read,
+    bool is_final_iteration) {
+  /*
+   * Stack status is considered "truncated" if:
+   * (1) `frame_ptr` is valid (i.e. `frame_ptr != NULL`) AND the last frame data
+  was read successfully before loop termination (i.e. `last_frame_read ==
+  true`).
+   * OR
+   (2) `frame_ptr` is invalid (NULL) AND this was the final loop iteration
+   (i.e. `is_final_iteration == true`).
+
+  * Stack status is considered "error" if:
+  (1) `frame_ptr` is valid (i.e. `frame_ptr != NULL`) AND the last frame data
+  was NOT read successfully before loop termination (i.e. `last_frame_read ==
+  false`).
+
+  * Stack status is considered "complete" if:
+  (1) `frame_ptr` is invalid (NULL) AND we've read the maximum number of frames
+  allowed ( i.e. `last_frame_read == true`).
+   */
+  if (frame_ptr) {
+    *stack_status =
+        last_frame_read ? PYSTACKS_STATUS_TRUNCATED : PYSTACKS_STATUS_ERROR;
+  } else {
+    *stack_status = is_final_iteration ? PYSTACKS_STATUS_TRUNCATED
+                                       : PYSTACKS_STATUS_COMPLETE;
+  }
+
+  return 0;
+}
+
+__hidden int walk_and_load_py_stack(
+    struct pt_regs* ctx,
+    struct task_struct* task) {
+  struct pystacks_message* py_msg = pystacks_get_msg();
+  if (!py_msg) {
+    return -PYSTACKS_ERROR; /* should never happen */
+  }
+
+  BPF_LIB_GET_STATE();
+
+  uint64_t i = 0;
+  const uint32_t stack_max_len = pystacks_prog_cfg.stack_max_len;
+
+#ifdef STROBELIGHT_READ_LEAF_FRAME
+  if (pystacks_prog_cfg.read_leaf_frame) {
+    /*
+     * At the time when uprobe attached to a native function (e.g.
+     * _PyEval_EvalFrameDefault) activates, we're unable to read the Python
+     * function that's being executed, so this work-around is necessary (see
+     * comment in `read_leaf_frame` definition).
+     */
+    read_leaf_frame(ctx, py_msg, task);
+    ++i;
+  }
+#endif
+
+  bool last_frame_read = false;
+  int pid = task ? BPF_CORE_READ(task, pid) : 0;
+
+  /*
+   * Bound the walk on emitted symbols rather than on visited frames, so a
+   * stack of N Python frames interleaved with entry frames still yields up
+   * to stack_max_len symbols. A visited-frame bound stays for the verifier:
+   * an entry frame hosts at least one real frame above it, so on the usual
+   * chain at most every other visited frame is stepped over and twice the
+   * symbol budget covers the walk; entry frames do follow one another when a
+   * finalizer re-enters the interpreter while a frame is being popped, and
+   * such a chain, rare and shallow, may end short of its symbol budget. An
+   * entry frame is counted where it is stepped over, in
+   * pystacks_get_frame_data, and spends nothing here.
+   */
+  for (; i < 2 * BPF_LIB_MAX_STACK_DEPTH && py_msg->stack_len < stack_max_len &&
+       (last_frame_read = pystacks_get_frame_data(pid));
+       ++i) {
+    if (!state->frame_skipped) {
+      add_symbol_to_buffer(py_msg);
+    }
+  }
+
+  set_py_stack_status(
+      &py_msg->stack_status,
+      (long)state->frame_ptr,
+      last_frame_read,
+      (py_msg->stack_len == stack_max_len - 1) /* is_final_iteration */);
+
+  return py_msg->header.len;
+}
+
+static __always_inline void* get_thread_state(
+    PyPidData* pid_data,
+    struct task_struct* task) {
+  // Python sets the thread_state using pthread_setspecific with the key
+  // stored in a global variable autoTLSkey: https://fburl.com/t6zrkein,
+  // https://fburl.com/4bz21uu1.
+  //
+  // We read the value of the key from the global variable and then read
+  // the value in the thread-local storage. This relies on pthread
+  // implementation: https://fburl.com/j2u1fvs8
+
+  // read TLS key
+  int key = 0;
+  long result = bpf_probe_read_user_task(
+      &key, sizeof(key), (void*)pid_data->tls_key_addr, task);
+  if (result != 0) {
+    return NULL;
+  }
+
+  void* thread_state;
+  result = probe_read_pthread_tls_slot(key, &thread_state, task);
+  if (result != 0) {
+    return NULL;
+  }
+
+  return thread_state;
+}
+
+// Get the frame pointer from the thread state
+// This could either be the PyFrameObject of PyShadowFrame
+static __always_inline void* get_frame_ptr(
+    void* thread_state,
+    const OffsetConfig* const offsets,
+    bool use_shadow_frame,
+    struct task_struct* task) {
+  void* frame_ptr;
+
+  if (offsets->PyThreadState_frame != BPF_LIB_DEFAULT_FIELD_OFFSET) {
+    if (bpf_probe_read_user_task(
+            &frame_ptr,
+            sizeof(void*),
+            (char*)thread_state +
+                (use_shadow_frame ? offsets->PyThreadState_shadow_frame
+                                  : offsets->PyThreadState_frame),
+            task) < 0) {
+      frame_ptr = NULL;
+    }
+  } else {
+    if (bpf_probe_read_user_task(
+            &frame_ptr,
+            sizeof(void*),
+            (char*)thread_state + (offsets->PyThreadState_cframe),
+            task) < 0) {
+      frame_ptr = NULL;
+    }
+    // Python 3.13+: current_frame is directly in PyThreadState, no cframe wrapper
+    // In this case, _PyCFrame_current_frame is set to BPF_LIB_DEFAULT_FIELD_OFFSET
+    // to signal that no second dereference is needed
+    if (offsets->_PyCFrame_current_frame != BPF_LIB_DEFAULT_FIELD_OFFSET) {
+      if (bpf_probe_read_user_task(
+              &frame_ptr,
+              sizeof(void*),
+              (char*)frame_ptr + (offsets->_PyCFrame_current_frame),
+              task) < 0) {
+        frame_ptr = NULL;
+      }
+    }
+  }
+  return frame_ptr;
+}
+
+// Determine if can use shadow frames when profiling based on offset
+// availability
+static __always_inline bool use_shadow_frame(
+    const OffsetConfig* const offsets) {
+  // Use of shadow frames rely on these offsets and thus they must be defined
+  // These offsets are defaulted to an invalid offset of
+  // BPF_LIB_DEFAULT_FIELD_OFFSET in the offset resolver
+  return offsets->PyThreadState_shadow_frame != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyGenObject_gi_shadow_frame != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyCoroObject_cr_awaiter != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyShadowFrame_data != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyShadowFrame_prev != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyShadowFrame_PtrMask != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyShadowFrame_PtrKindMask != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyShadowFrame_PYSF_CODE_RT != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyShadowFrame_PYSF_PYCODE != BPF_LIB_DEFAULT_FIELD_OFFSET &&
+      offsets->PyShadowFrame_PYSF_PYFRAME != BPF_LIB_DEFAULT_FIELD_OFFSET;
+}
+
+/*
+ * Whether the thread state found through the TLS slot was bound by the
+ * thread whose descriptor we derived: CPython stores pthread_self() of the
+ * binding thread in PyThreadState.thread, and on glibc pthread_self() is
+ * the descriptor's own address, so a MATCH is the witness that both the
+ * descriptor derivation and the TLS-slot read landed on this thread's
+ * glibc structures. A MISMATCH means a thread state bound by another
+ * thread (an embedder creating a thread state in one thread and swapping it
+ * in from another, on 3.11 and older) or a descriptor laid out otherwise
+ * than assumed. Every word compared here lives in user memory.
+ */
+static __always_inline int get_pthread_id_match(
+    void* thread_state,
+    void* tls_base,
+    PyPidData* pid_data,
+    struct task_struct* task) {
+  if (thread_state == 0) {
+    return PYSTACKS_PTHREAD_ID_THREAD_STATE_NULL;
+  }
+
+  uint64_t pthread_self, pthread_created;
+  long result;
+  result = bpf_probe_read_user_task(
+      &pthread_created,
+      sizeof(pthread_created),
+      thread_state + pid_data->offsets.PyThreadState_thread,
+      task);
+  if (result != 0) {
+    return PYSTACKS_PTHREAD_ID_ERROR;
+  }
+  if (pthread_created == 0) {
+    return PYSTACKS_PTHREAD_ID_NULL;
+  }
+
+#if __aarch64__ || __riscv64__
+  /*
+   * tls_base is the pthread descriptor from get_glibc_pthread_descriptor();
+   * compare it directly. struct pthread has no header.self on these
+   * architectures (the header union is plain padding), so there is
+   * nothing to read.
+   */
+  pthread_self = (uint64_t)tls_base;
+#else
+  // 0x10 = offsetof(struct pthread, header.self), the descriptor's own
+  // address as glibc keeps it in the TCB.
+  result = bpf_probe_read_user_task(
+      &pthread_self, sizeof(pthread_self), tls_base + 0x10, task);
+  if (result != 0) {
+    return PYSTACKS_PTHREAD_ID_ERROR;
+  }
+#endif
+  if (pthread_self == 0) {
+    return PYSTACKS_PTHREAD_ID_ERROR;
+  }
+
+  if (pthread_self == pthread_created) {
+    return PYSTACKS_PTHREAD_ID_MATCH;
+  } else {
+    return PYSTACKS_PTHREAD_ID_MISMATCH;
+  }
+}
+
+static __always_inline int get_gil_state(
+    void* this_thread_state,
+    void* global_thread_state,
+    PyPidData* pid_data,
+    struct task_struct* task) {
+  // Get information of GIL state
+  if (pid_data->gil_locked_addr == 0 || pid_data->gil_last_holder_addr == 0) {
+    return PYSTACKS_GIL_STATE_NO_INFO;
+  }
+
+  int gil_locked = 0;
+  void* gil_thread_state = 0;
+  long result = bpf_probe_read_user_task(
+      &gil_locked, sizeof(gil_locked), (void*)pid_data->gil_locked_addr, task);
+  if (result != 0) {
+    return PYSTACKS_GIL_STATE_ERROR;
+  }
+
+  switch (gil_locked) {
+    case -1:
+      return PYSTACKS_GIL_STATE_UNINITIALIZED;
+    case 0:
+      return PYSTACKS_GIL_STATE_NOT_LOCKED;
+    case 1:
+      // GIL is held by some Thread
+      bpf_probe_read_user_task(
+          &gil_thread_state,
+          sizeof(void*),
+          (void*)pid_data->gil_last_holder_addr,
+          task);
+      if (gil_thread_state == this_thread_state) {
+        return PYSTACKS_GIL_STATE_THIS_THREAD;
+      } else if (gil_thread_state == global_thread_state) {
+        return PYSTACKS_GIL_STATE_GLOBAL_CURRENT_THREAD;
+      } else if (gil_thread_state == 0) {
+        return PYSTACKS_GIL_STATE_NULL;
+      } else {
+        return PYSTACKS_GIL_STATE_OTHER_THREAD;
+      }
+    default:
+      return PYSTACKS_GIL_STATE_ERROR;
+  }
+}
+
+static int get_thread_state_match(
+    void* this_thread_state,
+    void* global_thread_state) {
+  if (this_thread_state == 0 && global_thread_state == 0) {
+    return PYSTACKS_THREAD_STATE_BOTH_NULL;
+  }
+  if (this_thread_state == 0) {
+    return PYSTACKS_THREAD_STATE_THIS_THREAD_NULL;
+  }
+  if (global_thread_state == 0) {
+    return PYSTACKS_THREAD_STATE_GLOBAL_CURRENT_THREAD_NULL;
+  }
+  if (this_thread_state == global_thread_state) {
+    return PYSTACKS_THREAD_STATE_MATCH;
+  } else {
+    return PYSTACKS_THREAD_STATE_MISMATCH;
+  }
+}
+
+__hidden int pystacks_read_stacks_task(
+    struct pt_regs* ctx,
+    pid_t pid,
+    struct task_struct* task) {
+  if (!ctx) {
+    return -PYSTACKS_PROG_NOT_SUPPORTED;
+  }
+
+  uint64_t sample_ts = bpf_ktime_get_ns();
+
+  // Get inode and pid and filter by them
+  const struct task_struct* cur_task = get_current_task(task);
+
+  PyPidData* pid_data = bpf_map_lookup_elem(&pystacks_pid_config, &pid);
+  if (!pid_data) {
+    struct bpf_lib_binary_id search_key;
+    search_key.inode = BPF_CORE_READ(cur_task, mm, exe_file, f_inode, i_ino);
+    search_key.dev =
+        BPF_CORE_READ(cur_task, mm, exe_file, f_inode, i_sb, s_dev);
+
+    // Is the inode of the task exe one we know to have python statically
+    // linked?
+    pid_data = bpf_map_lookup_elem(&pystacks_binaryid_config, &search_key);
+  }
+  // If this PID is not a python process stack of which we can decode
+  if (!pid_data) {
+    return -PYSTACKS_NON_PY_PROCESS;
+  }
+
+  BPF_LIB_GET_STATE();
+
+  state->offsets = pid_data->offsets;
+  state->cur_cpu = bpf_get_smp_processor_id();
+
+  // The global PyThreadState of the thread holding the GIL, where the
+  // interpreter keeps one (_PyThreadState_Current, 3.11 and older; the
+  // address is left unset from 3.12 on, where it is thread-local). It lives
+  // in the traced process, so it is a user read.
+  void* global_current_thread = (void*)0;
+  if (pid_data->current_state_addr != 0) {
+    bpf_probe_read_user_task(
+        &global_current_thread,
+        sizeof(global_current_thread),
+        (void*)pid_data->current_state_addr,
+        task);
+  }
+
+  // The thread's glibc descriptor, NULL when the thread's registered
+  // pointers do not witness glibc's layout (pthread_helpers.bpf.c).
+  void* tls_base = get_glibc_pthread_descriptor(cur_task);
+
+  struct pystacks_message* py_msg = pystacks_get_msg();
+  if (!py_msg) {
+    return -PYSTACKS_ERROR; /* should never happen */
+  }
+  // zero-initialize struct pystacks_message up to 'buffer' offset
+  memset_zero(py_msg, offsetof(struct pystacks_message, buffer));
+
+  py_msg->header.type = BPF_LIB_PYSTACKS_MESSAGE;
+  py_msg->header.len = offsetof(struct pystacks_message, buffer);
+
+  void* thread_state = 0;
+  if (pid_data->use_tls) {
+    // Read PyThreadState of this Thread from TLS
+    thread_state = get_thread_state(pid_data, task);
+
+    // Check for matching between TLS PyThreadState and
+    // the global _PyThreadState_Current
+    py_msg->thread_state_match =
+        get_thread_state_match(thread_state, global_current_thread);
+
+    // Read GIL state
+    py_msg->gil_state =
+        get_gil_state(thread_state, global_current_thread, pid_data, task);
+
+    // Check for matching between pthread ID created current PyThreadState and
+    // pthread of actual current pthread; without a witnessed descriptor no
+    // slot was read and the thread state above is NULL.
+    py_msg->pthread_id_match = tls_base
+        ? get_pthread_id_match(thread_state, tls_base, pid_data, task)
+        : PYSTACKS_PTHREAD_ID_NO_DESCRIPTOR;
+  } else {
+    // Use the global PyThreadState if native TLS not available
+    thread_state = global_current_thread;
+    py_msg->thread_state_match = PYSTACKS_THREAD_STATE_NOT_USING_TLS;
+    py_msg->pthread_id_match = PYSTACKS_PTHREAD_ID_NOT_USING_TLS;
+  }
+
+  // pre-initialize event struct in case any subprogram below fails
+  py_msg->stack_status = PYSTACKS_STATUS_UNKNOWN;
+  py_msg->async_stack_status = PYSTACKS_STATUS_UNKNOWN;
+
+  /*
+   * No frames to walk: the message is its header alone, and its length says
+   * so to pystacks_read_stacks(), which hands the header over — the
+   * diagnostic bytes (the pthread-id witness above all) are what tells a
+   * thread without a thread state from a descriptor that was not glibc's.
+   */
+  if (!thread_state) {
+    py_msg->probe_time_ns = bpf_ktime_get_ns() - sample_ts;
+    return py_msg->header.len;
+  }
+
+  // Shadow frame usage is determined by availability off shadow frame
+  // related offsets. This condition is the same for both sync and async
+  // python stacks
+  state->sync_use_shadow_frame = use_shadow_frame(&pid_data->offsets);
+
+  // Get pointer to top frame from PyThreadState
+  state->frame_ptr = get_frame_ptr(
+      thread_state, &pid_data->offsets, state->sync_use_shadow_frame, task);
+  if (!state->frame_ptr) {
+    py_msg->probe_time_ns = bpf_ktime_get_ns() - sample_ts;
+    return py_msg->header.len;
+  }
+
+  int py_stack_size = walk_and_load_py_stack(ctx, task);
+
+  py_msg->probe_time_ns = bpf_ktime_get_ns() - sample_ts;
+
+  return py_stack_size;
+}
+
+// global wrapper for verification
+// main function is to get and put the task around pystacks_read_stacks_task
+// call
+int pystacks_read_stacks_global(struct pt_regs* ctx, pid_t pid) {
+  struct task_struct* task;
+  if (get_task(pid, &task))
+    return 0;
+
+  int ret = pystacks_read_stacks_task(ctx, pid, task);
+
+  put_task(task);
+
+  return ret;
+}
+
+// pystacks_read_stacks
+// return :
+//    >= 0 - number of bytes written to buffer
+//    <  0 - error
+// non-global function for verification of destination buffer
+__hidden int pystacks_read_stacks(
+    struct pt_regs* ctx,
+    struct task_struct* task,
+    struct pystacks_message* py_msg_buffer) {
+  // Get TGID in upper 32bit.
+  // Userspace-referred "PID" is TGID for kernel.
+  pid_t pid = task ? BPF_CORE_READ(task, tgid)
+                   : (pid_t)(bpf_get_current_pid_tgid() >> 32);
+
+  if (!profile_pid(pid)) {
+    // process not targeted. Not an error, zero bytes written
+    return 0;
+  }
+
+  struct pystacks_message* py_msg = pystacks_get_msg();
+  if (!py_msg) {
+    return -PYSTACKS_ERROR; /* should never happen */
+  }
+
+  int py_stack_size = pystacks_read_stacks_global(ctx, pid);
+
+  if (py_stack_size == (int)offsetof(struct pystacks_message, buffer)) {
+    /* The walker ran and emitted no frame (no thread state behind the TLS
+     * slot, or an empty frame chain): hand over the header alone, whose
+     * diagnostic bytes — the pthread-id witness above all — say which. A
+     * process that is not Python returns a negative code and leaves the
+     * buffer as the sampler initialised it. */
+    bpf_probe_read_kernel(
+        py_msg_buffer, offsetof(struct pystacks_message, buffer), py_msg);
+    return py_stack_size;
+  }
+
+  if (py_stack_size > 0 && (uint32_t)py_stack_size <= sizeof(*py_msg_buffer)) {
+    /* Use bpf_probe_read_kernel with the fixed struct size to satisfy the
+     * BPF verifier. The verifier needs a compile-time constant or tightly
+     * bounded value for the size parameter. */
+    bpf_probe_read_kernel(py_msg_buffer, sizeof(*py_msg_buffer), py_msg);
+    return py_stack_size;
+  }
+
+  return 0;
+}
+
+struct pystacks_message* pystacks_get_msg(void) {
+  return bpf_map_lookup_elem(&pystacks_msg_heap, &zero);
+}
+
+/* See pystacks.bpf.h for the rationale.
+ *
+ * Note both maps are keyed by tgid, so this is a process-level operation.
+ * Threads (CLONE_THREAD) share their parent's tgid and need no propagation;
+ * they're handled here as a no-op (parent_pid == child_pid).
+ */
+__hidden bool pystacks_propagate_fork(pid_t parent_pid, pid_t child_pid) {
+  if (parent_pid == child_pid) {
+    /* Same tgid -> a new thread, not a forked process. The existing
+     * per-tgid entry already covers it. */
+    return false;
+  }
+
+  PyPidData* cfg = bpf_map_lookup_elem(&pystacks_pid_config, &parent_pid);
+  if (!cfg) {
+    /* Parent isn't a registered Python process — or it is, but its config
+     * was just cleared by pystacks_clear_pid() on exec and userspace hasn't
+     * re-registered it yet. The latter is a real (small) gap: a process that
+     * execs into Python and immediately forks workers before the userspace
+     * exec handler catches up will miss propagation for those early forks.
+     * Closing it would require waiting for userspace acks in the BPF fork
+     * path, which isn't worth the complexity given the window is sub-100ms. */
+    return false;
+  }
+
+  /* The forked child shares the parent's address space (CoW), so the
+   * parent's offsets / runtime addresses are valid for the child until it
+   * execs (at which point pystacks_clear_pid drops this entry).
+   *
+   * Both updates must succeed or neither: a child in targeted_pids without
+   * a pystacks_pid_config entry makes the sampler walk the binary-id
+   * fallback chain on every sample to no effect, and a config entry that
+   * isn't targeted is just a wasted slot. Either map can fill up under
+   * heavy fork churn (1024 entries each); when that happens, fail closed. */
+  if (bpf_map_update_elem(&pystacks_pid_config, &child_pid, cfg, BPF_ANY))
+    return false;
+
+  bool targeted = true;
+  if (bpf_map_update_elem(&targeted_pids, &child_pid, &targeted, BPF_ANY)) {
+    bpf_map_delete_elem(&pystacks_pid_config, &child_pid);
+    return false;
+  }
+
+  return true;
+}
+
+/* See pystacks.bpf.h for the rationale.
+ * bpf_map_delete_elem returns -ENOENT for missing keys; safe to call
+ * unconditionally on every exec from a traced task. */
+__hidden void pystacks_clear_pid(pid_t pid) {
+  bpf_map_delete_elem(&pystacks_pid_config, &pid);
+  bpf_map_delete_elem(&targeted_pids, &pid);
+}

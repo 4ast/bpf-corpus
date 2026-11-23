@@ -1,0 +1,5 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -fwrapv -Icorpus -I../../include/vmlinux -Isrc/bpf -Isrc/pystacks/bpf/include -Isrc/pystacks/bpf -Isrc/task_context/bpf -Icrates/task-context/include
+
+python_function_trace: src/bpf/python_function_trace.bpf.c | $F -DSTROBELIGHT_SLEEPABLE_BPF -Isrc -I../../include
+task_stacks: src/bpf/task_stacks.bpf.c | $F -DSTROBELIGHT_SLEEPABLE_BPF -Isrc -I../../include
+systing_system: src/bpf/systing_system.bpf.c | $F -Isrc -Isrc/golang/bpf -I../../include

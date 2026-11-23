@@ -1,0 +1,4 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Ibpf -I. -I../../include/vmlinux -I../../include
+
+files: bpf/files.c | $F
+tasks: bpf/tasks.c | $F

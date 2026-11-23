@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Copyright (C) 2023 The Falco Authors.
+ *
+ * This file is dual licensed under either the MIT or GPL 2. See MIT.txt
+ * or GPL2.txt for full copies of the license.
+ */
+
+#pragma once
+
+/* Here we have all definitions required both by
+ * BPF programs and `libpman` library.
+ */
+
+/* The auxiliary map can contain events of at most 64 KB.
+ * Here we have 128 KB as dimension to guarantee the verifier
+ * that there are always at least 64 KB free.
+ */
+#define AUXILIARY_MAP_SIZE 128 * 1024
+
+/* Segments of auxiliary map per CPU, so that a build keeps its own across a preemption while
+ * another runs on the same CPU. Userspace sizes the map from this.
+ */
+#define AUXMAP_POOL_DEPTH 2
+
+/* No segment, as an index into `auxiliary_maps`. */
+#define AUXMAP_POOL_NO_SLOT UINT32_MAX
+
+/**
+ * @brief General settings shared among all the CPUs.
+ *
+ */
+struct capture_settings {
+	uint64_t boot_time; /* boot time. */
+	uint32_t snaplen; /* we use it when we want to read a maximum size from an event and no more. */
+	bool dropping_mode;      /* this flag actives the sampling logic */
+	uint32_t sampling_ratio; /* this config tells tracepoints when they have to drop events  */
+	bool drop_failed;        /* whether to drop failed syscalls (exit events) */
+	bool do_dynamic_snaplen; /* enforce snaplen according to the event content */
+	uint16_t fullcapture_port_range_start; /* first interesting port */
+	uint16_t fullcapture_port_range_end;   /* last interesting port */
+	uint16_t statsd_port;                  /* port for statsd metrics */
+	int32_t scap_tid;                      /* tid of the scap process */
+};
+
+/**
+ * @brief This struct will temporally contain the event
+ * before being pushed to userspace. It also contains two
+ * placeholders for the payload position and the lengths position.
+ *
+ * To have more info about the event format, please look at `helpers/base/push_data.h`
+ */
+struct auxiliary_map {
+	uint8_t data[AUXILIARY_MAP_SIZE]; /* raw space to save our variable-size event. */
+	uint64_t payload_pos;             /* position of the first empty byte in the `data` buf. */
+	uint8_t lengths_pos; /* position the first empty slot into the lengths array of the event. */
+	uint16_t event_type; /* event type we want to send to userspace */
+	/* The task building an event in this segment, as bpf_get_current_pid_tgid(), or 0 when no
+	 * build is in flight. */
+	uint64_t owner;
+};
+
+/* These per-cpu maps are used to carry the number of drops and
+ * processed events.
+ */
+
+/**
+ * @brief These per-cpu maps are used to carry the number of dropped and
+ * processed events.
+ */
+struct counter_map {
+	uint64_t n_evts;         /* Number of events correctly sent to userspace. */
+	uint64_t n_drops_buffer; /* Number of drops due to a full ringbuf. */
+	/* Kernel side drops due to full buffer for categories of system calls. Not all system calls of
+	 * interest are mapped into one of the categories. */
+	uint64_t n_drops_buffer_clone_fork_exit;
+	uint64_t n_drops_buffer_execve_exit;
+	uint64_t n_drops_buffer_connect_enter;
+	uint64_t n_drops_buffer_connect_exit;
+	uint64_t n_drops_buffer_open_enter;
+	uint64_t n_drops_buffer_open_exit;
+	uint64_t n_drops_buffer_dir_file_exit;
+	uint64_t n_drops_buffer_other_interest_exit; /* Category of other system calls of interest, not
+	                                                all other system calls that did not match a
+	                                                category from above. */
+	uint64_t n_drops_buffer_close_exit;
+	uint64_t n_drops_buffer_proc_exit;
+	uint64_t n_drops_max_event_size; /* Number of drops due to an excessive event size (>64KB). */
+	uint64_t n_drops_auxmap_reentrancy;
+	uint64_t n_drops_auxmap_reentrancy_tail_call;
+	uint64_t n_drops_auxmap_pool_full;
+	/* Builds that resumed in a segment belonging to another CPU's pool, so not a drop: the
+	 * event was delivered. Non-zero means this kernel migrates a preempted filler. */
+	uint64_t n_auxmap_migrations;
+};
+
+/**
+ * @brief Counters accounting the number of dropped and processed iterator events.
+ */
+struct iter_counters {
+	/* Per-program "event processed" counters. */
+
+	uint64_t n_evts_task;
+	uint64_t n_evts_task_file_pipe;
+	uint64_t n_evts_task_file_memfd;
+	uint64_t n_evts_task_file_regular;
+	uint64_t n_evts_task_file_directory;
+	uint64_t n_evts_task_file_socket_inet;
+	uint64_t n_evts_task_file_socket_inet6;
+	uint64_t n_evts_task_file_socket_unix;
+	uint64_t n_evts_task_file_socket_netlink;
+	uint64_t n_evts_task_file_anon_inode;
+
+	uint64_t n_drops_max_event_size; /* Drops due to event size >= `MAX_ITER_EVENT_SIZE`. */
+
+	/* Per-program "event drop" counters. */
+
+	uint64_t n_drops_task;
+	uint64_t n_drops_task_file_pipe;
+	uint64_t n_drops_task_file_memfd;
+	uint64_t n_drops_task_file_regular;
+	uint64_t n_drops_task_file_directory;
+	uint64_t n_drops_task_file_socket_inet;
+	uint64_t n_drops_task_file_socket_inet6;
+	uint64_t n_drops_task_file_socket_unix;
+	uint64_t n_drops_task_file_socket_netlink;
+	uint64_t n_drops_task_file_anon_inode;
+};

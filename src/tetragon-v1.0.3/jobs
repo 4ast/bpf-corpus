@@ -1,0 +1,66 @@
+F = -Ibpf -Ibpf/libbpf -Ibpf/include -Ibpf/lib -Ibpf/errmetrics -Ibpf/glob -D__TARGET_ARCH_x86 -fdebug-default-version=4
+F1 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__MULTI_KPROBE
+F2 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__V61_BPF_PROG
+F3 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__V61_BPF_PROG -D__MULTI_KPROBE
+
+base-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F | core-old
+base-bpf_execve_event: bpf/process/bpf_execve_event.c | $F | core-old
+base-bpf_exit: bpf/process/bpf_exit.c | $F | core-old
+base-bpf_fork: bpf/process/bpf_fork.c | $F | core-old
+base-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F | core-old
+base-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F | core-old
+base-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F | core-old
+base-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F | core-old
+base-bpf_killer: bpf/process/bpf_killer.c | $F | core-old
+base-bpf_loader: bpf/process/bpf_loader.c | $F | core-old
+base-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F | core-old
+base-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F | core-old
+base-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F | core-old
+v53-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_execve_event: bpf/process/bpf_execve_event.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_exit: bpf/process/bpf_exit.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_fork: bpf/process/bpf_fork.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F -D__LARGE_BPF_PROG -D__MULTI_KPROBE | core-old
+v53-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F -D__LARGE_BPF_PROG -D__MULTI_KPROBE | core-old
+v53-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F -D__LARGE_BPF_PROG -D__MULTI_KPROBE | core-old
+v53-bpf_killer: bpf/process/bpf_killer.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_loader: bpf/process/bpf_loader.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F -D__LARGE_BPF_PROG | core-old
+v53-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F -D__LARGE_BPF_PROG | core-old
+v511-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_execve_event: bpf/process/bpf_execve_event.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_exit: bpf/process/bpf_exit.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_fork: bpf/process/bpf_fork.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F1 | core-old
+v511-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F1 | core-old
+v511-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F1 | core-old
+v511-bpf_killer: bpf/process/bpf_killer.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_loader: bpf/process/bpf_loader.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v511-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | core-old
+v61-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F2 | core-old
+v61-bpf_execve_event: bpf/process/bpf_execve_event.c | $F2 | core-old
+v61-bpf_exit: bpf/process/bpf_exit.c | $F2 | core-old
+v61-bpf_fork: bpf/process/bpf_fork.c | $F2 | core-old
+v61-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F2 | core-old
+v61-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F3 | core-old
+v61-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F2 | core-old
+v61-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F3 | core-old
+v61-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F2 | core-old
+v61-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F2 | core-old
+v61-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F3 | core-old
+v61-bpf_killer: bpf/process/bpf_killer.c | $F2 | core-old
+v61-bpf_loader: bpf/process/bpf_loader.c | $F2 | core-old
+v61-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F2 | core-old
+v61-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F2 | core-old
+v61-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F2 | core-old

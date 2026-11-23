@@ -1,0 +1,184 @@
+F = -Ibpf -Ibpf/libbpf -Ibpf/include -Ibpf/lib -Ibpf/errmetrics -Ibpf/glob -D__TARGET_ARCH_x86 -fdebug-default-version=4
+X0 = sec:fentry*=fentry/security_file_open sec:fexit*=fexit/security_file_open
+X1 = sec:fentry*=fentry/vfs_unlink sec:fexit*=fexit/vfs_unlink
+X2 = sec:fentry*=fentry/tcp_sendmsg sec:fexit*=fexit/tcp_sendmsg
+F1 = $F -D__LARGE_BPF_PROG -include ../../include/tetragon-cel-stub.h
+F2 = $F -D__LARGE_BPF_PROG -D__MULTI_KPROBE -include ../../include/tetragon-cel-stub.h
+F3 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -include ../../include/tetragon-cel-stub.h
+F4 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__MULTI_KPROBE -include ../../include/tetragon-cel-stub.h
+F5 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__V61_BPF_PROG -include ../../include/tetragon-cel-stub.h
+F6 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__V61_BPF_PROG -D__MULTI_KPROBE -include ../../include/tetragon-cel-stub.h
+
+base-bpf_cgroup: bpf/process/bpf_cgroup.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_enforcer: bpf/process/bpf_enforcer.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_execve_event: bpf/process/bpf_execve_event.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_execve_event_notc: bpf/process/bpf_execve_event_notc.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_execve_map_update: bpf/process/bpf_execve_map_update.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_exit: bpf/process/bpf_exit.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_fork: bpf/process/bpf_fork.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_generic_fentry@security_file_open: bpf/process/bpf_generic_fentry.c | $F -include ../../include/tetragon-cel-stub.h | $X0
+base-bpf_generic_fentry@vfs_unlink: bpf/process/bpf_generic_fentry.c | $F -include ../../include/tetragon-cel-stub.h | $X1
+base-bpf_generic_fentry@tcp_sendmsg: bpf/process/bpf_generic_fentry.c | $F -include ../../include/tetragon-cel-stub.h | $X2
+base-bpf_generic_fexit@security_file_open: bpf/process/bpf_generic_fexit.c | $F -include ../../include/tetragon-cel-stub.h | $X0
+base-bpf_generic_fexit@vfs_unlink: bpf/process/bpf_generic_fexit.c | $F -include ../../include/tetragon-cel-stub.h | $X1
+base-bpf_generic_fexit@tcp_sendmsg: bpf/process/bpf_generic_fexit.c | $F -include ../../include/tetragon-cel-stub.h | $X2
+base-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_generic_lsm_core@file_open: bpf/process/bpf_generic_lsm_core.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm*=lsm/file_open
+base-bpf_generic_lsm_core@bprm_check_security: bpf/process/bpf_generic_lsm_core.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm*=lsm/bprm_check_security
+base-bpf_generic_lsm_core@inode_unlink: bpf/process/bpf_generic_lsm_core.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm*=lsm/inode_unlink
+base-bpf_generic_lsm_core@socket_connect: bpf/process/bpf_generic_lsm_core.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm*=lsm/socket_connect
+base-bpf_generic_lsm_ima_bprm@bprm_check_security: bpf/process/bpf_generic_lsm_ima_bprm.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm.s*=lsm.s/bprm_check_security
+base-bpf_generic_lsm_ima_bprm@bprm_creds_for_exec: bpf/process/bpf_generic_lsm_ima_bprm.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm.s*=lsm.s/bprm_creds_for_exec
+base-bpf_generic_lsm_ima_file@file_open: bpf/process/bpf_generic_lsm_ima_file.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm.s*=lsm.s/file_open
+base-bpf_generic_lsm_output@file_open: bpf/process/bpf_generic_lsm_output.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm*=lsm/file_open
+base-bpf_generic_lsm_output@bprm_check_security: bpf/process/bpf_generic_lsm_output.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm*=lsm/bprm_check_security
+base-bpf_generic_lsm_output@inode_unlink: bpf/process/bpf_generic_lsm_output.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm*=lsm/inode_unlink
+base-bpf_generic_lsm_output@socket_connect: bpf/process/bpf_generic_lsm_output.c | $F -include ../../include/tetragon-cel-stub.h | sec:lsm*=lsm/socket_connect
+base-bpf_generic_rawtp: bpf/process/bpf_generic_rawtp.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_generic_retuprobe: bpf/process/bpf_generic_retuprobe.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_generic_usdt: bpf/process/bpf_generic_usdt.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_loader: bpf/process/bpf_loader.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_map_test_p1: bpf/process/bpf_map_test_p1.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_map_test_p2: bpf/process/bpf_map_test_p2.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_map_test_p3: bpf/process/bpf_map_test_p3.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_prog_iter: bpf/process/bpf_prog_iter.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F -include ../../include/tetragon-cel-stub.h
+base-bpf_cgtracker: bpf/cgroup/bpf_cgtracker.c | $F -include ../../include/tetragon-cel-stub.h
+v53-bpf_cgroup: bpf/process/bpf_cgroup.c | $F1
+v53-bpf_enforcer: bpf/process/bpf_enforcer.c | $F1
+v53-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F1
+v53-bpf_execve_event: bpf/process/bpf_execve_event.c | $F1
+v53-bpf_execve_event_notc: bpf/process/bpf_execve_event_notc.c | $F1
+v53-bpf_execve_map_update: bpf/process/bpf_execve_map_update.c | $F1
+v53-bpf_exit: bpf/process/bpf_exit.c | $F1
+v53-bpf_fork: bpf/process/bpf_fork.c | $F1
+v53-bpf_generic_fentry@security_file_open: bpf/process/bpf_generic_fentry.c | $F1 | $X0
+v53-bpf_generic_fentry@vfs_unlink: bpf/process/bpf_generic_fentry.c | $F1 | $X1
+v53-bpf_generic_fentry@tcp_sendmsg: bpf/process/bpf_generic_fentry.c | $F1 | $X2
+v53-bpf_generic_fexit@security_file_open: bpf/process/bpf_generic_fexit.c | $F1 | $X0
+v53-bpf_generic_fexit@vfs_unlink: bpf/process/bpf_generic_fexit.c | $F1 | $X1
+v53-bpf_generic_fexit@tcp_sendmsg: bpf/process/bpf_generic_fexit.c | $F1 | $X2
+v53-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F1
+v53-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F2
+v53-bpf_generic_lsm_core@file_open: bpf/process/bpf_generic_lsm_core.c | $F1 | sec:lsm*=lsm/file_open
+v53-bpf_generic_lsm_core@bprm_check_security: bpf/process/bpf_generic_lsm_core.c | $F1 | sec:lsm*=lsm/bprm_check_security
+v53-bpf_generic_lsm_core@inode_unlink: bpf/process/bpf_generic_lsm_core.c | $F1 | sec:lsm*=lsm/inode_unlink
+v53-bpf_generic_lsm_core@socket_connect: bpf/process/bpf_generic_lsm_core.c | $F1 | sec:lsm*=lsm/socket_connect
+v53-bpf_generic_lsm_ima_bprm@bprm_check_security: bpf/process/bpf_generic_lsm_ima_bprm.c | $F1 | sec:lsm.s*=lsm.s/bprm_check_security
+v53-bpf_generic_lsm_ima_bprm@bprm_creds_for_exec: bpf/process/bpf_generic_lsm_ima_bprm.c | $F1 | sec:lsm.s*=lsm.s/bprm_creds_for_exec
+v53-bpf_generic_lsm_ima_file@file_open: bpf/process/bpf_generic_lsm_ima_file.c | $F1 | sec:lsm.s*=lsm.s/file_open
+v53-bpf_generic_lsm_output@file_open: bpf/process/bpf_generic_lsm_output.c | $F1 | sec:lsm*=lsm/file_open
+v53-bpf_generic_lsm_output@bprm_check_security: bpf/process/bpf_generic_lsm_output.c | $F1 | sec:lsm*=lsm/bprm_check_security
+v53-bpf_generic_lsm_output@inode_unlink: bpf/process/bpf_generic_lsm_output.c | $F1 | sec:lsm*=lsm/inode_unlink
+v53-bpf_generic_lsm_output@socket_connect: bpf/process/bpf_generic_lsm_output.c | $F1 | sec:lsm*=lsm/socket_connect
+v53-bpf_generic_rawtp: bpf/process/bpf_generic_rawtp.c | $F1
+v53-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F1
+v53-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F2
+v53-bpf_generic_retuprobe: bpf/process/bpf_generic_retuprobe.c | $F1
+v53-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F1
+v53-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F1
+v53-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F2
+v53-bpf_generic_usdt: bpf/process/bpf_generic_usdt.c | $F1
+v53-bpf_loader: bpf/process/bpf_loader.c | $F1
+v53-bpf_map_test_p1: bpf/process/bpf_map_test_p1.c | $F1
+v53-bpf_map_test_p2: bpf/process/bpf_map_test_p2.c | $F1
+v53-bpf_map_test_p3: bpf/process/bpf_map_test_p3.c | $F1
+v53-bpf_prog_iter: bpf/process/bpf_prog_iter.c | $F1
+v53-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F1
+v53-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F1
+v53-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F1
+v53-bpf_cgtracker: bpf/cgroup/bpf_cgtracker.c | $F1
+v511-bpf_cgroup: bpf/process/bpf_cgroup.c | $F3
+v511-bpf_enforcer: bpf/process/bpf_enforcer.c | $F3
+v511-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F3
+v511-bpf_execve_event: bpf/process/bpf_execve_event.c | $F3
+v511-bpf_execve_event_notc: bpf/process/bpf_execve_event_notc.c | $F3
+v511-bpf_execve_map_update: bpf/process/bpf_execve_map_update.c | $F3
+v511-bpf_exit: bpf/process/bpf_exit.c | $F3
+v511-bpf_fork: bpf/process/bpf_fork.c | $F3
+v511-bpf_generic_fentry@security_file_open: bpf/process/bpf_generic_fentry.c | $F3 | $X0
+v511-bpf_generic_fentry@vfs_unlink: bpf/process/bpf_generic_fentry.c | $F3 | $X1
+v511-bpf_generic_fentry@tcp_sendmsg: bpf/process/bpf_generic_fentry.c | $F3 | $X2
+v511-bpf_generic_fexit@security_file_open: bpf/process/bpf_generic_fexit.c | $F3 | $X0
+v511-bpf_generic_fexit@vfs_unlink: bpf/process/bpf_generic_fexit.c | $F3 | $X1
+v511-bpf_generic_fexit@tcp_sendmsg: bpf/process/bpf_generic_fexit.c | $F3 | $X2
+v511-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F3
+v511-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F4
+v511-bpf_generic_lsm_core@file_open: bpf/process/bpf_generic_lsm_core.c | $F3 | sec:lsm*=lsm/file_open
+v511-bpf_generic_lsm_core@bprm_check_security: bpf/process/bpf_generic_lsm_core.c | $F3 | sec:lsm*=lsm/bprm_check_security
+v511-bpf_generic_lsm_core@inode_unlink: bpf/process/bpf_generic_lsm_core.c | $F3 | sec:lsm*=lsm/inode_unlink
+v511-bpf_generic_lsm_core@socket_connect: bpf/process/bpf_generic_lsm_core.c | $F3 | sec:lsm*=lsm/socket_connect
+v511-bpf_generic_lsm_ima_bprm@bprm_check_security: bpf/process/bpf_generic_lsm_ima_bprm.c | $F3 | sec:lsm.s*=lsm.s/bprm_check_security
+v511-bpf_generic_lsm_ima_bprm@bprm_creds_for_exec: bpf/process/bpf_generic_lsm_ima_bprm.c | $F3 | sec:lsm.s*=lsm.s/bprm_creds_for_exec
+v511-bpf_generic_lsm_ima_file@file_open: bpf/process/bpf_generic_lsm_ima_file.c | $F3 | sec:lsm.s*=lsm.s/file_open
+v511-bpf_generic_lsm_output@file_open: bpf/process/bpf_generic_lsm_output.c | $F3 | sec:lsm*=lsm/file_open
+v511-bpf_generic_lsm_output@bprm_check_security: bpf/process/bpf_generic_lsm_output.c | $F3 | sec:lsm*=lsm/bprm_check_security
+v511-bpf_generic_lsm_output@inode_unlink: bpf/process/bpf_generic_lsm_output.c | $F3 | sec:lsm*=lsm/inode_unlink
+v511-bpf_generic_lsm_output@socket_connect: bpf/process/bpf_generic_lsm_output.c | $F3 | sec:lsm*=lsm/socket_connect
+v511-bpf_generic_rawtp: bpf/process/bpf_generic_rawtp.c | $F3
+v511-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F3
+v511-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F4
+v511-bpf_generic_retuprobe: bpf/process/bpf_generic_retuprobe.c | $F3
+v511-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F3
+v511-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F3
+v511-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F4
+v511-bpf_generic_usdt: bpf/process/bpf_generic_usdt.c | $F3
+v511-bpf_loader: bpf/process/bpf_loader.c | $F3
+v511-bpf_map_test_p1: bpf/process/bpf_map_test_p1.c | $F3
+v511-bpf_map_test_p2: bpf/process/bpf_map_test_p2.c | $F3
+v511-bpf_map_test_p3: bpf/process/bpf_map_test_p3.c | $F3
+v511-bpf_prog_iter: bpf/process/bpf_prog_iter.c | $F3
+v511-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F3
+v511-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F3
+v511-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F3
+v511-bpf_cgtracker: bpf/cgroup/bpf_cgtracker.c | $F3
+v61-bpf_cgroup: bpf/process/bpf_cgroup.c | $F5
+v61-bpf_enforcer: bpf/process/bpf_enforcer.c | $F5
+v61-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F5
+v61-bpf_execve_event: bpf/process/bpf_execve_event.c | $F5
+v61-bpf_execve_event_notc: bpf/process/bpf_execve_event_notc.c | $F5
+v61-bpf_execve_map_update: bpf/process/bpf_execve_map_update.c | $F5
+v61-bpf_exit: bpf/process/bpf_exit.c | $F5
+v61-bpf_fork: bpf/process/bpf_fork.c | $F5
+v61-bpf_generic_fentry@security_file_open: bpf/process/bpf_generic_fentry.c | $F5 | $X0
+v61-bpf_generic_fentry@vfs_unlink: bpf/process/bpf_generic_fentry.c | $F5 | $X1
+v61-bpf_generic_fentry@tcp_sendmsg: bpf/process/bpf_generic_fentry.c | $F5 | $X2
+v61-bpf_generic_fexit@security_file_open: bpf/process/bpf_generic_fexit.c | $F5 | $X0
+v61-bpf_generic_fexit@vfs_unlink: bpf/process/bpf_generic_fexit.c | $F5 | $X1
+v61-bpf_generic_fexit@tcp_sendmsg: bpf/process/bpf_generic_fexit.c | $F5 | $X2
+v61-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F5
+v61-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F6
+v61-bpf_generic_lsm_core@file_open: bpf/process/bpf_generic_lsm_core.c | $F5 | sec:lsm*=lsm/file_open
+v61-bpf_generic_lsm_core@bprm_check_security: bpf/process/bpf_generic_lsm_core.c | $F5 | sec:lsm*=lsm/bprm_check_security
+v61-bpf_generic_lsm_core@inode_unlink: bpf/process/bpf_generic_lsm_core.c | $F5 | sec:lsm*=lsm/inode_unlink
+v61-bpf_generic_lsm_core@socket_connect: bpf/process/bpf_generic_lsm_core.c | $F5 | sec:lsm*=lsm/socket_connect
+v61-bpf_generic_lsm_ima_bprm@bprm_check_security: bpf/process/bpf_generic_lsm_ima_bprm.c | $F5 | sec:lsm.s*=lsm.s/bprm_check_security
+v61-bpf_generic_lsm_ima_bprm@bprm_creds_for_exec: bpf/process/bpf_generic_lsm_ima_bprm.c | $F5 | sec:lsm.s*=lsm.s/bprm_creds_for_exec
+v61-bpf_generic_lsm_ima_file@file_open: bpf/process/bpf_generic_lsm_ima_file.c | $F5 | sec:lsm.s*=lsm.s/file_open
+v61-bpf_generic_lsm_output@file_open: bpf/process/bpf_generic_lsm_output.c | $F5 | sec:lsm*=lsm/file_open
+v61-bpf_generic_lsm_output@bprm_check_security: bpf/process/bpf_generic_lsm_output.c | $F5 | sec:lsm*=lsm/bprm_check_security
+v61-bpf_generic_lsm_output@inode_unlink: bpf/process/bpf_generic_lsm_output.c | $F5 | sec:lsm*=lsm/inode_unlink
+v61-bpf_generic_lsm_output@socket_connect: bpf/process/bpf_generic_lsm_output.c | $F5 | sec:lsm*=lsm/socket_connect
+v61-bpf_generic_rawtp: bpf/process/bpf_generic_rawtp.c | $F5
+v61-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F5
+v61-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F6
+v61-bpf_generic_retuprobe: bpf/process/bpf_generic_retuprobe.c | $F5
+v61-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F5
+v61-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F5
+v61-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F6
+v61-bpf_generic_usdt: bpf/process/bpf_generic_usdt.c | $F5
+v61-bpf_loader: bpf/process/bpf_loader.c | $F5
+v61-bpf_map_test_p1: bpf/process/bpf_map_test_p1.c | $F5
+v61-bpf_map_test_p2: bpf/process/bpf_map_test_p2.c | $F5
+v61-bpf_map_test_p3: bpf/process/bpf_map_test_p3.c | $F5
+v61-bpf_prog_iter: bpf/process/bpf_prog_iter.c | $F5
+v61-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F5
+v61-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F5
+v61-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F5
+v61-bpf_cgtracker: bpf/cgroup/bpf_cgtracker.c | $F5

@@ -1,0 +1,1 @@
+kprobe_pwru: bpf/kprobe_pwru.c | -D__TARGET_ARCH_x86 -D__x86_64__ -DOUTPUT_SKB -DHAS_KPROBE_MULTI -Ibpf -Ibpf/headers -I../../include | sec:fentry/tc=fentry/netif_receive_skb sec:fentry/xdp=fentry/xdp_master_redirect sec:fexit/xdp=fexit/xdp_master_redirect

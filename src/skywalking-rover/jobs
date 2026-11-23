@@ -1,0 +1,6 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+accesslog: bpf/accesslog/accesslog.c | $F -Ibpf/accesslog -Ibpf -I. -I../../include/vmlinux -Ibpf/accesslog/l24 -Ibpf/accesslog/tls -Ibpf/accesslog/common -Ibpf/accesslog/process -Ibpf/accesslog/ambient -Ibpf/accesslog/syscalls -Ibpf/include -Ibpf/profiling -Ibpf/profiling/network -Ibpf/profiling/continuous -I../../include
+nf: bpf/accesslog/l24/nf.c | $F -Ibpf/accesslog/l24 -Ibpf/accesslog -Ibpf -I. -I../../include/vmlinux -Ibpf/accesslog/tls -Ibpf/accesslog/common -Ibpf/accesslog/process -Ibpf/accesslog/ambient -Ibpf/accesslog/syscalls -Ibpf/include -Ibpf/profiling -Ibpf/profiling/network -Ibpf/profiling/continuous -I../../include
+network: bpf/profiling/continuous/network.c | $F -Ibpf/profiling/continuous -Ibpf/profiling -Ibpf -I. -I../../include/vmlinux -Ibpf/profiling/network -Ibpf/include -Ibpf/accesslog/l24 -Ibpf/accesslog/tls -Ibpf/accesslog/common -Ibpf/accesslog/process -Ibpf/accesslog/ambient -Ibpf/accesslog/syscalls -I../../include
+netmonitor: bpf/profiling/network/netmonitor.c | $F -Ibpf/profiling/network -Ibpf/profiling -Ibpf -I. -I../../include/vmlinux -Ibpf/profiling/continuous -Ibpf/include -Ibpf/accesslog/l24 -Ibpf/accesslog/tls -Ibpf/accesslog/common -Ibpf/accesslog/process -Ibpf/accesslog/ambient -Ibpf/accesslog/syscalls -I../../include

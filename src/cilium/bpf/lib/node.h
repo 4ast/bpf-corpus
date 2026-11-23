@@ -1,0 +1,114 @@
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Cilium */
+
+#pragma once
+
+#include <linux/bpf.h>
+#include <bpf/section.h>
+#include <bpf/loader.h>
+
+#include "eps.h"
+
+struct node_key {
+	__u16 pad1;
+	__u8 pad2;
+	__u8 family;
+	union {
+		union v4addr ip4;
+		union v6addr ip6;
+	};
+};
+
+struct node_value {
+	__u16 id;
+	__u8  spi;
+	__u8  internalip:1,
+	      reserved:7;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct node_key);
+	__type(value, struct node_value);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG_COND);
+} cilium_node_map_v2 __section_maps_btf;
+
+static __always_inline const struct node_value *
+lookup_ip4_node(__be32 ip4)
+{
+	struct node_key key = {};
+
+	key.family = ENDPOINT_KEY_IPV4;
+	key.ip4.be32 = ip4;
+
+	return map_lookup_elem(&cilium_node_map_v2, &key);
+}
+
+static __always_inline __u16
+lookup_ip4_node_id(__be32 ip4)
+{
+	const struct node_value *node_value;
+
+	node_value = lookup_ip4_node(ip4);
+	if (!node_value)
+		return 0;
+	if (!node_value->id)
+		return 0;
+	return node_value->id;
+}
+
+static __always_inline bool
+is_internal_node_ip(__be32 ip4)
+{
+	const struct node_value *node_value;
+
+	node_value = lookup_ip4_node(ip4);
+	if (!node_value)
+		return false;
+	return node_value->internalip;
+}
+
+static __always_inline const struct node_value *
+lookup_ip6_node(const union v6addr *ip6)
+{
+	struct node_key key = {};
+
+	key.family = ENDPOINT_KEY_IPV6;
+	key.ip6 = *ip6;
+
+	return map_lookup_elem(&cilium_node_map_v2, &key);
+}
+
+static __always_inline __u16
+lookup_ip6_node_id(const union v6addr *ip6)
+{
+	const struct node_value *node_value;
+
+	node_value = lookup_ip6_node(ip6);
+	if (!node_value)
+		return 0;
+	if (!node_value->id)
+		return 0;
+	return node_value->id;
+}
+
+static __always_inline __u16
+is_internal_node_ip6(const union v6addr *ip6)
+{
+	const struct node_value *node_value;
+
+	node_value = lookup_ip6_node(ip6);
+	if (!node_value)
+		return false;
+	return node_value->internalip;
+}
+
+static __always_inline const struct node_value *
+lookup_node(const struct remote_endpoint_info *info)
+{
+	if (is_defined(ENABLE_IPV6) && info->flag_ipv6_tunnel_ep)
+		return lookup_ip6_node(&info->tunnel_endpoint.ip6);
+	return lookup_ip4_node(info->tunnel_endpoint.ip4.be32);
+}

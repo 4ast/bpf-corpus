@@ -1,0 +1,4 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+cgroup_bpf: below/cgroupfs/src/bpf/cgroup_bpf.bpf.c | $F -Ibelow/cgroupfs/src/bpf -Ibelow/cgroupfs/src -Ibelow/cgroupfs -Ibelow -I. -Ibelow/vmlinux -I../../include
+exitstat: below/src/bpf/exitstat.bpf.c | $F -Ibelow/src/bpf -Ibelow/src -Ibelow -I. -Ibelow/vmlinux -I../../include | Os?hidden

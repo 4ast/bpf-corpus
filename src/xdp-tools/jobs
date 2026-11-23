@@ -1,0 +1,16 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+F1 = $F -Ilib/libxdp/tests -Ilib/libxdp -Ilib -I. -Iheaders -Iheaders/bpf -I../../include
+F2 = $F -Ilib/testing -Ilib -I. -Iheaders -Iheaders/bpf -I../../include
+
+xsk_def_xdp_prog: lib/libxdp/xsk_def_xdp_prog.c | $F -Ilib/libxdp -Ilib -I. -Iheaders -Iheaders/bpf -I../../include
+xsk_def_xdp_prog_5.3: lib/libxdp/xsk_def_xdp_prog_5.3.c | $F -Ilib/libxdp -Ilib -I. -Iheaders -Iheaders/bpf -I../../include
+xdp_dispatcher_v1: lib/libxdp/tests/xdp_dispatcher_v1.c | $F1
+xdp_dispatcher_v2: lib/libxdp/tests/xdp_dispatcher_v2.c | $F1
+lib_libxdp_tests-xdp_pass: lib/libxdp/tests/xdp_pass.c | $F1
+test_long_func_name: lib/testing/test_long_func_name.c | $F2
+xdp_adjust_tail: lib/testing/xdp_adjust_tail.c | $F2
+xdp_drop: lib/testing/xdp_drop.c | $F2
+lib_testing-xdp_pass: lib/testing/xdp_pass.c | $F2
+xdpsock: lib/util/xdpsock.bpf.c | $F -Ilib/util -Ilib -I. -Iheaders -Iheaders/bpf -I../../include
+xdpdump_xdp: xdp-dump/xdpdump_xdp.c | $F -Ixdp-dump -I. -Iheaders -Iheaders/bpf -I../../include
+xdp_forward: xdp-forward/xdp_forward.bpf.c | $F -Ixdp-forward -I. -Iheaders -Iheaders/bpf -I../../include

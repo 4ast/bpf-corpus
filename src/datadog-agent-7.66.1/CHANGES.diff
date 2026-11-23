@@ -1,0 +1,15 @@
+--- a/pkg/security/ebpf/c/include/perf_ring.h
++++ b/pkg/security/ebpf/c/include/perf_ring.h
+@@ -16,7 +16,11 @@
+     u64 usage;
+ };
+ 
+-BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 33554432); } events SEC(".maps");
++#else
++ BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#endif
+ BPF_PERCPU_ARRAY_MAP(events_stats, struct perf_map_stats_t, EVENT_MAX)
+ 
+ #if USE_RING_BUFFER == 1

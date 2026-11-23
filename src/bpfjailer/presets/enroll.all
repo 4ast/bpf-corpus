@@ -1,0 +1,3 @@
+bpfj_enroll_tgid = 1000
+bpfj_enroll_caller_pid = 999
+bpfj_enroll_all_threads = 1

@@ -1,0 +1,321 @@
+#ifndef _HELPERS_SYSCALLS_H_
+#define _HELPERS_SYSCALLS_H_
+
+#include "constants/custom.h"
+#include "maps.h"
+
+#include "events.h"
+#include "activity_dump.h"
+#include "span.h"
+#include "cgroup.h"
+#include <uapi/linux/filter.h>
+
+
+#define SYSCALL_CTX_STR_TYPE 1
+#define SYSCALL_CTX_INT_TYPE 2
+
+#define SYSCALL_CTX_ARG(type, pos) (type << (pos * 2))
+#define SYSCALL_CTX_ARG_STR(pos) SYSCALL_CTX_ARG(SYSCALL_CTX_STR_TYPE, pos)
+#define SYSCALL_CTX_ARG_INT(pos) SYSCALL_CTX_ARG(SYSCALL_CTX_INT_TYPE, pos)
+#define SYSCALL_CTX_ARG_MASK(pos) (SYSCALL_CTX_ARG_STR(pos) | SYSCALL_CTX_ARG_INT(pos))
+
+#define IS_SYSCALL_CTX_ARG(types, type, pos) (types & (type << (pos * 2)))
+#define IS_SYSCALL_CTX_ARG_STR(types, pos) IS_SYSCALL_CTX_ARG(types, SYSCALL_CTX_STR_TYPE, pos)
+#define IS_SYSCALL_CTX_ARG_INT(types, pos) IS_SYSCALL_CTX_ARG(types, SYSCALL_CTX_INT_TYPE, pos)
+
+static void __attribute__((always_inline)) collect_syscall_ctx(struct syscall_cache_t *syscall, u8 types, void *arg1, void *arg2, void *arg3) {
+    u32 key = 0;
+    u32 *id = bpf_map_lookup_elem(&syscall_ctx_gen_id, &key);
+    if (!id) {
+        return;
+    }
+    __sync_fetch_and_add(id, 1);
+
+    key = *id % MAX_SYSCALL_CTX_ENTRIES;
+    char *data = bpf_map_lookup_elem(&syscall_ctx, &key);
+    if (!data) {
+        return;
+    }
+
+    u32 *id_ptr = (u32 *)&data[0];
+    id_ptr[0] = *id;
+
+    u8 effective_types = 0;
+
+    if (arg1) {
+        effective_types |= (types & SYSCALL_CTX_ARG_MASK(0));
+        if (IS_SYSCALL_CTX_ARG_STR(types, 0)) {
+            bpf_probe_read_str(&data[5], MAX_SYSCALL_ARG_MAX_SIZE, arg1);
+        } else {
+            s64 *addr = (s64 *)&data[5];
+            addr[0] = *(s64 *)arg1;
+        }
+    }
+
+    if (arg2) {
+        effective_types |= (types & SYSCALL_CTX_ARG_MASK(1));
+        if (IS_SYSCALL_CTX_ARG_STR(types, 1)) {
+            bpf_probe_read_str(&data[5 + MAX_SYSCALL_ARG_MAX_SIZE], MAX_SYSCALL_ARG_MAX_SIZE, arg2);
+        } else {
+            s64 *addr = (s64 *)&data[5 + MAX_SYSCALL_ARG_MAX_SIZE];
+            addr[0] = *(s64 *)arg2;
+        }
+    }
+
+    if (arg3) {
+        effective_types |= (types & SYSCALL_CTX_ARG_MASK(2));
+        if (IS_SYSCALL_CTX_ARG_STR(types, 2)) {
+            bpf_probe_read_str(&data[5 + MAX_SYSCALL_ARG_MAX_SIZE * 2], MAX_SYSCALL_ARG_MAX_SIZE, arg3);
+        } else {
+            s64 *addr = (s64 *)&data[5 + MAX_SYSCALL_ARG_MAX_SIZE * 2];
+            addr[0] = *(s64 *)arg3;
+        }
+    }
+
+    data[4] = effective_types;
+
+    syscall->ctx_id = *id;
+}
+
+static void __attribute__((always_inline)) monitor_syscalls(u64 event_type, int delta) {
+    u64 enabled;
+    LOAD_CONSTANT("monitor_syscalls_map_enabled", enabled);
+
+    if (!enabled) {
+        return;
+    }
+
+    u32 key = 0;
+    u32 *value = bpf_map_lookup_elem(&syscalls_stats_enabled, &key);
+    if (value == NULL || !*value) {
+        return;
+    }
+
+    key = event_type;
+    struct syscalls_stats_t *stats = bpf_map_lookup_elem(&syscalls_stats, &key);
+    if (stats == NULL) {
+        return;
+    }
+    if (delta < 0 && !stats->active) {
+        return;
+    }
+    stats->active = 1;
+
+    __sync_fetch_and_add(&stats->count, delta);
+}
+
+static struct policy_t __attribute__((always_inline)) fetch_policy(u64 event_type) {
+    struct policy_t *policy = bpf_map_lookup_elem(&filter_policy, &event_type);
+    if (policy) {
+        return *policy;
+    }
+    struct policy_t empty_policy = {};
+    return empty_policy;
+}
+
+// cache_syscall caches the syscall struct for the current task. Hook points that don't
+// follow up with another tail call should prefer cache_syscall_update_cgroup so the cached
+// cgroup inode is also refreshed.
+static void __attribute__((always_inline)) cache_syscall(void *ctx, struct syscall_cache_t *syscall) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+
+    // handle kill action
+    send_signal(pid);
+
+#if USE_SYSCALL_TASK_STORAGE == 1
+    u64 use_syscall_task_storage;
+    LOAD_CONSTANT("use_syscall_task_storage", use_syscall_task_storage);
+    if (use_syscall_task_storage) { // deadcode elimination will remove one of these branches
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+        bpf_task_storage_delete(&syscalls, task);
+        bpf_task_storage_get(&syscalls, task, syscall, BPF_LOCAL_STORAGE_GET_F_CREATE);
+        monitor_syscalls(syscall->type, 1);
+        return;
+    }
+#endif
+    bpf_map_update_elem(&syscalls, &pid_tgid, syscall, BPF_ANY);
+    monitor_syscalls(syscall->type, 1);
+}
+
+// cache_syscall_update_cgroup caches the syscall struct and then tail-calls
+// update_proc_cache_cgroup. It must be the very last function call in each hook point that
+// uses it: on success the tail call replaces the running program.
+static void __attribute__((always_inline)) cache_syscall_update_cgroup(void *ctx, struct syscall_cache_t *syscall) {
+    cache_syscall(ctx, syscall);
+
+    // keep the cached cgroup inode in sync with the kernel's view: a process may have
+    // migrated to a new cgroup since proc_cache was populated, and downstream consumers
+    // (cgroup/container context resolution) rely on this field being current.
+    bpf_tail_call_compat(ctx, &cache_syscall_progs, CACHE_SYSCALL_UPDATE_PROC_CACHE_CGROUP_KEY);
+}
+
+static struct syscall_cache_t *__attribute__((always_inline)) get_syscall(u64 pid_tgid) {
+#if USE_SYSCALL_TASK_STORAGE == 1
+    u64 use_syscall_task_storage;
+    LOAD_CONSTANT("use_syscall_task_storage", use_syscall_task_storage);
+    if (use_syscall_task_storage) { // deadcode elimination will remove one of these branches
+        return (struct syscall_cache_t *)bpf_task_storage_get(&syscalls, bpf_get_current_task_btf(), NULL, 0);
+    }
+#endif
+    return (struct syscall_cache_t *)bpf_map_lookup_elem(&syscalls, &pid_tgid);
+}
+
+static void __attribute__((always_inline)) delete_syscall(u64 pid_tgid) {
+#if USE_SYSCALL_TASK_STORAGE == 1
+    u64 use_syscall_task_storage;
+    LOAD_CONSTANT("use_syscall_task_storage", use_syscall_task_storage);
+    if (use_syscall_task_storage) { // deadcode elimination will remove one of these branches
+        bpf_task_storage_delete(&syscalls, bpf_get_current_task_btf());
+        return;
+    }
+#endif
+    bpf_map_delete_elem(&syscalls, &pid_tgid);
+}
+
+static struct syscall_cache_t *__attribute__((always_inline)) peek_task_syscall(u64 pid_tgid, u64 type) {
+    struct syscall_cache_t *syscall = get_syscall(pid_tgid);
+    if (!syscall) {
+        return NULL;
+    }
+    if (!type || syscall->type == type) {
+        return syscall;
+    }
+    return NULL;
+}
+
+static struct syscall_cache_t *__attribute__((always_inline)) peek_syscall(u64 type) {
+    u64 key = bpf_get_current_pid_tgid();
+    return peek_task_syscall(key, type);
+}
+
+static struct syscall_cache_t *__attribute__((always_inline)) peek_syscall_with(int (*predicate)(u64 type)) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct syscall_cache_t *syscall = get_syscall(pid_tgid);
+    if (!syscall) {
+        return NULL;
+    }
+    if (predicate(syscall->type)) {
+        return syscall;
+    }
+    return NULL;
+}
+
+// The pop helpers deliberately return nothing: the entry they delete is a map value, and the
+// pointer to it is dangling the moment it is deleted, so peek for the entry and pop it once
+// the last field has been read.
+static void __attribute__((always_inline)) pop_syscall_with(int (*predicate)(u64 type)) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct syscall_cache_t *syscall = get_syscall(pid_tgid);
+    if (!syscall) {
+        return;
+    }
+
+    if (predicate(syscall->type)) {
+        u64 event_type = syscall->type;
+        delete_syscall(pid_tgid);
+        monitor_syscalls(event_type, -1);
+    }
+}
+
+static void __attribute__((always_inline)) pop_task_syscall(u64 pid_tgid, u64 type) {
+    struct syscall_cache_t *syscall = get_syscall(pid_tgid);
+    if (!syscall) {
+        return;
+    }
+    u64 event_type = syscall->type; // fixes 4.14 verifier issue
+    if (!type || event_type == type) {
+        delete_syscall(pid_tgid);
+        monitor_syscalls(event_type, -1);
+    }
+}
+
+static void __attribute__((always_inline)) pop_syscall(u64 type) {
+    u64 key = bpf_get_current_pid_tgid();
+#if defined(DEBUG_SYSCALLS)
+    if (!peek_task_syscall(key, type)) {
+        bpf_printk("Failed to pop syscall with type %d", type);
+    }
+#endif
+    pop_task_syscall(key, type);
+}
+
+// the following functions must use the {peek,pop}_current_or_impersonated_exec_syscall to retrieve the syscall context
+// because the task performing the exec syscall may change its pid in the flush_old_exec() kernel function
+
+// Key of the task that entered the execve being completed, or 0. The tgid/pid guards alone
+// also match a sibling thread's leftover slot, hence the task comparison.
+static u64 __attribute__((always_inline)) impersonated_exec_key(u64 pid_tgid) {
+    u32 tgid = pid_tgid >> 32;
+    u32 pid = pid_tgid;
+
+    struct exec_pid_transfer_t *transfer = (struct exec_pid_transfer_t *)bpf_map_lookup_elem(&exec_pid_transfer, &tgid);
+    if (!transfer) {
+        return 0;
+    }
+
+    u32 tgid_execing = transfer->pid_tgid >> 32;
+    u32 pid_execing = transfer->pid_tgid;
+    if (tgid != tgid_execing || pid == pid_execing) {
+        return 0;
+    }
+
+    if (transfer->task != bpf_get_current_task()) {
+        return 0;
+    }
+
+    return transfer->pid_tgid;
+}
+
+static struct syscall_cache_t *__attribute__((always_inline)) peek_current_or_impersonated_exec_syscall() {
+#if USE_SYSCALL_TASK_STORAGE == 1
+    u64 use_syscall_task_storage;
+    LOAD_CONSTANT("use_syscall_task_storage", use_syscall_task_storage);
+    if (use_syscall_task_storage) { // deadcode elimination will remove one of these branches
+        // task storage is keyed on the task_struct, which is stable across flush_old_exec()'s
+        // thread-leader impersonation (de_thread only swaps the pid numbers, not the task), so
+        // a plain lookup on the current task always finds the cached syscall. The exec_pid_transfer
+        // fallback below is only needed to recover the changed pid_tgid key of the syscalls map.
+        return peek_syscall(EVENT_EXEC);
+    }
+#endif
+    struct syscall_cache_t *syscall = peek_syscall(EVENT_EXEC);
+    if (!syscall) {
+        u64 pid_tgid_execing = impersonated_exec_key(bpf_get_current_pid_tgid());
+        if (pid_tgid_execing == 0) {
+            return NULL;
+        }
+        syscall = peek_task_syscall(pid_tgid_execing, EVENT_EXEC);
+    }
+    return syscall;
+}
+
+static void __attribute__((always_inline)) pop_current_or_impersonated_exec_syscall() {
+#if USE_SYSCALL_TASK_STORAGE == 1
+    u64 use_syscall_task_storage;
+    LOAD_CONSTANT("use_syscall_task_storage", use_syscall_task_storage);
+    if (use_syscall_task_storage) { // deadcode elimination will remove one of these branches
+        // see peek_current_or_impersonated_exec_syscall: task storage keys on the task_struct,
+        // which survives thread-leader impersonation, so the exec_pid_transfer fallback is redundant.
+        pop_syscall(EVENT_EXEC);
+        return;
+    }
+#endif
+    if (peek_syscall(EVENT_EXEC) != NULL) {
+        // popping the slot's entry here would consume a sibling's in-flight exec
+        pop_syscall(EVENT_EXEC);
+        return;
+    }
+
+    u64 pid_tgid_execing = impersonated_exec_key(bpf_get_current_pid_tgid());
+    if (pid_tgid_execing != 0) {
+        pop_task_syscall(pid_tgid_execing, EVENT_EXEC);
+    }
+}
+
+static __attribute__((always_inline)) int capture_all_errors_enabled(void) {
+    u64 captured;
+    LOAD_CONSTANT("capture_all_errors_enabled", captured);
+    return captured != 0;
+}
+#endif

@@ -1,0 +1,1 @@
+recorder: internal/pkg/daemon/bpfrecorder/bpf/recorder.bpf.c | -D__TARGET_ARCH_x86 -D__x86_64__ -Iinternal/pkg/daemon/bpfrecorder/bpf -Iinternal/pkg/daemon/bpfrecorder -Iinternal/pkg/daemon -Iinternal/pkg -Iinternal -I. -Iinternal/pkg/daemon/bpfrecorder/vmlinux/x86 -I../../include

@@ -1,0 +1,7 @@
+key_size = 16
+seed_count = 1
+seed_keys[0] = 1
+seed_key_tails[0] = 9
+seed_vals[0] = 10
+lookup_key = 1
+lookup_key_tail = 9

@@ -1,0 +1,83 @@
+--- a/pkg/ebpf/c/compiler.h
++++ b/pkg/ebpf/c/compiler.h
+@@ -33,6 +33,8 @@
+  * eliminates a bpf_map_lookup_elem per kprobe hit. The constants are best accessed with a
+  * dedicated inlined function.
+  */
++#ifndef LOAD_CONSTANT
+ #define LOAD_CONSTANT(param, var) asm("%0 = " param " ll" : "=r"(var))
++#endif
+ 
+ #endif /* __BPF_COMPILER_H_ */
+--- a/pkg/network/ebpf/c/sk/maps.h
++++ b/pkg/network/ebpf/c/sk/maps.h
+@@ -10,7 +10,7 @@
+ BPF_SK_STORAGE_MAP(sk_tcp_stats, sk_tcp_stats_t);
+ BPF_SK_STORAGE_MAP(sk_udp_stats, sk_udp_stats_t);
+ // will always be upgraded to ringbuffer
+-BPF_PERF_EVENT_ARRAY_MAP(conn_close_event, __u32);
++BPF_RINGBUF_MAP(conn_close_event, 1);
+ BPF_HASH_MAP(port_bindings, port_binding_t, __u32, 0)
+ BPF_HASH_MAP(udp_port_bindings, port_binding_t, __u32, 0)
+ 
+--- a/pkg/security/ebpf/c/include/constants/macros.h
++++ b/pkg/security/ebpf/c/include/constants/macros.h
+@@ -1,8 +1,10 @@
+ #ifndef _CONSTANTS_MACROS_H
+ #define _CONSTANTS_MACROS_H
+ 
++#ifndef LOAD_CONSTANT
+ #define LOAD_CONSTANT(param, var) asm("%0 = " param " ll" \
+                                       : "=r"(var))
++#endif
+ #define IS_UNHANDLED_ERROR(retval) !capture_all_errors_enabled() && retval < 0 && retval != -EACCES && retval != -EPERM
+ #define IS_ERR(ptr) ((unsigned long)(ptr) > (unsigned long)(-1000))
+ #define IS_KTHREADD(pid) (pid == 2)
+--- a/pkg/security/ebpf/c/include/maps.h
++++ b/pkg/security/ebpf/c/include/maps.h
+@@ -101,7 +101,11 @@
+ BPF_LRU_MAP(syscall_table, struct syscall_table_key_t, u8, 50)
+ BPF_LRU_MAP(kill_list, u32, u32, 32)
+ BPF_LRU_MAP(user_sessions, struct user_session_key_t, struct user_session_t, 1024)
+-BPF_LRU_MAP(dentry_resolver_inputs, u64, struct dentry_resolver_input_t, 256) // will be changed to BPF_TASK_STORAGE_MAP if USE_SYSCALL_TASK_STORAGE is set to 1 at runtime
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_TASK_STORAGE); __uint(map_flags, 1 /* BPF_F_NO_PREALLOC */); __type(key, int); __type(value, struct dentry_resolver_input_t); } dentry_resolver_inputs SEC(".maps");
++#else
++ BPF_LRU_MAP(dentry_resolver_inputs, u64, struct dentry_resolver_input_t, 256) // will be changed to BPF_TASK_STORAGE_MAP if USE_SYSCALL_TASK_STORAGE is set to 1 at runtime
++#endif
+ BPF_LRU_MAP(ns_flow_to_network_stats, struct namespaced_flow_t, struct network_stats_t, 4096) // TODO: size should be updated dynamically with "nf_conntrack_max"
+ BPF_LRU_MAP(sock_meta, void *, struct sock_meta_t, 4096);
+ BPF_LRU_MAP(dns_responses_sent_to_userspace, u16, struct dns_responses_sent_to_userspace_lru_entry_t, 1024)
+@@ -111,9 +115,17 @@
+ BPF_LRU_MAP(memfd_tracking, struct memfd_key_t, u32, 1024)
+ 
+ BPF_LRU_MAP_FLAGS(tasks_in_coredump, u64, u8, 64, BPF_F_NO_COMMON_LRU)
+-BPF_LRU_MAP_FLAGS(syscalls, u64, struct syscall_cache_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime. Will be changed to BPF_TASK_STORAGE_MAP if USE_SYSCALL_TASK_STORAGE is set to 1 at runtime
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_TASK_STORAGE); __uint(map_flags, 1 /* BPF_F_NO_PREALLOC */); __type(key, int); __type(value, struct syscall_cache_t); } syscalls SEC(".maps");
++#else
++ BPF_LRU_MAP_FLAGS(syscalls, u64, struct syscall_cache_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime. Will be changed to BPF_TASK_STORAGE_MAP if USE_SYSCALL_TASK_STORAGE is set to 1 at runtime
++#endif
+ BPF_LRU_MAP_FLAGS(pathnames, struct path_key_t, struct path_leaf_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime
+-BPF_LRU_MAP_FLAGS(capabilities_contexts, u32, struct capabilities_context_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime. Will be changed to BPF_TASK_STORAGE_MAP if USE_SYSCALL_TASK_STORAGE is set to 1 at runtime
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_TASK_STORAGE); __uint(map_flags, 1 /* BPF_F_NO_PREALLOC */); __type(key, int); __type(value, struct capabilities_context_t); } capabilities_contexts SEC(".maps");
++#else
++ BPF_LRU_MAP_FLAGS(capabilities_contexts, u32, struct capabilities_context_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime. Will be changed to BPF_TASK_STORAGE_MAP if USE_SYSCALL_TASK_STORAGE is set to 1 at runtime
++#endif
+ BPF_LRU_MAP_FLAGS(open_samples, struct process_path_key_t, struct sample_entry_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime
+ BPF_LRU_MAP_FLAGS(pid_path_keys, u32, struct path_key_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime
+ BPF_LRU_MAP_FLAGS(bind_samples, struct bind_connect_sample_key_t, struct sample_entry_t, 1, BPF_F_NO_COMMON_LRU) // max entries will be overridden at runtime
+@@ -177,7 +189,11 @@
+ BPF_PROG_ARRAY(span_fill_progs, 3)
+ BPF_PROG_ARRAY(span_fill_tp_progs, 2)
+ 
+-BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 33554432); } events SEC(".maps");
++#else
++ BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#endif
+ BPF_PERCPU_ARRAY_MAP(events_stats, struct perf_map_stats_t, EVENT_MAX)
+ 
+ #if USE_RING_BUFFER == 1

@@ -1,0 +1,5 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Ipkg/bpf/c -Ipkg/bpf -I../../include
+
+restricted-file: pkg/bpf/c/restricted-file.bpf.c | $F
+restricted-mount: pkg/bpf/c/restricted-mount.bpf.c | $F
+restricted-network: pkg/bpf/c/restricted-network.bpf.c | $F

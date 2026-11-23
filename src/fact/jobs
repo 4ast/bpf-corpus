@@ -1,0 +1,4 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -D__TARGET_ARCH_x86_64 -Ifact-ebpf/src/bpf -Ifact-ebpf/src -Ifact-ebpf -I../../include
+
+checks: fact-ebpf/src/bpf/checks.c | $F | license:GPL
+main: fact-ebpf/src/bpf/main.c | $F

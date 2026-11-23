@@ -1,0 +1,5 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -IKubeArmor/BPF -I../../include/bpf -I../../include/vmlinux -I../../include
+
+enforcer: KubeArmor/BPF/enforcer.bpf.c | $F
+enforcer_path: KubeArmor/BPF/enforcer_path.bpf.c | $F
+probe: KubeArmor/BPF/probe.bpf.c | $F

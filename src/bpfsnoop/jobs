@@ -1,0 +1,12 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Ibpf -I. -I../../include/bpf -I../../include/vmlinux
+
+bpfsnoop: bpf/bpfsnoop.c | $F -Ibpf/headers -I../../include | sec:fexit=fexit/vfs_read !nc?set:CPU_MASK=0 nc?drop:bpfsnoop_fn,bpfsnoop_kmulti
+bpfsnoop_fgraph: bpf/bpfsnoop_fgraph.c | $F -Ibpf/headers -I../../include | sec:fexit=fexit/vfs_read
+bpfsnoop_insn: bpf/bpfsnoop_insn.c | $F -Ibpf/headers -I../../include
+bpfsnoop_kmulti: bpf/bpfsnoop_kmulti.c | $F -Ibpf/headers -I../../include | !nc?set:CPU_MASK=0 nc?drop:bpfsnoop_fn,bpfsnoop_kmulti
+feature: bpf/feature.c | $F -I../../include
+read: bpf/read.c | $F -I../../include
+tailcall: bpf/tailcall.c | $F -I../../include
+traceable: bpf/traceable.c | $F -I../../include
+tracepoint: bpf/tracepoint.c | $F -I../../include
+tracepoint_module: bpf/tracepoint_module.c | $F -I../../include

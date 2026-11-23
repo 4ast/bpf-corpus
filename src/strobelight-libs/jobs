@@ -1,0 +1,6 @@
+L = strobelight/bpf_lib
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Dint8_t=s8 -fms-extensions \
+    -I../../include/vmlinux -I../../include -I../../include/bpf -I.
+
+pystacks_sample: $L/samples/pystacks/pystacks_sample.bpf.c $L/common/*.bpf.c \
+    $L/python/pystacks/pystacks.bpf.c | $F

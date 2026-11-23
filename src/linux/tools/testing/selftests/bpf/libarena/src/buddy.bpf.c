@@ -1,0 +1,1514 @@
+// SPDX-License-Identifier: LGPL-2.1 OR BSD-2-Clause
+/* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
+
+#include <libarena/common.h>
+#include <libarena/asan.h>
+#include <libarena/buddy.h>
+
+#include <bpf_arena_spin_lock.h>
+#include <bpf_experimental.h>
+
+_Static_assert(BUDDY_CACHE_MAX_CPUS == _Q_MAX_CPUS,
+	       "buddy caches must cover every CPU arena spinlocks support");
+
+/*
+ * Buddy allocator arena-based implementation.
+ *
+ * Memory is organized into chunks. These chunks
+ * cannot be coalesced or split. Allocating
+ * chunks allocates their memory eagerly.
+ *
+ * Internally, each chunk is organized into blocks.
+ * Blocks _can_ be coalesced/split, but only inside
+ * the chunk. Each block can be allocated or
+ * unallocated. If allocated, the entire block holds
+ * user data. If unallocated, the block is mostly
+ * invalid memory, with the exception of a header
+ * used for freelist tracking.
+ *
+ * The header is placed at an offset inside the block
+ * to prevent off-by-one errors from the previous block
+ * from trivially overwriting the header. Such an error
+ * is also not catchable by ASAN, since the header remains
+ * valid memory even after the block is freed. It is still
+ * theoretically possible for the header to be corrupted
+ * without being caught by ASAN, but harder.
+ *
+ * Since the allocator needs to track order information for
+ * both allocated and free blocks, and allocated blocks cannot
+ * store a header, the allocator also stores per-chunk order
+ * information in a reserved region at the beginning of the
+ * chunk. The header includes a bitmap with the order of blocks
+ * and their allocation state. It also includes the freelist
+ * heads for the allocation itself.
+ */
+static u8 idx_get_order(struct buddy_chunk __arena *chunk, u64 idx);
+static int idx_is_allocated(struct buddy_chunk __arena *chunk, u64 idx, bool *allocated);
+static u64 arena_next_pow2(__u64 n);
+static u64 size_to_order(size_t size);
+static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size,
+					int order, size_t norder, bool grow);
+static int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr);
+static bool buddy_deferred_free_pending(struct buddy __arena *buddy);
+static void buddy_deferred_free_complete(struct buddy __arena *buddy);
+
+#define buddy_lock(buddy, flags)						\
+	(bpf_in_nmi() ? arena_spin_trylock_irqsave(&(buddy)->lock, (flags)) :	\
+			arena_spin_lock_irqsave(&(buddy)->lock, (flags)))
+#define buddy_unlock(buddy, flags) (arena_spin_unlock_irqrestore(&(buddy)->lock, (flags)))
+
+/*
+ * Per-CPU caching is disabled in ASAN builds because its additional call-chain
+ * stack usage causes instrumented programs to exceed BPF's 512-byte stack limit.
+ */
+#ifdef BPF_ARENA_ASAN
+#define buddy_order_cached(order) false
+#else
+#define buddy_order_cached(order) ((order) < BUDDY_CACHE_NUM_ORDERS)
+#endif
+
+static __always_inline struct buddy_cache __arena *
+buddy_cache_enter(struct buddy __arena *buddy)
+{
+	struct buddy_cache __arena *cache;
+
+	/* The caches only exist between buddy_init() and buddy_destroy(). */
+	cache = buddy->percpu[bpf_get_smp_processor_id()];
+	if (unlikely(!cache))
+		return NULL;
+
+	/*
+	 * No support for cache operations from contexts that interrupted or
+	 * preempted an in-flight operation on the same CPU, just like the
+	 * kernel's BPF memory allocator.
+	 */
+	if (cmpxchg(&cache->active, 0, 1))
+		return NULL;
+
+	return cache;
+}
+
+static __always_inline void buddy_cache_exit(struct buddy_cache __arena *cache)
+{
+	smp_store_release(&cache->active, 0);
+}
+
+static __always_inline void __arena *
+buddy_cache_pop(struct buddy_cache __arena *cache, int order)
+{
+	struct buddy_cache_order __arena *slots;
+	void __arena *addr;
+	u32 elems;
+
+	slots = &cache->orders[order];
+	elems = READ_ONCE(slots->elems);
+	if (!elems)
+		return NULL;
+
+	addr = READ_ONCE(slots->objects[elems - 1]);
+	WRITE_ONCE(slots->elems, elems - 1);
+
+	return addr;
+}
+
+static __always_inline int buddy_cache_push(struct buddy_cache __arena *cache,
+					    int order, void __arena *obj)
+{
+	struct buddy_cache_order __arena *slots;
+	u32 elems;
+
+	slots = &cache->orders[order];
+	elems = READ_ONCE(slots->elems);
+	if (elems >= BUDDY_CACHE_CAPACITY)
+		return -ENOMEM;
+
+	WRITE_ONCE(slots->objects[elems], obj);
+	WRITE_ONCE(slots->elems, elems + 1);
+
+	return 0;
+}
+
+static int buddy_transfer_take_batch(struct buddy __arena *buddy, int order,
+				     struct buddy_cache_order __arena *slots)
+{
+	struct buddy_transfer_order __arena *transfer = &buddy->transfer[order];
+	unsigned long flags;
+	u32 elems, start;
+	unsigned int i;
+	int ret = 0;
+
+	ret = buddy_lock(transfer, flags);
+	if (ret)
+		return -EAGAIN;
+
+	elems = READ_ONCE(transfer->elems);
+	if (elems < BUDDY_CACHE_BATCH_SIZE) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	start = elems - BUDDY_CACHE_BATCH_SIZE;
+	for (i = zero; i < BUDDY_CACHE_BATCH_SIZE && can_loop; i++)
+		WRITE_ONCE(slots->objects[i],
+			   READ_ONCE(transfer->objects[start + i]));
+
+	WRITE_ONCE(transfer->elems, start);
+	WRITE_ONCE(slots->elems, BUDDY_CACHE_BATCH_SIZE);
+
+out_unlock:
+	arena_spin_unlock_irqrestore(&transfer->lock, flags);
+	return ret;
+}
+
+static int buddy_transfer_put_batch(struct buddy __arena *buddy, int order,
+				    struct buddy_cache_order __arena *slots)
+{
+	struct buddy_transfer_order __arena *transfer = &buddy->transfer[order];
+	unsigned long flags;
+	u32 elems, local_elems, start;
+	unsigned int i;
+	int ret = 0;
+
+	ret = buddy_lock(transfer, flags);
+
+	if (ret)
+		return -EAGAIN;
+
+	elems = READ_ONCE(transfer->elems);
+	if (elems > BUDDY_TRANSFER_CAPACITY - BUDDY_CACHE_BATCH_SIZE) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	local_elems = READ_ONCE(slots->elems);
+	if (local_elems < BUDDY_CACHE_BATCH_SIZE) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	start = local_elems - BUDDY_CACHE_BATCH_SIZE;
+	for (i = zero; i < BUDDY_CACHE_BATCH_SIZE && can_loop; i++)
+		WRITE_ONCE(transfer->objects[elems + i],
+			   READ_ONCE(slots->objects[start + i]));
+
+	WRITE_ONCE(slots->elems, start);
+	WRITE_ONCE(transfer->elems, elems + BUDDY_CACHE_BATCH_SIZE);
+
+out_unlock:
+	arena_spin_unlock_irqrestore(&transfer->lock, flags);
+	return ret;
+}
+
+/*
+ * Refill an empty cache from the shared transfer array, or with one trip to the
+ * buddy allocator. Kept out of line so that cache hits do not pay for the refill
+ * path.
+ */
+static __noinline void __arena *
+buddy_cache_refill(struct buddy __arena *buddy, struct buddy_cache __arena *cache,
+		   size_t size, int order)
+{
+	struct buddy_cache_order __arena *slots = &cache->orders[order];
+
+	/* Peek without the lock, buddy_transfer_take_batch() rechecks under it. */
+	if (READ_ONCE(buddy->transfer[order].elems) >= BUDDY_CACHE_BATCH_SIZE &&
+	    !buddy_transfer_take_batch(buddy, order, slots))
+		return buddy_cache_pop(cache, order);
+
+	if (buddy_alloc_bulk_nogrow(buddy, size, BUDDY_CACHE_BATCH_ORDER,
+				    (void __arena * __arena *)slots->objects))
+		return NULL;
+
+	WRITE_ONCE(slots->elems, BUDDY_CACHE_BATCH_SIZE - 1);
+	return slots->objects[BUDDY_CACHE_BATCH_SIZE - 1];
+}
+
+static void __arena *buddy_cache_alloc(struct buddy __arena *buddy, size_t size, size_t order)
+{
+	struct buddy_cache __arena *cache;
+	void __arena *address;
+
+	if (!buddy_order_cached(order))
+		return NULL;
+
+	cache = buddy_cache_enter(buddy);
+	if (!cache)
+		return NULL;
+
+	address = buddy_cache_pop(cache, order);
+	if (!address)
+		address = buddy_cache_refill(buddy, cache, size, order);
+
+	buddy_cache_exit(cache);
+
+	return address;
+}
+
+/*
+ * Retrieve the order of an allocation from the address. Reject addresses
+ * that do not start an allocated block so that the locked path can report
+ * them, instead of caching memory that overlaps a live allocation. Cached
+ * objects stay marked as allocated, so freeing an object that is already
+ * cached is not detected.
+ */
+static int buddy_cache_get_order(void __arena *addr)
+{
+	struct buddy_chunk __arena *chunk;
+	bool allocated;
+	u64 idx;
+
+	if ((u64)addr & (BUDDY_MIN_ALLOC_BYTES - 1))
+		return BUDDY_CHUNK_NUM_ORDERS;
+
+	chunk = (void __arena *)((u64)addr & ~BUDDY_CHUNK_OFFSET_MASK);
+	idx = ((u64)addr & BUDDY_CHUNK_OFFSET_MASK) / BUDDY_MIN_ALLOC_BYTES;
+
+	if (idx_is_allocated(chunk, idx, &allocated) || !allocated)
+		return BUDDY_CHUNK_NUM_ORDERS;
+
+	return idx_get_order(chunk, idx);
+}
+
+/*
+ * Make room in a full cache by moving its top batch to the shared transfer
+ * array, or to the buddy allocator when the array is full or busy, then cache
+ * the freed object. Kept out of line so that frees that fit in the cache do not
+ * pay for it.
+ */
+static __noinline int
+buddy_cache_spill(struct buddy __arena *buddy, struct buddy_cache __arena *cache,
+		  int order, void __arena *addr)
+{
+	struct buddy_cache_order __arena *slots = &cache->orders[order];
+	u32 elems;
+	int ret = -ENOMEM;
+
+	/*
+	 * Peek without the lock, buddy_transfer_put_batch() rechecks under it.
+	 * NMIs just try the transfer lock and return immediately on failure.
+	 */
+	if (READ_ONCE(buddy->transfer[order].elems) <=
+	    BUDDY_TRANSFER_CAPACITY - BUDDY_CACHE_BATCH_SIZE)
+		ret = buddy_transfer_put_batch(buddy, order, slots);
+
+	if (ret) {
+		elems = READ_ONCE(slots->elems) - BUDDY_CACHE_BATCH_SIZE;
+		ret = buddy_free_bulk(buddy, (void __arena * __arena *)&slots->objects[elems],
+				      BUDDY_CACHE_BATCH_SIZE);
+		if (ret)
+			return ret;
+
+		WRITE_ONCE(slots->elems, elems);
+	}
+
+	return buddy_cache_push(cache, order, addr);
+}
+
+static __always_inline int buddy_cache_free(struct buddy __arena *buddy, void __arena *addr)
+{
+	struct buddy_cache __arena *cache;
+	int order;
+	int ret = 0;
+
+	/* Skip the metadata lookup when caching is compiled out. */
+	if (!buddy_order_cached(0))
+		return -EINVAL;
+
+	order = buddy_cache_get_order(addr);
+	if (!buddy_order_cached(order))
+		return -EINVAL;
+
+	cache = buddy_cache_enter(buddy);
+	if (!cache)
+		return -EAGAIN;
+
+	ret = buddy_cache_push(cache, order, addr);
+	if (ret)
+		ret = buddy_cache_spill(buddy, cache, order, addr);
+	buddy_cache_exit(cache);
+
+	return ret;
+}
+
+enum {
+	BUDDY_POISONED = (s8)0xef,
+
+	/* Number of pages to be allocated per chunk. */
+	BUDDY_CHUNK_PAGES	= BUDDY_CHUNK_BYTES / __PAGE_SIZE,
+};
+
+/*
+ * Reserve part of the arena address space for the allocator. We use
+ * this to get aligned addresses for the chunks, since the arena
+ * page alloc kfuncs do not support aligning to a boundary (in this
+ * case 1 MiB, see buddy.h on how this is derived).
+ */
+static int buddy_reserve_arena_vaddr(struct buddy __arena *buddy)
+{
+	buddy->vaddr = 0;
+
+	return bpf_arena_reserve_pages(&arena,
+				       (void __arena *)BUDDY_VADDR_OFFSET,
+				       BUDDY_VADDR_SIZE / __PAGE_SIZE);
+}
+
+/*
+ * Free up any unused address space. Used only during teardown.
+ */
+static void buddy_unreserve_arena_vaddr(struct buddy __arena *buddy)
+{
+	bpf_arena_free_pages(
+		&arena, (void __arena *)(BUDDY_VADDR_OFFSET + buddy->vaddr),
+		(BUDDY_VADDR_SIZE - buddy->vaddr) / __PAGE_SIZE);
+
+	buddy->vaddr = 0;
+}
+
+/*
+ * Carve out part of the reserved address space and hand it over
+ * to the buddy allocator.
+ *
+ * We are assuming the buddy allocator is the only allocator in the
+ * system, so there is no race between this function reserving a
+ * page range and some other allocator actually making the BPF call
+ * to really create and reserve it.
+ *
+ * However, bump allocation must still be atomic because this function
+ * is called without the buddy lock from multiple threads concurrently.
+ */
+__weak int buddy_alloc_arena_vaddr(struct buddy __arena *buddy, u64 *vaddrp)
+{
+	u64 vaddr, old, new;
+
+	if (!buddy || !vaddrp)
+		return -EINVAL;
+
+	do {
+		vaddr = buddy->vaddr;
+		new = vaddr + BUDDY_CHUNK_BYTES;
+
+		if (new > BUDDY_VADDR_SIZE)
+			return -EINVAL;
+
+		old = __sync_val_compare_and_swap(&buddy->vaddr, vaddr, new);
+	} while (old != vaddr && can_loop);
+
+	if (old != vaddr)
+		return -EINVAL;
+
+	*vaddrp = BUDDY_VADDR_OFFSET + vaddr;
+
+	return 0;
+}
+
+static u64 arena_next_pow2(__u64 n)
+{
+	n--;
+	n |= n >> 1;
+	n |= n >> 2;
+	n |= n >> 4;
+	n |= n >> 8;
+	n |= n >> 16;
+	n |= n >> 32;
+	n++;
+
+	return n;
+}
+
+__weak
+int idx_set_allocated(struct buddy_chunk __arena *chunk, u64 idx, bool allocated)
+{
+	bool already_allocated;
+
+	if (unlikely(idx >= BUDDY_CHUNK_ITEMS)) {
+		arena_stderr("setting state of invalid idx (%ld, max %d)\n", idx,
+			     BUDDY_CHUNK_ITEMS);
+		return -EINVAL;
+	}
+
+	already_allocated = chunk->allocated[idx / 8] & (1 << (idx % 8));
+	if (unlikely(already_allocated == allocated)) {
+		arena_stderr("Double %s of idx %ld for chunk %p",
+				allocated ? "alloc" : "free",
+				idx, chunk);
+		return -EINVAL;
+	}
+
+	if (allocated)
+		chunk->allocated[idx / 8] |= 1 << (idx % 8);
+	else
+		chunk->allocated[idx / 8] &= ~(1 << (idx % 8));
+
+	return 0;
+}
+
+static int idx_is_allocated(struct buddy_chunk __arena *chunk, u64 idx, bool *allocated)
+{
+	if (unlikely(idx >= BUDDY_CHUNK_ITEMS)) {
+		arena_stderr("getting state of invalid idx (%llu, max %d)\n", idx,
+			     BUDDY_CHUNK_ITEMS);
+		return -EINVAL;
+	}
+
+	*allocated = chunk->allocated[idx / 8] & (1 << (idx % 8));
+	return 0;
+}
+
+__weak
+int idx_set_order(struct buddy_chunk __arena *chunk, u64 idx, u8 order)
+{
+	u8 prev_order;
+
+	if (unlikely(order >= BUDDY_CHUNK_NUM_ORDERS)) {
+		arena_stderr("setting invalid order %u\n", order);
+		return -EINVAL;
+	}
+
+	if (unlikely(idx >= BUDDY_CHUNK_ITEMS)) {
+		arena_stderr("setting order of invalid idx (%d, max %d)\n", idx,
+			     BUDDY_CHUNK_ITEMS);
+		return -EINVAL;
+	}
+
+	/*
+	 * We store two order instances per byte, one per nibble.
+	 * Retain the existing nibble.
+	 */
+	prev_order = chunk->orders[idx / 2];
+	if (idx & 0x1) {
+		order &= 0xf;
+		order |= (prev_order & 0xf0);
+	} else {
+		order <<= 4;
+		order |= (prev_order & 0xf);
+	}
+
+	chunk->orders[idx / 2] = order;
+
+	return 0;
+}
+
+static u8 idx_get_order(struct buddy_chunk __arena *chunk, u64 idx)
+{
+	u8 result;
+
+	_Static_assert(BUDDY_CHUNK_NUM_ORDERS <= 16,
+		       "order must fit in 4 bits");
+
+	if (unlikely(idx >= BUDDY_CHUNK_ITEMS)) {
+		arena_stderr("getting order of invalid idx %u\n", idx);
+		return BUDDY_CHUNK_NUM_ORDERS;
+	}
+
+	result = chunk->orders[idx / 2];
+
+	return (idx & 0x1) ? (result & 0xf) : (result >> 4);
+}
+
+static void __arena *idx_to_addr(struct buddy_chunk __arena *chunk, size_t idx)
+{
+	u64 address;
+
+	if (unlikely(idx >= BUDDY_CHUNK_ITEMS)) {
+		arena_stderr("translating invalid idx %u\n", idx);
+		return NULL;
+	}
+
+	/*
+	 * The data blocks start in the chunk after the metadata block.
+	 * We find the actual address by indexing into the region at an
+	 * BUDDY_MIN_ALLOC_BYTES granularity, the minimum allowed.
+	 * The index number already accounts for the fact that the first
+	 * blocks in the chunk are occupied by the metadata, so we do
+	 * not need to offset it.
+	 */
+
+	address = (u64)chunk + (idx * BUDDY_MIN_ALLOC_BYTES);
+
+	return (void __arena *)address;
+}
+
+static struct buddy_header __arena *idx_to_header(struct buddy_chunk __arena *chunk, size_t idx)
+{
+	bool allocated;
+	u64 address;
+
+	if (unlikely(idx_is_allocated(chunk, idx, &allocated))) {
+		arena_stderr("accessing invalid idx 0x%lx\n", idx);
+		return NULL;
+	}
+
+	if (unlikely(allocated)) {
+		arena_stderr("accessing allocated idx 0x%lx as header\n", idx);
+		return NULL;
+	}
+
+	address = (u64)idx_to_addr(chunk, idx);
+	if (!address)
+		return NULL;
+
+	/*
+	 * Offset the header within the block. This avoids accidental overwrites
+	 * to the header because of off-by-one errors when using adjacent blocks.
+	 *
+	 * The offset has been chosen as a compromise between ASAN effectiveness
+	 * and allocator granularity:
+	 * 1) ASAN dictates valid data runs are 8-byte aligned.
+	 * 2) We want to keep a low minimum allocation size (currently 16).
+	 *
+	 * As a result, we have only two possible positions for the header: Bytes
+	 * 0 and 8. Keeping the header in byte 0 means off-by-ones from the previous
+	 * block touch the header, and, since the header must be accessible, ASAN
+	 * will not trigger. Keeping the header on byte 8 means off-by-one errors from
+	 * the previous block are caught by ASAN. Negative offsets are rarer, so
+	 * while accesses into the block from the next block are possible, they are
+	 * less probable.
+	 */
+
+	return (struct buddy_header __arena *)(address + BUDDY_HEADER_OFF);
+}
+
+static void header_add_freelist(struct buddy_chunk __arena *chunk, struct buddy_header __arena *header,
+		u64 idx, u8 order)
+{
+	struct buddy_header __arena *tmp_header;
+
+	idx_set_order(chunk, idx, order);
+
+	header->next_index = chunk->freelists[order];
+	header->prev_index = BUDDY_CHUNK_ITEMS;
+
+	if (header->next_index != BUDDY_CHUNK_ITEMS) {
+		tmp_header = idx_to_header(chunk, header->next_index);
+		tmp_header->prev_index = idx;
+	}
+
+	chunk->freelists[order] = idx;
+}
+
+static void header_remove_freelist(struct buddy_chunk __arena  *chunk,
+				   struct buddy_header __arena *header, u8 order)
+{
+	struct buddy_header __arena *tmp_header;
+
+	if (header->prev_index != BUDDY_CHUNK_ITEMS) {
+		tmp_header = idx_to_header(chunk, header->prev_index);
+		tmp_header->next_index = header->next_index;
+	}
+
+	if (header->next_index != BUDDY_CHUNK_ITEMS) {
+		tmp_header = idx_to_header(chunk, header->next_index);
+		tmp_header->prev_index = header->prev_index;
+	}
+
+	/* Pop off the list head if necessary. */
+	if (idx_to_header(chunk, chunk->freelists[order]) == header)
+		chunk->freelists[order] = header->next_index;
+
+	header->prev_index = BUDDY_CHUNK_ITEMS;
+	header->next_index = BUDDY_CHUNK_ITEMS;
+}
+
+static u64 size_to_order(size_t size)
+{
+	u64 order;
+
+	/*
+	 * Legal sizes are [1, 4GiB] (the biggest possible arena).
+	 * Of course, sizes close to GiB are practically impossible
+	 * to fulfill and allocation will fail, but that's taken care
+	 * of by the caller.
+	 */
+
+	if (unlikely(size == 0 || size > (1UL << 32))) {
+		arena_stderr("illegal size request %lu\n", size);
+		return 64;
+	}
+	/*
+	 * To find the order of the allocation we find the first power of two
+	 * >= the requested size, take the log2, then adjust it for the minimum
+	 * allocation size by removing the minimum shift from it. Requests
+	 * smaller than the minimum allocation size are rounded up.
+	 */
+	order = arena_fls(arena_next_pow2(size)) - 1;
+	if (order < BUDDY_MIN_ALLOC_SHIFT)
+		return 0;
+
+	return order - BUDDY_MIN_ALLOC_SHIFT;
+}
+
+__weak
+int add_leftovers_to_freelist(struct buddy_chunk __arena *chunk, u32 cur_idx,
+		u64 min_order, u64 max_order)
+{
+	struct buddy_header __arena *header;
+	u64 ord;
+	u32 idx;
+
+	for (ord = min_order; ord < max_order && can_loop; ord++) {
+		/* Mark the buddy as free and add it to the freelists. */
+		idx = cur_idx + (1 << ord);
+
+		header = idx_to_header(chunk, idx);
+		if (unlikely(!header)) {
+			arena_stderr("idx %u has no header", idx);
+			return -EINVAL;
+		}
+
+		asan_unpoison(header, sizeof(*header));
+
+		header_add_freelist(chunk, header, idx, ord);
+	}
+
+	return 0;
+}
+
+static struct buddy_chunk __arena *buddy_chunk_get(struct buddy __arena *buddy)
+{
+	u64 order, ord, min_order, max_order;
+	struct buddy_chunk __arena  *chunk;
+	unsigned long flags;
+	size_t left;
+	int power2;
+	u64 vaddr;
+	u32 idx;
+	int ret;
+
+	/*
+	 * Step 1:  Allocate a properly aligned chunk, and
+	 * prep it for insertion into the buddy allocator.
+	 * We don't need the allocator lock until step 2.
+	 */
+
+	ret = buddy_alloc_arena_vaddr(buddy, &vaddr);
+	if (ret)
+		return NULL;
+
+	/* Addresses must be aligned to the chunk boundary. */
+	if (vaddr % BUDDY_CHUNK_BYTES)
+		return NULL;
+
+	/* Unreserve the address space. */
+	bpf_arena_free_pages(&arena, (void __arena *)vaddr,
+			     BUDDY_CHUNK_PAGES);
+
+	chunk = bpf_arena_alloc_pages(&arena, (void __arena *)vaddr,
+				      BUDDY_CHUNK_PAGES, NUMA_NO_NODE, 0);
+	if (!chunk) {
+		arena_stderr("[ALLOC FAILED]");
+		return NULL;
+	}
+
+	if (buddy_lock(buddy, flags)) {
+		/*
+		 * We cannot reclaim the vaddr space, but that is ok - this
+		 * operation should always succeed. The error path is to catch
+		 * accidental deadlocks that will cause -ENOMEMs to the program as
+		 * the allocator fails to refill itself, in which case vaddr usage
+		 * is the least of our worries.
+		 */
+		bpf_arena_free_pages(&arena, (void __arena *)vaddr, BUDDY_CHUNK_PAGES);
+		return NULL;
+	}
+
+	asan_poison(chunk, BUDDY_POISONED, BUDDY_CHUNK_PAGES * __PAGE_SIZE);
+
+	/* Unpoison the chunk itself. */
+	asan_unpoison(chunk, sizeof(*chunk));
+
+	/* Mark all freelists as empty. */
+	for (ord = zero; ord < BUDDY_CHUNK_NUM_ORDERS && can_loop; ord++)
+		chunk->freelists[ord] = BUDDY_CHUNK_ITEMS;
+
+	/*
+	 * Initialize the chunk by carving out a page range to hold the metadata
+	 * struct above, then dumping the rest of the pages into the allocator.
+	 */
+
+	_Static_assert(BUDDY_CHUNK_PAGES * __PAGE_SIZE >=
+			       BUDDY_MIN_ALLOC_BYTES *
+				       BUDDY_CHUNK_ITEMS,
+		       "chunk must fit within the allocation");
+
+	/*
+	 * Step 2: Reserve a chunk for the chunk metadata, then breaks
+	 * the rest of the full allocation into the different buckets.
+	 * We allocating the memory by grabbing blocks of progressively
+	 * smaller sizes from the allocator, which are guaranteed to be
+	 * continuous.
+	 *
+	 * This operation also populates the allocator.
+	 *
+	 * Algorithm:
+	 *
+	 * - max_order: The last order allocation we made
+	 * - left: How many bytes are left to allocate
+	 * - cur_index: Current index into the top-level block we are
+	 * allocating from.
+	 *
+	 * Step 3:
+	 * - Find the largest power-of-2 allocation still smaller than left (infimum)
+	 * - Reserve a chunk of that size, along with its buddy
+	 * - For every order from [infimum + 1, last order), carve out a block
+	 *   and put it into the allocator.
+	 *
+	 *  Example: Chunk size 0b1010000 (80 bytes)
+	 *
+	 *  Step 1:
+	 *
+	 *   idx  infimum                             1 << max_order
+	 *   0        64        128                    1 << 20
+	 *   |________|_________|______________________|
+	 *
+	 *   Blocks set aside:
+	 *   	[0, 64)         - Completely allocated
+	 *   	[64, 128)       - Will be further split in the next iteration
+	 *
+	 *   Blocks added to the allocator:
+	 *   	[128, 256)
+	 *   	[256, 512)
+	 *   	...
+	 *   	[1 << 18, 1 << 19)
+	 *   	[1 << 19, 1 << 20)
+	 *
+	 *  Step 2:
+	 *
+	 *   idx  infimum			   idx + 1 << max_order
+	 *   64	      80	96		   	64 + 1 << 6 = 128
+	 *   |________|_________|______________________|
+	 *
+	 *   Blocks set aside:
+	 *   	[64, 80)	- Completely allocated
+	 *
+	 *   Blocks added to the allocator:
+	 *      [80, 96) - left == 0 so the buddy is unused and marked as freed
+	 *   	[96, 128)
+	 */
+	 max_order = BUDDY_CHUNK_NUM_ORDERS;
+	left = sizeof(*chunk);
+	idx = 0;
+	while (left && can_loop) {
+		power2 = arena_fls(left) - 1;
+		/*
+		 * Note: The condition below only triggers to catch serious bugs
+		 * early. There is no sane way to undo any block insertions from
+		 * the allocated chunk, so just leak any leftover allocations,
+		 * emit a diagnostic, unlock and exit.
+		 *
+		 */
+		if (unlikely(power2 >= BUDDY_CHUNK_NUM_ORDERS)) {
+			arena_stderr(
+				"buddy chunk metadata require allocation of order %d\n",
+				power2);
+			arena_stderr(
+				"chunk has size of 0x%lx bytes (left %lx bytes)\n",
+				sizeof(*chunk), left);
+			buddy_unlock(buddy, flags);
+
+			return NULL;
+		}
+
+		/* Round up allocations that are too small. */
+
+		left -= (power2 >= BUDDY_MIN_ALLOC_SHIFT) ? 1 << power2 : left;
+		order = (power2 >= BUDDY_MIN_ALLOC_SHIFT) ? power2 - BUDDY_MIN_ALLOC_SHIFT : 0;
+
+		if (idx_set_allocated(chunk, idx, true)) {
+			buddy_unlock(buddy, flags);
+			return NULL;
+		}
+
+		/*
+		 * Starting an order above the one we allocated, populate
+		 * the allocator with free blocks. If this is the last
+		 * allocation (left == 0), also mark the buddy as free.
+		 *
+		 * See comment above about error handling: The error path
+		 * is only there as a way to mitigate deeply buggy allocator
+		 * states by emitting a diagnostic in add_leftovers_to_freelist()
+		 * and leaking any memory not added in the freelists.
+		 */
+		min_order = left ? order + 1 : order;
+		if (add_leftovers_to_freelist(chunk, idx, min_order, max_order)) {
+			buddy_unlock(buddy, flags);
+			return NULL;
+		}
+
+		/* Adjust the index. */
+		idx += 1 << order;
+		max_order = order;
+	}
+
+	buddy_unlock(buddy, flags);
+
+	return chunk;
+}
+
+static int buddy_cache_init(struct buddy __arena *buddy)
+{
+	struct buddy_cache __arena *cache;
+	unsigned int cpu, order;
+	int ret;
+
+	if (!buddy_order_cached(0))
+		return 0;
+
+	if (CONFIG_NR_CPUS > BUDDY_CACHE_MAX_CPUS)
+		return -E2BIG;
+
+	for (order = zero; order < BUDDY_CACHE_NUM_ORDERS && can_loop; order++)
+		WRITE_ONCE(buddy->transfer[order].elems, 0);
+
+	for (cpu = zero; cpu < CONFIG_NR_CPUS && can_loop; cpu++) {
+		ret = buddy_alloc_bulk(buddy, sizeof(*cache), 0,
+				       (void __arena * __arena *)&buddy->percpu[cpu]);
+		if (ret)
+			return ret;
+
+		cache = buddy->percpu[cpu];
+		WRITE_ONCE(cache->active, 0);
+		for (order = zero; order < BUDDY_CACHE_NUM_ORDERS && can_loop; order++)
+			WRITE_ONCE(cache->orders[order].elems, 0);
+	}
+
+	return 0;
+}
+
+static void buddy_cache_destroy(struct buddy __arena *buddy)
+{
+	unsigned int cpu, order;
+
+	for (cpu = zero; cpu < min(CONFIG_NR_CPUS, BUDDY_CACHE_MAX_CPUS) && can_loop; cpu++)
+		WRITE_ONCE(buddy->percpu[cpu], NULL);
+	for (order = zero; order < BUDDY_CACHE_NUM_ORDERS && can_loop; order++)
+		WRITE_ONCE(buddy->transfer[order].elems, 0);
+}
+
+__weak int buddy_init(struct buddy __arena *buddy)
+{
+	struct buddy_chunk __arena *chunk;
+	unsigned long flags;
+	int ret;
+
+	if (!asan_ready())
+		return -EINVAL;
+	buddy->deferred_free = NULL;
+
+	/* Reserve enough address space to ensure allocations are aligned. */
+	ret = buddy_reserve_arena_vaddr(buddy);
+	if (ret)
+		return ret;
+
+	_Static_assert(BUDDY_CHUNK_PAGES > 0,
+		       "chunk must use one or more pages");
+
+	chunk = buddy_chunk_get(buddy);
+
+	if (buddy_lock(buddy, flags)) {
+		bpf_arena_free_pages(&arena, chunk, BUDDY_CHUNK_PAGES);
+		return -EINVAL;
+	}
+
+	/* Chunk is already properly unpoisoned if allocated. */
+	if (chunk)
+		chunk->next = buddy->first_chunk;
+
+	/* Put the chunk at the beginning of the list. */
+	buddy->first_chunk = chunk;
+
+	buddy_unlock(buddy, flags);
+
+	if (!chunk)
+		return -ENOMEM;
+
+	ret = buddy_cache_init(buddy);
+	if (ret) {
+		buddy_destroy(buddy);
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * Destroy the allocator. This does not check whether there are any allocations
+ * currently in use, so any pages being accessed will start taking arena faults.
+ * We do not take a lock because we are freeing arena pages, and nobody should
+ * be using the allocator at that point in the execution.
+ */
+__weak int buddy_destroy(struct buddy __arena *buddy)
+{
+	struct buddy_chunk __arena *chunk, *next;
+
+	if (!buddy)
+		return -EINVAL;
+
+	buddy_cache_destroy(buddy);
+
+	/*
+	 * Traverse all buddy chunks and free them back to the arena
+	 * with the same granularity they were allocated with.
+	 */
+	for (chunk = buddy->first_chunk; chunk && can_loop; chunk = next) {
+		next = chunk->next;
+
+		/* Wholesale poison the entire block. */
+		asan_poison(chunk, BUDDY_POISONED,
+			    BUDDY_CHUNK_PAGES * __PAGE_SIZE);
+		bpf_arena_free_pages(&arena, chunk, BUDDY_CHUNK_PAGES);
+	}
+
+	/* Free up any part of the address space that did not get used. */
+	buddy_unreserve_arena_vaddr(buddy);
+
+	/* Clear all fields. */
+	buddy->first_chunk = NULL;
+	buddy->deferred_free = NULL;
+
+	return 0;
+}
+
+__weak u64 buddy_chunk_alloc(struct buddy_chunk __arena *chunk, int order_req, int order_allocs)
+{
+	struct buddy_header __arena *header, *tmp_header, *next_header;
+	u32 idx, tmpidx, retidx;
+	u64 address;
+	u64 order = 0;
+	u64 i;
+
+	for (order = order_req + order_allocs; order < BUDDY_CHUNK_NUM_ORDERS && can_loop; order++) {
+		if (chunk->freelists[order] != BUDDY_CHUNK_ITEMS)
+			break;
+	}
+
+	if (order >= BUDDY_CHUNK_NUM_ORDERS)
+		return (u64)NULL;
+
+	retidx = chunk->freelists[order];
+	header = idx_to_header(chunk, retidx);
+	if (unlikely(!header))
+		return (u64) NULL;
+
+	chunk->freelists[order] = header->next_index;
+
+	if (header->next_index != BUDDY_CHUNK_ITEMS) {
+		next_header = idx_to_header(chunk, header->next_index);
+		next_header->prev_index = BUDDY_CHUNK_ITEMS;
+	}
+
+	header->prev_index = BUDDY_CHUNK_ITEMS;
+	header->next_index = BUDDY_CHUNK_ITEMS;
+	/*
+	 * For a bulk allocation, record the allocation state and size
+	 * of each item separately so each can be freed independently.
+	 */
+	for (i = zero, idx = retidx; i < (1U << order_allocs) && can_loop; i++) {
+		if (idx_set_order(chunk, idx, order_req))
+			return (u64)NULL;
+
+		if (idx_set_allocated(chunk, idx, true))
+			return (u64)NULL;
+
+		idx += 1U << order_req;
+	}
+
+	/*
+	 * Do not unpoison the address yet, will be done by the caller
+	 * because the caller has the exact allocation size requested.
+	 */
+	address = (u64)idx_to_addr(chunk, retidx);
+	if (!address)
+		return (u64)NULL;
+
+	/* If we allocated from a larger-order chunk, split the buddies. */
+	for (i = order_req + order_allocs; i < order && can_loop; i++) {
+		/*
+		 * Flip the bit for the current order (the bit is guaranteed
+		 * to be 0, so just add 1 << i).
+		 */
+		idx = retidx + (1 << i);
+
+		/* Add the buddy of the allocation to the free list. */
+		header = idx_to_header(chunk, idx);
+		/* Unpoison the buddy header */
+		asan_unpoison(header, sizeof(*header));
+
+		if (idx_set_order(chunk, idx, i))
+			return (u64)NULL;
+
+		/* Push the header to the beginning of the freelists list. */
+		tmpidx = chunk->freelists[i];
+
+		header->prev_index = BUDDY_CHUNK_ITEMS;
+		header->next_index = tmpidx;
+
+		if (tmpidx != BUDDY_CHUNK_ITEMS) {
+			tmp_header = idx_to_header(chunk, tmpidx);
+			tmp_header->prev_index = idx;
+		}
+
+		chunk->freelists[i] = idx;
+	}
+
+	return address;
+}
+
+/* Scan the existing chunks for available memory. */
+static u64 buddy_alloc_from_existing_chunks(struct buddy __arena *buddy, int order, int norder)
+{
+	struct buddy_chunk __arena *chunk;
+	u64 address;
+
+	for (chunk = buddy->first_chunk; chunk != NULL && can_loop;
+	     chunk = chunk->next) {
+		address = buddy_chunk_alloc(chunk, order, norder);
+		if (address)
+			return address;
+	}
+
+	return (u64)NULL;
+}
+
+/*
+ * Try an allocation from a newly allocated chunk. Also
+ * incorporate the chunk into the linked list.
+ */
+static u64 buddy_alloc_from_new_chunk(struct buddy __arena *buddy, struct buddy_chunk __arena *chunk,
+		int order, int norder)
+{
+	unsigned long flags;
+	u64 address;
+
+	if (buddy_lock(buddy, flags))
+		return (u64)NULL;
+
+	/*
+	 * Add the chunk into the allocator and try
+	 * to allocate specifically from that chunk.
+	 */
+	chunk->next = buddy->first_chunk;
+	buddy->first_chunk = chunk;
+
+	address = buddy_chunk_alloc(buddy->first_chunk, order, norder);
+
+	buddy_unlock(buddy, flags);
+
+	return (u64)address;
+}
+
+static void __arena *buddy_alloc_memory(struct buddy __arena *buddy, size_t size,
+		int order, size_t norder, bool grow)
+{
+	void __arena *address = NULL;
+	u8 __arena *object;
+	struct buddy_chunk __arena *chunk;
+	unsigned int alloc_size;
+	unsigned int i, offset;
+	unsigned long flags;
+
+	if (!buddy)
+		return NULL;
+
+	if (order < 0 || order >= BUDDY_CHUNK_NUM_ORDERS || norder >= BUDDY_CHUNK_NUM_ORDERS - order) {
+		arena_stderr("invalid order %d (norder %lu) (sz %lu)\n", order, norder, size);
+		return NULL;
+	}
+
+	if (buddy_lock(buddy, flags))
+		return NULL;
+
+	if (unlikely(buddy_deferred_free_pending(buddy))) {
+		buddy_deferred_free_complete(buddy);
+	}
+
+	address = (u8 __arena *)buddy_alloc_from_existing_chunks(buddy, order, norder);
+	buddy_unlock(buddy, flags);
+	if (address)
+		goto done;
+
+	if (!grow || bpf_in_nmi())
+		return NULL;
+
+	/* Get a new chunk. */
+	chunk = buddy_chunk_get(buddy);
+	if (chunk)
+		address = (u8 __arena *)buddy_alloc_from_new_chunk(buddy, chunk, order, norder);
+
+done:
+	/* If we failed to allocate memory, return NULL. */
+	if (!address)
+		return NULL;
+
+	alloc_size = BUDDY_MIN_ALLOC_BYTES << order;
+
+	/*
+	 * Unpoison exactly the requested bytes in each allocation. Keep
+	 * the padding between the requested size and the rounded buddy
+	 * allocation poisoned.
+	 */
+	for (i = zero, offset = zero; i < (1U << norder) && can_loop; i++, offset += alloc_size) {
+		object = (u8 __arena *)address + offset;
+
+		if (size < BUDDY_HEADER_OFF + sizeof(struct buddy_header __arena))
+			asan_poison(object + BUDDY_HEADER_OFF,
+				    BUDDY_POISONED,
+				    sizeof(struct buddy_header __arena));
+
+		asan_unpoison(object, size);
+	}
+
+	return address;
+}
+
+__weak
+void __arena *buddy_alloc(struct buddy __arena *buddy, size_t size)
+{
+	void __arena *address;
+	int order;
+
+	if (!buddy)
+		return NULL;
+
+	order = size_to_order(size);
+	address = buddy_cache_alloc(buddy, size, order);
+	if (address)
+		return address;
+
+	return buddy_alloc_memory(buddy, size, order, 0, true);
+}
+
+__weak
+void __arena *buddy_alloc_nogrow(struct buddy __arena *buddy, size_t size)
+{
+	void __arena *address;
+	int order;
+
+	if (!buddy)
+		return NULL;
+
+	order = size_to_order(size);
+	address = buddy_cache_alloc(buddy, size, order);
+	if (address)
+		return address;
+
+	return buddy_alloc_memory(buddy, size, order, 0, false);
+}
+
+__weak
+int buddy_grow(struct buddy __arena *buddy, size_t nr_chunks)
+{
+	struct buddy_chunk __arena *chunk;
+	unsigned long flags;
+	size_t chunk_index;
+
+	if (bpf_in_nmi())
+		return -EOPNOTSUPP;
+
+	for (chunk_index = zero; chunk_index < nr_chunks && can_loop; chunk_index++) {
+		chunk = buddy_chunk_get(buddy);
+		if (!chunk)
+			return -ENOMEM;
+
+		if (buddy_lock(buddy, flags)) {
+			bpf_arena_free_pages(&arena, chunk, BUDDY_CHUNK_PAGES);
+			return -ENOMEM;
+		}
+
+		chunk->next = buddy->first_chunk;
+		buddy->first_chunk = chunk;
+
+		buddy_unlock(buddy, flags);
+	}
+
+	return 0;
+}
+
+static int buddy_alloc_bulk_memory(struct buddy __arena *buddy, size_t size, size_t norder,
+				   void __arena * __arena *out, bool grow)
+{
+	void __arena *address;
+	unsigned int i, off;
+	unsigned int step;
+	int order;
+
+	if (!buddy || !out || norder >= BUDDY_CHUNK_NUM_ORDERS)
+		return -EINVAL;
+
+	/*
+	 * Bulk allocations bypass the per-cpu caches and reserve one buddy
+	 * block covering all returned objects. The buddy metadata records
+	 * each object separately so it can later be freed independently.
+	 */
+	order = size_to_order(size);
+	address = buddy_alloc_memory(buddy, size, order, norder, grow);
+	if (!address)
+		return -ENOMEM;
+
+	step = BUDDY_MIN_ALLOC_BYTES << order;
+	for (i = zero, off = zero; i < (1U << norder) && can_loop; i++, off += step)
+		out[i] = &address[off];
+
+	return 0;
+}
+
+__weak
+int buddy_alloc_bulk(struct buddy __arena *buddy, size_t size, size_t norder,
+		void __arena * __arena *out)
+{
+	return buddy_alloc_bulk_memory(buddy, size, norder, out, true);
+}
+
+__weak
+int buddy_alloc_bulk_nogrow(struct buddy __arena *buddy, size_t size, size_t norder,
+			    void __arena * __arena *out)
+{
+	return buddy_alloc_bulk_memory(buddy, size, norder, out, false);
+}
+
+static __always_inline int buddy_free_unlocked(struct buddy __arena *buddy, u64 addr)
+{
+	struct buddy_header __arena *header, *buddy_header;
+	u64 idx, buddy_idx, tmp_idx;
+	struct buddy_chunk __arena *chunk;
+	bool allocated;
+	u8 order;
+	int ret;
+
+	if (!buddy)
+		return -EINVAL;
+
+	if (addr & (BUDDY_MIN_ALLOC_BYTES - 1)) {
+		arena_stderr("Freeing unaligned address %llx\n", addr);
+		return -EINVAL;
+	}
+
+	/* Get (chunk, idx) out of the address. */
+	chunk = (void __arena *)(addr & ~BUDDY_CHUNK_OFFSET_MASK);
+	idx = (addr & BUDDY_CHUNK_OFFSET_MASK) / BUDDY_MIN_ALLOC_BYTES;
+
+	/* Mark the block as unallocated so we can access the header. */
+	ret = idx_set_allocated(chunk, idx, false);
+	if (ret)
+		return ret;
+
+	order  = idx_get_order(chunk, idx);
+	header = idx_to_header(chunk, idx);
+
+	/* The header is in the block itself, keep it unpoisoned. */
+	asan_poison((u8 __arena *)addr, BUDDY_POISONED,
+		    BUDDY_MIN_ALLOC_BYTES << order);
+	asan_unpoison(header, sizeof(*header));
+
+	/*
+	 * Coalescing loop. Merge with free buddies of equal order.
+	 * For every coalescing step, keep the left buddy and
+	 * drop the right buddy's header.
+	 */
+	for (; order < BUDDY_CHUNK_NUM_ORDERS && can_loop; order++) {
+		buddy_idx = idx ^ (1 << order);
+
+		/* Check if the buddy is actually free. */
+		idx_is_allocated(chunk, buddy_idx, &allocated);
+		if (allocated)
+			break;
+
+		/*
+		 * If buddy is not the same order as the chunk
+		 * being freed, then we're done coalescing.
+		 */
+		if (idx_get_order(chunk, buddy_idx) != order)
+			break;
+
+		buddy_header = idx_to_header(chunk, buddy_idx);
+		header_remove_freelist(chunk, buddy_header, order);
+
+		/* Keep the left header out of the two buddies, drop the other one. */
+		if (buddy_idx < idx) {
+			tmp_idx = idx;
+			idx = buddy_idx;
+			buddy_idx = tmp_idx;
+		}
+
+		/* Remove the buddy from the freelists so that we can merge it. */
+		idx_set_order(chunk, buddy_idx, order);
+
+		buddy_header = idx_to_header(chunk, buddy_idx);
+		asan_poison(buddy_header, BUDDY_POISONED,
+			    sizeof(*buddy_header));
+	}
+
+	/* Header properly freed but not in any freelists yet .*/
+	idx_set_order(chunk, idx, order);
+
+	header = idx_to_header(chunk, idx);
+	header_add_freelist(chunk, header, idx, order);
+
+	return 0;
+}
+
+static bool buddy_deferred_free_pending(struct buddy __arena *buddy)
+{
+	return buddy->deferred_free != NULL;
+}
+
+static __always_inline void buddy_deferred_free_push(struct buddy __arena *buddy,
+						   void __arena *first, void __arena *last)
+{
+	void __arena *head;
+
+	do {
+		head = READ_ONCE(buddy->deferred_free);
+		*(void __arena * __arena *)last = head;
+	} while (cmpxchg((void __arena * __arena *)&buddy->deferred_free,
+			 head, first) != head && can_loop);
+}
+
+static int buddy_deferred_free_start(struct buddy __arena *buddy, void __arena *addr)
+{
+	int order = buddy_cache_get_order(addr);
+
+	if (order >= BUDDY_CHUNK_NUM_ORDERS)
+		return -EINVAL;
+
+	/*
+	 * Make a linked list by chaining the allocations into a linked list.
+	 * Possible because allocations are 16 bytes minimum and so fit a pointer.
+	 */
+	asan_poison(addr, BUDDY_POISONED, BUDDY_MIN_ALLOC_BYTES << order);
+	asan_unpoison(addr, sizeof(void *));
+	buddy_deferred_free_push(buddy, addr, addr);
+	return 0;
+}
+
+static int buddy_deferred_free_start_bulk(struct buddy __arena *buddy,
+		 void __arena * __arena *addrs, size_t naddrs)
+{
+	void __arena *first, *last, *addr;
+	unsigned int i;
+	int ret = 0, order;
+
+	/*
+	 * Chain the allocations into a local linked list. Possible because
+	 * allocations are 16 bytes minimum and so fit a pointer.
+	 */
+	first = NULL;
+	last = NULL;
+	for (i = zero; i < naddrs && can_loop; i++) {
+		addr = addrs[i];
+		if (!addr)
+			continue;
+
+		order = buddy_cache_get_order(addr);
+		if (order >= BUDDY_CHUNK_NUM_ORDERS) {
+			ret = -EINVAL;
+			continue;
+		}
+
+		asan_poison(addr, BUDDY_POISONED, BUDDY_MIN_ALLOC_BYTES << order);
+		asan_unpoison(addr, sizeof(void *));
+
+		if (!first)
+			first = addr;
+		else
+			*(void __arena * __arena *)last = addr;
+
+		last = addr;
+	}
+
+	if (!first)
+		return ret;
+
+	/* Splice the local list onto the deferred-free list. */
+	buddy_deferred_free_push(buddy, first, last);
+	return 0;
+}
+
+static void buddy_deferred_free_complete(struct buddy __arena *buddy)
+{
+	void __arena *head, *old;
+
+	head = __sync_lock_test_and_set((void __arena * __arena *)&buddy->deferred_free,
+					NULL);
+
+	while (head && can_loop) {
+		old = head;
+		head = *(void __arena * __arena *)head;
+
+		buddy_free_unlocked(buddy, (u64)old);
+	}
+}
+
+__weak int buddy_free(struct buddy __arena *buddy, void __arena *addr)
+{
+	unsigned long flags;
+	int ret;
+
+	if (!buddy)
+		return -EINVAL;
+
+	/* Freeing NULL is a valid no-op. */
+	if (!addr)
+		return 0;
+
+	ret = buddy_cache_free(buddy, addr);
+	if (!ret)
+		return 0;
+
+	ret = buddy_lock(buddy, flags);
+	if (ret) {
+		return buddy_deferred_free_start(buddy, addr);
+	}
+
+	ret = buddy_free_unlocked(buddy, (u64)addr);
+
+	/* Drain any frees stranded during NMI/lock failure. */
+	if (unlikely(buddy_deferred_free_pending(buddy))) {
+		buddy_deferred_free_complete(buddy);
+	}
+
+	buddy_unlock(buddy, flags);
+
+	return ret;
+}
+
+/*
+ * Reject a NULL buddy or a NULL address array for a nonempty batch with -EINVAL.
+ * Valid objects are freed under the buddy lock or deferred on lock failure.
+ * Objects that buddy_free_unlocked() rejects are reported there.
+ */
+__weak int buddy_free_bulk(struct buddy __arena *buddy, void __arena * __arena *addrs, size_t naddrs)
+{
+	unsigned long flags;
+	unsigned int i;
+	int ret;
+
+	if (!buddy)
+		return -EINVAL;
+
+	if (!naddrs)
+		return 0;
+
+	if (!addrs)
+		return -EINVAL;
+
+	ret = buddy_lock(buddy, flags);
+	if (ret) {
+		return buddy_deferred_free_start_bulk(buddy, addrs, naddrs);
+	}
+
+	for (i = zero; i < naddrs && can_loop; i++) {
+		/* NULL pointers are ignored. */
+		if (!addrs[i])
+			continue;
+
+		buddy_free_unlocked(buddy, (u64)addrs[i]);
+	}
+
+	/* Drain any frees stranded during an NMI/lock failure. */
+	if (unlikely(buddy_deferred_free_pending(buddy)))
+		buddy_deferred_free_complete(buddy);
+
+	buddy_unlock(buddy, flags);
+
+	return 0;
+}

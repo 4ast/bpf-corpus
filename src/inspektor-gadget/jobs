@@ -1,0 +1,60 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -D__TARGET_ARCH_x86
+
+gadgets_advise_networkpolicy-program: gadgets/advise_networkpolicy/program.bpf.c | $F -Igadgets/advise_networkpolicy -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_advise_seccomp-program: gadgets/advise_seccomp/program.bpf.c | $F -Igadgets/advise_seccomp -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_audit_seccomp-program: gadgets/audit_seccomp/program.bpf.c | $F -Igadgets/audit_seccomp -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_ci_container_filtering-program: gadgets/ci/container_filtering/program.bpf.c | $F -Igadgets/ci/container_filtering -Igadgets/ci -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_ci_datasource-containers-program: gadgets/ci/datasource-containers/program.bpf.c | $F -Igadgets/ci/datasource-containers -Igadgets/ci -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_ci_gpu-program: gadgets/ci/gpu/program.bpf.c | $F -Igadgets/ci/gpu -Igadgets/ci -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_ci_inner_fields-program: gadgets/ci/inner_fields/program.bpf.c | $F -Igadgets/ci/inner_fields -Igadgets/ci -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_ci_sched_cls_drop-program: gadgets/ci/sched_cls_drop/program.bpf.c | $F -Igadgets/ci/sched_cls_drop -Igadgets/ci -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | Os?hidden core-local:gadget_socket_value*
+gadgets_ci_stacks-program: gadgets/ci/stacks/program.bpf.c | $F -Igadgets/ci/stacks -Igadgets/ci -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_ci_test_iter_map_elem-program: gadgets/ci/test_iter_map_elem/program.bpf.c | $F -Igadgets/ci/test_iter_map_elem -Igadgets/ci -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_ci_uprobe-program: gadgets/ci/uprobe/program.bpf.c | $F -Igadgets/ci/uprobe -Igadgets/ci -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_deadlock-program: gadgets/deadlock/program.bpf.c | $F -Igadgets/deadlock -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_fdpass-program: gadgets/fdpass/program.bpf.c | $F -Igadgets/fdpass -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_fsnotify-program: gadgets/fsnotify/program.bpf.c | $F -Igadgets/fsnotify -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_gpu_top-program: gadgets/gpu_top/program.bpf.c | $F -Igadgets/gpu_top -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_gpu_top_per_pid-program: gadgets/gpu_top_per_pid/program.bpf.c | $F -Igadgets/gpu_top_per_pid -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_profile_blockio-program: gadgets/profile_blockio/program.bpf.c | $F -Igadgets/profile_blockio -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_profile_cpu-program: gadgets/profile_cpu/program.bpf.c | $F -Igadgets/profile_cpu -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_profile_cuda-program: gadgets/profile_cuda/program.bpf.c | $F -Igadgets/profile_cuda -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_profile_qdisc_latency-program: gadgets/profile_qdisc_latency/program.bpf.c | $F -Igadgets/profile_qdisc_latency -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_profile_tcprtt-program: gadgets/profile_tcprtt/program.bpf.c | $F -Igadgets/profile_tcprtt -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_snapshot_file-program: gadgets/snapshot_file/program.bpf.c | $F -Igadgets/snapshot_file -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_snapshot_process-program: gadgets/snapshot_process/program.bpf.c | $F -Igadgets/snapshot_process -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_snapshot_socket-program: gadgets/snapshot_socket/program.bpf.c | $F -Igadgets/snapshot_socket -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_tcpdump-program: gadgets/tcpdump/program.bpf.c | $F -Igadgets/tcpdump -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_top_blockio-program: gadgets/top_blockio/program.bpf.c | $F -Igadgets/top_blockio -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_top_cuda_memory-program: gadgets/top_cuda_memory/program.bpf.c | $F -Igadgets/top_cuda_memory -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_top_file-program: gadgets/top_file/program.bpf.c | $F -Igadgets/top_file -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_top_tcp-program: gadgets/top_tcp/program.bpf.c | $F -Igadgets/top_tcp -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_bind-program: gadgets/trace_bind/program.bpf.c | $F -Igadgets/trace_bind -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_capabilities-program: gadgets/trace_capabilities/program.bpf.c | $F -Igadgets/trace_capabilities -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_dns-program: gadgets/trace_dns/program.bpf.c | $F -Igadgets/trace_dns -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_exec-program: gadgets/trace_exec/program.bpf.c | $F -Igadgets/trace_exec -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_fsslower-program: gadgets/trace_fsslower/program.bpf.c | $F -Igadgets/trace_fsslower -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_gpu_starvation-program: gadgets/trace_gpu_starvation/program.bpf.c | $F -Igadgets/trace_gpu_starvation -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_init_module-program: gadgets/trace_init_module/program.bpf.c | $F -Igadgets/trace_init_module -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_link-program: gadgets/trace_link/program.bpf.c | $F -Igadgets/trace_link -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_lsm-program: gadgets/trace_lsm/program.bpf.c | $F -Igadgets/trace_lsm -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_malloc-program: gadgets/trace_malloc/program.bpf.c | $F -Igadgets/trace_malloc -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_mount-program: gadgets/trace_mount/program.bpf.c | $F -Igadgets/trace_mount -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_oomkill-program: gadgets/trace_oomkill/program.bpf.c | $F -Igadgets/trace_oomkill -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_open-program: gadgets/trace_open/program.bpf.c | $F -Igadgets/trace_open -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_rename-program: gadgets/trace_rename/program.bpf.c | $F -Igadgets/trace_rename -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_selinux-program: gadgets/trace_selinux/program.bpf.c | $F -Igadgets/trace_selinux -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_signal-program: gadgets/trace_signal/program.bpf.c | $F -Igadgets/trace_signal -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_sni-program: gadgets/trace_sni/program.bpf.c | $F -Igadgets/trace_sni -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_ssl-program: gadgets/trace_ssl/program.bpf.c | $F -Igadgets/trace_ssl -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_tcp-program: gadgets/trace_tcp/program.bpf.c | $F -Igadgets/trace_tcp -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_tcpdrop-program: gadgets/trace_tcpdrop/program.bpf.c | $F -Igadgets/trace_tcpdrop -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_trace_tcpretrans-program: gadgets/trace_tcpretrans/program.bpf.c | $F -Igadgets/trace_tcpretrans -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_traceloop-program: gadgets/traceloop/program.bpf.c | $F -Igadgets/traceloop -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+gadgets_ttysnoop-program: gadgets/ttysnoop/program.bpf.c | $F -Igadgets/ttysnoop -Igadgets -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+execruntime: pkg/container-hook/bpf/execruntime.bpf.c | $F -Ipkg/container-hook/bpf -Ipkg/container-hook -Ipkg -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+dispatcher: pkg/networktracer/bpf/dispatcher.bpf.c | $F -Ipkg/networktracer/bpf -Ipkg/networktracer -Ipkg -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+pkg_operators_wasm_rusttestdata_perf-program: pkg/operators/wasm/rusttestdata/perf/program.bpf.c | $F -Ipkg/operators/wasm/rusttestdata/perf -Ipkg/operators/wasm/rusttestdata -Ipkg/operators/wasm -Ipkg/operators -Ipkg -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+pkg_operators_wasm_testdata_perf-program: pkg/operators/wasm/testdata/perf/program.bpf.c | $F -Ipkg/operators/wasm/testdata/perf -Ipkg/operators/wasm/testdata -Ipkg/operators/wasm -Ipkg/operators -Ipkg -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+socket-enricher: pkg/socketenricher/bpf/socket-enricher.bpf.c | $F -Ipkg/socketenricher/bpf -Ipkg/socketenricher -Ipkg -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*
+sockets-iter: pkg/socketenricher/bpf/sockets-iter.bpf.c | $F -Ipkg/socketenricher/bpf -Ipkg/socketenricher -Ipkg -I. -Iinclude -Iinclude/gadget/amd64 -I../../include | core-local:gadget_socket_value*

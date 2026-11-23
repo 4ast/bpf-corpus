@@ -1,0 +1,11 @@
+L = ../strobelight-libs/strobelight/bpf_lib
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Dint8_t=s8 -DWPROF_PYSTACKS -fms-extensions -Iinclude -Isrc \
+    -Icorpus -I../../include -I../../include/bpf -I../strobelight-libs
+
+# The user names the function or the BPF program for fentry and fexit.
+# The loader takes wprof_dispatch* on kernels that have the old names of the kfuncs.
+wprof: src/wprof.bpf.c src/utils.bpf.c src/scx.bpf.c $L/common/*.bpf.c \
+    $L/python/pystacks/pystacks.bpf.c | $F | \
+    sec:?fentry=?fentry/bpf_fentry_test1 sec:?fexit=?fexit/bpf_fentry_test1 \
+    drop:wprof_dispatch*
+wprof_query: src/wprof_query.bpf.c | $F

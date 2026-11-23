@@ -1,0 +1,9 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+F1 = $F -I2022-10-bpf-tail-call -I. -I../../include/vmlinux -I../../include
+
+xdp-drop-ebpf: 2018-07-dropping-packets/xdp-drop-ebpf.c | $F -I2018-07-dropping-packets -I. -I../../include/vmlinux -I../../include
+connect4_ebpf: 2022-02-connectx/ebpf_connect4/connect4_ebpf.c | $F -I2022-02-connectx/ebpf_connect4 -I2022-02-connectx -I. -I../../include/vmlinux -I../../include
+sub_call_ex1: 2022-10-bpf-tail-call/sub_call_ex1.bpf.c | $F1
+tail_call_ex1: 2022-10-bpf-tail-call/tail_call_ex1.bpf.c | $F1
+tail_call_ex2: 2022-10-bpf-tail-call/tail_call_ex2.bpf.c | $F1
+tail_call_ex3: 2022-10-bpf-tail-call/tail_call_ex3.bpf.c | $F1

@@ -1,0 +1,11 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+#ifndef __BPF_LIB_PTHREAD_HELPERS_H__
+#define __BPF_LIB_PTHREAD_HELPERS_H__
+
+// @oss-disable: #include <bpf/vmlinux/vmlinux.h>
+#include <vmlinux.h> // @oss-enable
+
+void* get_pthread_specific_data_task(uint32_t key, struct task_struct* task);
+
+#endif // __BPF_LIB_PTHREAD_HELPERS_H__

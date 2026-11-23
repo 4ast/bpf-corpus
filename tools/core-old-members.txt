@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+# Members and types of old kernels, for the fixup core-old. See core.py.
+#
+#   STRUCT.MEMBER = OTHER [TYPE]                MEMBER is at the place of the member OTHER
+#   struct NAME SIZE { TYPE member@BYTE; .. }   a type that is gone
+#
+# The comment is the release that removed it.
+inode.i_atime = i_atime_sec struct timespec64           # 6.7
+inode.__i_atime = i_atime_sec struct timespec64         # 6.11
+inode.i_ctime = i_ctime_sec struct timespec64           # 6.6
+inode.__i_ctime = i_ctime_sec struct timespec64         # 6.11
+inode.i_mtime = i_mtime_sec struct timespec64           # 6.7
+inode.__i_mtime = i_mtime_sec struct timespec64         # 6.11
+mm_struct.user_ns = exe_file struct user_namespace *    # 7.1
+kernfs_node.parent = __parent                           # 6.15
+file_operations.iterate = iterate_shared                # 6.5
+kernel_cap_t.cap = val __u32[2]                         # 6.3
+struct module_layout 16 { void * base@0; unsigned int size@8; unsigned int text_size@12; }
+module.core_layout = mem struct module_layout           # 6.4
+module.init_layout = mem struct module_layout           # 6.4

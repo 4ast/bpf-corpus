@@ -1,0 +1,9 @@
+bpf/             headers of libbpf                       LGPL-2.1 OR BSD-2-Clause
+kernel/          headers of the kernel, for --x86-ir     GPL-2.0
+vmlinux/         bpftool btf dump file vmlinux format c  GPL-2.0
+vmlinux.btf.xz   BTF of the same kernel                  GPL-2.0
+libc/            glibc 2.39                              LGPL-2.1-or-later
+                 uapi headers of Linux 6.8               GPL-2.0 WITH Linux-syscall-note
+
+The first four come from the commit of 'linux' in projects.tsv, built for x86_64
+with kernel.config. Only the files that a compiler reads are here.

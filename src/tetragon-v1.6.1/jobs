@@ -1,0 +1,146 @@
+F = -Ibpf -Ibpf/libbpf -Ibpf/include -Ibpf/lib -Ibpf/errmetrics -Ibpf/glob -D__TARGET_ARCH_x86 -fdebug-default-version=4
+F1 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__MULTI_KPROBE
+F2 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__V61_BPF_PROG
+F3 = $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG -D__V61_BPF_PROG -D__MULTI_KPROBE
+
+base-bpf_cgroup: bpf/process/bpf_cgroup.c | $F
+base-bpf_enforcer: bpf/process/bpf_enforcer.c | $F
+base-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F
+base-bpf_execve_event: bpf/process/bpf_execve_event.c | $F
+base-bpf_execve_map_update: bpf/process/bpf_execve_map_update.c | $F | sec:seccomp=socket
+base-bpf_exit: bpf/process/bpf_exit.c | $F
+base-bpf_fork: bpf/process/bpf_fork.c | $F
+base-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F
+base-bpf_generic_lsm_core@file_open: bpf/process/bpf_generic_lsm_core.c | $F | sec:lsm*=lsm/file_open
+base-bpf_generic_lsm_core@bprm_check_security: bpf/process/bpf_generic_lsm_core.c | $F | sec:lsm*=lsm/bprm_check_security
+base-bpf_generic_lsm_core@inode_unlink: bpf/process/bpf_generic_lsm_core.c | $F | sec:lsm*=lsm/inode_unlink
+base-bpf_generic_lsm_core@socket_connect: bpf/process/bpf_generic_lsm_core.c | $F | sec:lsm*=lsm/socket_connect
+base-bpf_generic_lsm_ima_bprm@bprm_check_security: bpf/process/bpf_generic_lsm_ima_bprm.c | $F | sec:lsm.s*=lsm.s/bprm_check_security
+base-bpf_generic_lsm_ima_bprm@bprm_creds_for_exec: bpf/process/bpf_generic_lsm_ima_bprm.c | $F | sec:lsm.s*=lsm.s/bprm_creds_for_exec
+base-bpf_generic_lsm_ima_file@file_open: bpf/process/bpf_generic_lsm_ima_file.c | $F | sec:lsm.s*=lsm.s/file_open
+base-bpf_generic_lsm_output@file_open: bpf/process/bpf_generic_lsm_output.c | $F | sec:lsm*=lsm/file_open
+base-bpf_generic_lsm_output@bprm_check_security: bpf/process/bpf_generic_lsm_output.c | $F | sec:lsm*=lsm/bprm_check_security
+base-bpf_generic_lsm_output@inode_unlink: bpf/process/bpf_generic_lsm_output.c | $F | sec:lsm*=lsm/inode_unlink
+base-bpf_generic_lsm_output@socket_connect: bpf/process/bpf_generic_lsm_output.c | $F | sec:lsm*=lsm/socket_connect
+base-bpf_generic_rawtp: bpf/process/bpf_generic_rawtp.c | $F
+base-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F
+base-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F
+base-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F
+base-bpf_generic_usdt: bpf/process/bpf_generic_usdt.c | $F
+base-bpf_loader: bpf/process/bpf_loader.c | $F
+base-bpf_map_test_p1: bpf/process/bpf_map_test_p1.c | $F
+base-bpf_map_test_p2: bpf/process/bpf_map_test_p2.c | $F
+base-bpf_map_test_p3: bpf/process/bpf_map_test_p3.c | $F
+base-bpf_prog_iter: bpf/process/bpf_prog_iter.c | $F
+base-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F
+base-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F
+base-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F
+base-bpf_cgtracker: bpf/cgroup/bpf_cgtracker.c | $F
+v53-bpf_cgroup: bpf/process/bpf_cgroup.c | $F -D__LARGE_BPF_PROG
+v53-bpf_enforcer: bpf/process/bpf_enforcer.c | $F -D__LARGE_BPF_PROG
+v53-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F -D__LARGE_BPF_PROG
+v53-bpf_execve_event: bpf/process/bpf_execve_event.c | $F -D__LARGE_BPF_PROG
+v53-bpf_execve_map_update: bpf/process/bpf_execve_map_update.c | $F -D__LARGE_BPF_PROG | sec:seccomp=socket
+v53-bpf_exit: bpf/process/bpf_exit.c | $F -D__LARGE_BPF_PROG
+v53-bpf_fork: bpf/process/bpf_fork.c | $F -D__LARGE_BPF_PROG
+v53-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F -D__LARGE_BPF_PROG
+v53-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F -D__LARGE_BPF_PROG -D__MULTI_KPROBE
+v53-bpf_generic_lsm_core@file_open: bpf/process/bpf_generic_lsm_core.c | $F -D__LARGE_BPF_PROG | sec:lsm*=lsm/file_open
+v53-bpf_generic_lsm_core@bprm_check_security: bpf/process/bpf_generic_lsm_core.c | $F -D__LARGE_BPF_PROG | sec:lsm*=lsm/bprm_check_security
+v53-bpf_generic_lsm_core@inode_unlink: bpf/process/bpf_generic_lsm_core.c | $F -D__LARGE_BPF_PROG | sec:lsm*=lsm/inode_unlink
+v53-bpf_generic_lsm_core@socket_connect: bpf/process/bpf_generic_lsm_core.c | $F -D__LARGE_BPF_PROG | sec:lsm*=lsm/socket_connect
+v53-bpf_generic_lsm_ima_bprm@bprm_check_security: bpf/process/bpf_generic_lsm_ima_bprm.c | $F -D__LARGE_BPF_PROG | sec:lsm.s*=lsm.s/bprm_check_security
+v53-bpf_generic_lsm_ima_bprm@bprm_creds_for_exec: bpf/process/bpf_generic_lsm_ima_bprm.c | $F -D__LARGE_BPF_PROG | sec:lsm.s*=lsm.s/bprm_creds_for_exec
+v53-bpf_generic_lsm_ima_file@file_open: bpf/process/bpf_generic_lsm_ima_file.c | $F -D__LARGE_BPF_PROG | sec:lsm.s*=lsm.s/file_open
+v53-bpf_generic_lsm_output@file_open: bpf/process/bpf_generic_lsm_output.c | $F -D__LARGE_BPF_PROG | sec:lsm*=lsm/file_open
+v53-bpf_generic_lsm_output@bprm_check_security: bpf/process/bpf_generic_lsm_output.c | $F -D__LARGE_BPF_PROG | sec:lsm*=lsm/bprm_check_security
+v53-bpf_generic_lsm_output@inode_unlink: bpf/process/bpf_generic_lsm_output.c | $F -D__LARGE_BPF_PROG | sec:lsm*=lsm/inode_unlink
+v53-bpf_generic_lsm_output@socket_connect: bpf/process/bpf_generic_lsm_output.c | $F -D__LARGE_BPF_PROG | sec:lsm*=lsm/socket_connect
+v53-bpf_generic_rawtp: bpf/process/bpf_generic_rawtp.c | $F -D__LARGE_BPF_PROG
+v53-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F -D__LARGE_BPF_PROG
+v53-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F -D__LARGE_BPF_PROG -D__MULTI_KPROBE
+v53-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F -D__LARGE_BPF_PROG
+v53-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F -D__LARGE_BPF_PROG
+v53-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F -D__LARGE_BPF_PROG -D__MULTI_KPROBE
+v53-bpf_generic_usdt: bpf/process/bpf_generic_usdt.c | $F -D__LARGE_BPF_PROG
+v53-bpf_loader: bpf/process/bpf_loader.c | $F -D__LARGE_BPF_PROG
+v53-bpf_map_test_p1: bpf/process/bpf_map_test_p1.c | $F -D__LARGE_BPF_PROG
+v53-bpf_map_test_p2: bpf/process/bpf_map_test_p2.c | $F -D__LARGE_BPF_PROG
+v53-bpf_map_test_p3: bpf/process/bpf_map_test_p3.c | $F -D__LARGE_BPF_PROG
+v53-bpf_prog_iter: bpf/process/bpf_prog_iter.c | $F -D__LARGE_BPF_PROG
+v53-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F -D__LARGE_BPF_PROG
+v53-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F -D__LARGE_BPF_PROG
+v53-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F -D__LARGE_BPF_PROG
+v53-bpf_cgtracker: bpf/cgroup/bpf_cgtracker.c | $F -D__LARGE_BPF_PROG
+v511-bpf_cgroup: bpf/process/bpf_cgroup.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_enforcer: bpf/process/bpf_enforcer.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_execve_event: bpf/process/bpf_execve_event.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_execve_map_update: bpf/process/bpf_execve_map_update.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:seccomp=socket
+v511-bpf_exit: bpf/process/bpf_exit.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_fork: bpf/process/bpf_fork.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F1
+v511-bpf_generic_lsm_core@file_open: bpf/process/bpf_generic_lsm_core.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm*=lsm/file_open
+v511-bpf_generic_lsm_core@bprm_check_security: bpf/process/bpf_generic_lsm_core.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm*=lsm/bprm_check_security
+v511-bpf_generic_lsm_core@inode_unlink: bpf/process/bpf_generic_lsm_core.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm*=lsm/inode_unlink
+v511-bpf_generic_lsm_core@socket_connect: bpf/process/bpf_generic_lsm_core.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm*=lsm/socket_connect
+v511-bpf_generic_lsm_ima_bprm@bprm_check_security: bpf/process/bpf_generic_lsm_ima_bprm.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm.s*=lsm.s/bprm_check_security
+v511-bpf_generic_lsm_ima_bprm@bprm_creds_for_exec: bpf/process/bpf_generic_lsm_ima_bprm.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm.s*=lsm.s/bprm_creds_for_exec
+v511-bpf_generic_lsm_ima_file@file_open: bpf/process/bpf_generic_lsm_ima_file.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm.s*=lsm.s/file_open
+v511-bpf_generic_lsm_output@file_open: bpf/process/bpf_generic_lsm_output.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm*=lsm/file_open
+v511-bpf_generic_lsm_output@bprm_check_security: bpf/process/bpf_generic_lsm_output.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm*=lsm/bprm_check_security
+v511-bpf_generic_lsm_output@inode_unlink: bpf/process/bpf_generic_lsm_output.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm*=lsm/inode_unlink
+v511-bpf_generic_lsm_output@socket_connect: bpf/process/bpf_generic_lsm_output.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG | sec:lsm*=lsm/socket_connect
+v511-bpf_generic_rawtp: bpf/process/bpf_generic_rawtp.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F1
+v511-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F1
+v511-bpf_generic_usdt: bpf/process/bpf_generic_usdt.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_loader: bpf/process/bpf_loader.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_map_test_p1: bpf/process/bpf_map_test_p1.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_map_test_p2: bpf/process/bpf_map_test_p2.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_map_test_p3: bpf/process/bpf_map_test_p3.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_prog_iter: bpf/process/bpf_prog_iter.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v511-bpf_cgtracker: bpf/cgroup/bpf_cgtracker.c | $F -D__LARGE_BPF_PROG -D__V511_BPF_PROG
+v61-bpf_cgroup: bpf/process/bpf_cgroup.c | $F2
+v61-bpf_enforcer: bpf/process/bpf_enforcer.c | $F2
+v61-bpf_execve_bprm_commit_creds: bpf/process/bpf_execve_bprm_commit_creds.c | $F2
+v61-bpf_execve_event: bpf/process/bpf_execve_event.c | $F2
+v61-bpf_execve_map_update: bpf/process/bpf_execve_map_update.c | $F2 | sec:seccomp=socket
+v61-bpf_exit: bpf/process/bpf_exit.c | $F2
+v61-bpf_fork: bpf/process/bpf_fork.c | $F2
+v61-bpf_generic_kprobe: bpf/process/bpf_generic_kprobe.c | $F2
+v61-bpf_multi_kprobe: bpf/process/bpf_generic_kprobe.c | $F3
+v61-bpf_generic_lsm_core@file_open: bpf/process/bpf_generic_lsm_core.c | $F2 | sec:lsm*=lsm/file_open
+v61-bpf_generic_lsm_core@bprm_check_security: bpf/process/bpf_generic_lsm_core.c | $F2 | sec:lsm*=lsm/bprm_check_security
+v61-bpf_generic_lsm_core@inode_unlink: bpf/process/bpf_generic_lsm_core.c | $F2 | sec:lsm*=lsm/inode_unlink
+v61-bpf_generic_lsm_core@socket_connect: bpf/process/bpf_generic_lsm_core.c | $F2 | sec:lsm*=lsm/socket_connect
+v61-bpf_generic_lsm_ima_bprm@bprm_check_security: bpf/process/bpf_generic_lsm_ima_bprm.c | $F2 | sec:lsm.s*=lsm.s/bprm_check_security
+v61-bpf_generic_lsm_ima_bprm@bprm_creds_for_exec: bpf/process/bpf_generic_lsm_ima_bprm.c | $F2 | sec:lsm.s*=lsm.s/bprm_creds_for_exec
+v61-bpf_generic_lsm_ima_file@file_open: bpf/process/bpf_generic_lsm_ima_file.c | $F2 | sec:lsm.s*=lsm.s/file_open
+v61-bpf_generic_lsm_output@file_open: bpf/process/bpf_generic_lsm_output.c | $F2 | sec:lsm*=lsm/file_open
+v61-bpf_generic_lsm_output@bprm_check_security: bpf/process/bpf_generic_lsm_output.c | $F2 | sec:lsm*=lsm/bprm_check_security
+v61-bpf_generic_lsm_output@inode_unlink: bpf/process/bpf_generic_lsm_output.c | $F2 | sec:lsm*=lsm/inode_unlink
+v61-bpf_generic_lsm_output@socket_connect: bpf/process/bpf_generic_lsm_output.c | $F2 | sec:lsm*=lsm/socket_connect
+v61-bpf_generic_rawtp: bpf/process/bpf_generic_rawtp.c | $F2
+v61-bpf_generic_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F2
+v61-bpf_multi_retkprobe: bpf/process/bpf_generic_retkprobe.c | $F3
+v61-bpf_generic_tracepoint: bpf/process/bpf_generic_tracepoint.c | $F2
+v61-bpf_generic_uprobe: bpf/process/bpf_generic_uprobe.c | $F2
+v61-bpf_multi_uprobe: bpf/process/bpf_generic_uprobe.c | $F3
+v61-bpf_generic_usdt: bpf/process/bpf_generic_usdt.c | $F2
+v61-bpf_loader: bpf/process/bpf_loader.c | $F2
+v61-bpf_map_test_p1: bpf/process/bpf_map_test_p1.c | $F2
+v61-bpf_map_test_p2: bpf/process/bpf_map_test_p2.c | $F2
+v61-bpf_map_test_p3: bpf/process/bpf_map_test_p3.c | $F2
+v61-bpf_prog_iter: bpf/process/bpf_prog_iter.c | $F2
+v61-bpf_cgroup_mkdir: bpf/cgroup/bpf_cgroup_mkdir.c | $F2
+v61-bpf_cgroup_release: bpf/cgroup/bpf_cgroup_release.c | $F2
+v61-bpf_cgroup_rmdir: bpf/cgroup/bpf_cgroup_rmdir.c | $F2
+v61-bpf_cgtracker: bpf/cgroup/bpf_cgtracker.c | $F2

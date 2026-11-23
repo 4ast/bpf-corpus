@@ -1,0 +1,15 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -DBPF_DEBUG=0
+F1 = $F -Ibpf/tpinjector -Ibpf -Ibpf/bpfcore -I../../include
+
+generictracer: bpf/generictracer/generictracer.c | $F -Ibpf/generictracer -Ibpf -Ibpf/bpfcore -I../../include
+gotracer: bpf/gotracer/gotracer.c | $F -Ibpf/gotracer -Ibpf -Ibpf/bpfcore -I../../include
+gpuevent: bpf/gpuevent/gpuevent.c | $F -Ibpf/gpuevent -Ibpf -Ibpf/bpfcore -I../../include
+logenricher: bpf/logenricher/logenricher.c | $F -Ibpf/logenricher -Ibpf -Ibpf/bpfcore -I../../include
+flows: bpf/netolly/flows.c | $F -Ibpf/netolly -Ibpf -Ibpf/bpfcore -I../../include
+flows_sock: bpf/netolly/flows_sock.c | $F -Ibpf/netolly -Ibpf -Ibpf/bpfcore -I../../include
+rdns_xdp: bpf/rdns/rdns_xdp.c | $F -Ibpf/rdns -Ibpf -Ibpf/bpfcore -I../../include
+stats: bpf/statsolly/stats.c | $F -Ibpf/statsolly -Ibpf -Ibpf/bpfcore -I../../include
+fionread_fixup: bpf/tpinjector/fionread_fixup.c | $F1
+sock_iter: bpf/tpinjector/sock_iter.c | $F1
+tpinjector: bpf/tpinjector/tpinjector.c | $F1
+watcher: bpf/watcher/watcher.c | $F -Ibpf/watcher -Ibpf -Ibpf/bpfcore -I../../include

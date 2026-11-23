@@ -1,0 +1,12 @@
+--- a/src/profiler/src/bpf/native_stack.bpf.c
++++ b/src/profiler/src/bpf/native_stack.bpf.c
+@@ -20,7 +20,8 @@
+ // Macro to create a map named exe_id_to_X_stack_deltas that is a nested maps with a fileID for the
+ // outer map and an array as inner map that holds up to 2^X stack delta entries for the given fileID.
+ #define STACK_DELTA_BUCKET(X) \
+-  BPF_MAP(exe_id_to_##X##_stack_deltas, BPF_MAP_TYPE_HASH_OF_MAPS, u64, u32, 4096)
++  struct { __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS); __uint(max_entries, 4096); __type(key, u64); __type(value, u32); /* corpus: the inner map that the loader makes, as in the comment below */ \
++    __array(values, struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1 << X); __type(key, u32); __type(value, StackDelta); }); } exe_id_to_##X##_stack_deltas SEC(".maps")
+ // struct inner_map_##X##_stack_deltas                     \
+   // {                                                       \
+   //   __uint(type, BPF_MAP_TYPE_ARRAY);                     \

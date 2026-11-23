@@ -1,0 +1,150 @@
+//go:build ignore
+
+#include "vmlinux.h"
+#include "constants.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
+
+char LICENSE[] SEC("license") = "GPL";
+
+// CO-RE type flavor for before6.3 kernels
+struct kernel_cap_struct___old {
+	__u32 cap[2];
+} __attribute__((preserve_access_index));
+
+enum cap_type { 
+	CAP_EFFECTIVE,
+	CAP_PERMITTED,
+	CAP_INHERITABLE 
+};
+
+static __always_inline __u64 read_capability(const struct cred *cred, enum cap_type type)
+{
+	const void *cap_ptr = (type == CAP_EFFECTIVE)   ? &cred->cap_effective :
+	                      (type == CAP_PERMITTED)   ? &cred->cap_permitted :
+	                                                  &cred->cap_inheritable;
+
+	if (bpf_core_field_exists(cred->cap_effective.val)) {
+		__u64 val;
+		bpf_probe_read_kernel(&val, sizeof(val), cap_ptr);
+		return val;
+	}
+
+	struct kernel_cap_struct___old old;
+	bpf_probe_read_kernel(&old, sizeof(old), cap_ptr);
+	return ((__u64)old.cap[1] << 32) | old.cap[0];
+}
+
+struct task_descriptor {
+	int euid;
+	int ruid;                 
+	int suid;                
+	int pid;
+	int tid;
+	int ppid;
+	unsigned int state;       // Process state (__state field)
+	unsigned long start_time; // Start time in nanoseconds (start_time)
+	unsigned long utime;      // User CPU time in nanoseconds
+	unsigned long stime;      // System CPU time in nanoseconds
+	unsigned long vsz;        // Virtual memory size in bytes
+	unsigned long rss;        // Resident set size in bytes
+	// Capabilities
+	unsigned long cap_effective;
+	unsigned long cap_permitted;
+	unsigned long cap_inheritable;
+	// Namespace inodes
+	unsigned int ns_uts;
+	unsigned int ns_ipc;
+	unsigned int ns_mnt;
+	unsigned int ns_pid;
+	unsigned int ns_net;
+	unsigned int ns_cgroup;
+	unsigned int _pad;        // padding for alignment
+	char comm[TASK_COMM_LEN];
+	// Note: cmdline is read from /proc in userspace as BPF iterators
+	// have restrictions on reading userspace memory
+};
+
+static __always_inline void fill_task_descriptor(struct task_descriptor *td, struct task_struct *task)
+{
+	struct mm_struct *mm;
+	struct nsproxy *nsp;
+	s64 rss_file, rss_anon, rss_shmem;
+
+	// UIDs from credentials
+	td->euid = task->cred->euid.val;
+	td->ruid = task->cred->uid.val;
+	td->suid = task->cred->suid.val;
+
+	td->pid = task->tgid;
+	td->tid = task->pid;
+	td->ppid = task->real_parent->tgid;
+	td->state = task->__state;
+	td->start_time = task->start_time;
+	td->utime = task->utime;
+	td->stime = task->stime;
+
+	td->cap_effective = read_capability(task->cred, CAP_EFFECTIVE);
+	td->cap_permitted = read_capability(task->cred, CAP_PERMITTED);
+	td->cap_inheritable = read_capability(task->cred, CAP_INHERITABLE);
+
+	// Get memory info from mm_struct
+	mm = task->mm;
+	if (mm) {
+		// VSZ: total_vm is in pages, convert to bytes (PAGE_SIZE = 4096)
+		td->vsz = mm->total_vm * 4096;
+
+		// RSS: sum of file, anon, and shmem pages (approximation using base count)
+		// Note: This is the base count only, actual RSS may be slightly different
+		// due to per-CPU deltas in percpu_counter
+		rss_file = mm->rss_stat[MM_FILEPAGES].count;
+		rss_anon = mm->rss_stat[MM_ANONPAGES].count;
+		rss_shmem = mm->rss_stat[MM_SHMEMPAGES].count;
+		
+		// Ensure non-negative (percpu counters can temporarily go negative)
+		if (rss_file < 0) rss_file = 0;
+		if (rss_anon < 0) rss_anon = 0;
+		if (rss_shmem < 0) rss_shmem = 0;
+		
+		td->rss = (rss_file + rss_anon + rss_shmem) * 4096;
+	} else {
+		td->vsz = 0;
+		td->rss = 0;
+	}
+
+	// Namespace inodes from nsproxy
+	nsp = task->nsproxy;
+	if (nsp) {
+		if (nsp->uts_ns)
+			td->ns_uts = nsp->uts_ns->ns.inum;
+		if (nsp->ipc_ns)
+			td->ns_ipc = nsp->ipc_ns->ns.inum;
+		if (nsp->mnt_ns)
+			td->ns_mnt = nsp->mnt_ns->ns.inum;
+		if (nsp->pid_ns_for_children)
+			td->ns_pid = nsp->pid_ns_for_children->ns.inum;
+		if (nsp->net_ns)
+			td->ns_net = nsp->net_ns->ns.inum;
+		if (nsp->cgroup_ns)
+			td->ns_cgroup = nsp->cgroup_ns->ns.inum;
+	}
+
+	bpf_probe_read_str(&td->comm, sizeof(td->comm), task->comm);
+}
+
+SEC("iter/task")
+int ps_task(struct bpf_iter__task *ctx)
+{
+	struct seq_file *seq = ctx->meta->seq;
+	struct task_struct *task = ctx->task;
+	struct task_descriptor td = {};
+
+	if (task == (void *)0)
+		return 0;
+
+	fill_task_descriptor(&td, task);
+	bpf_seq_write(seq, &td, sizeof(td));
+
+	return 0;
+}
+

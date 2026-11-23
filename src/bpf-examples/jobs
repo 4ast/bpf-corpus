@@ -1,0 +1,18 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+xdpsock_kern: AF_XDP-example/xdpsock_kern.c | $F -IAF_XDP-example -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+af_xdp_kern: AF_XDP-interaction/af_xdp_kern.c | $F -IAF_XDP-interaction -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+btf_unit_test_bpf: AF_XDP-interaction/btf_unit_test_bpf.c | $F -IAF_XDP-interaction -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+stats: LPM-map-bench/stats.bpf.c | $F -ILPM-map-bench -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+xdp-pass: bpf-link-hang/xdp-pass.c | $F -Ibpf-link-hang -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+delay-kfunc: delay-kfunc/delay-kfunc.bpf.c | $F -Idelay-kfunc -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+dhcp_kern_xdp: dhcp-relay/dhcp_kern_xdp.c | $F -Idhcp-relay -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+ktrace01_kern: ktrace-CO-RE/ktrace01_kern.c | $F -Iktrace-CO-RE -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+lsm-nobpf-kern: lsm-nobpf/lsm-nobpf-kern.c | $F -Ilsm-nobpf -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+netstacklat: netstacklat/netstacklat.bpf.c | $F -Inetstacklat -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+get-bond-active.kern: pkt-loop-filter/get-bond-active.kern.c | $F -Ipkt-loop-filter -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+pping_kern: pping/pping_kern.c | $F -Ipping -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+preserve_dscp_kern: preserve-dscp/preserve_dscp_kern.c | $F -Ipreserve-dscp -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+filter: tc-basic-classifier/filter.c | $F -Itc-basic-classifier -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+tc_txq_policy_kern: tc-policy/tc_txq_policy_kern.c | $F -Itc-policy -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include
+xdp_cpumap_qinq: traffic-pacing-edt/xdp_cpumap_qinq.c | $F -Itraffic-pacing-edt -I. -Iheaders -Iinclude -Iheaders/vmlinux/arch/x86 -I../../include

@@ -1,0 +1,255 @@
+--- a/driver/bpf/fillers.h
++++ b/driver/bpf/fillers.h
+@@ -57,12 +57,12 @@
+ #define FILLER_RAW(x)                                               \
+ 	static __always_inline int __bpf_##x(struct filler_data *data); \
+                                                                     \
+-	__bpf_section(TP_NAME "filler/" #x) static __always_inline int bpf_##x(void *ctx)
++	__bpf_section(TP_NAME "filler/" #x) int bpf_##x(void *ctx)
+ 
+ #define FILLER(x, is_syscall)                                                           \
+ 	static __always_inline int __bpf_##x(struct filler_data *data);                     \
+                                                                                         \
+-	__bpf_section(TP_NAME "filler/" #x) static __always_inline int bpf_##x(void *ctx) { \
++	__bpf_section(TP_NAME "filler/" #x) int bpf_##x(void *ctx) { \
+ 		struct filler_data data = {0};                                                  \
+ 		int res;                                                                        \
+                                                                                         \
+@@ -1808,7 +1808,7 @@
+ 	for(int k = 0; k < MAX_CGROUP_PATHS; ++k) {
+ 		if(kn) {
+ 			cgroup_path[k] = (char *)_READ(kn->name);
+-			kn = _READ(kn->parent);
++			kn = _READ(kn->__parent);
+ 		} else {
+ 			cgroup_path[k] = NULL;
+ 		}
+@@ -2776,9 +2776,9 @@
+ 	time.tv_sec = _READ(inode->i_ctime_sec);
+ 	time.tv_nsec = _READ(inode->i_ctime_nsec);
+ #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+-	time = _READ(inode->__i_ctime);
++	time.tv_sec = _READ(inode->i_ctime_sec); time.tv_nsec = _READ(inode->i_ctime_nsec);
+ #else
+-	time = _READ(inode->i_ctime);
++	time.tv_sec = _READ(inode->i_ctime_sec); time.tv_nsec = _READ(inode->i_ctime_nsec);
+ #endif
+ 	res = bpf_push_u64_to_ring(data, bpf_epoch_ns_from_time(time));
+ 	CHECK_RES(res);
+@@ -2789,9 +2789,9 @@
+ 	time.tv_sec = _READ(inode->i_mtime_sec);
+ 	time.tv_nsec = _READ(inode->i_mtime_nsec);
+ #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+-	time = _READ(inode->__i_mtime);
++	time.tv_sec = _READ(inode->i_mtime_sec); time.tv_nsec = _READ(inode->i_mtime_nsec);
+ #else
+-	time = _READ(inode->i_mtime);
++	time.tv_sec = _READ(inode->i_mtime_sec); time.tv_nsec = _READ(inode->i_mtime_nsec);
+ #endif
+ 	res = bpf_push_u64_to_ring(data, bpf_epoch_ns_from_time(time));
+ 	CHECK_RES(res);
+@@ -6553,9 +6553,9 @@
+ 	time.tv_sec = _READ(inode->i_ctime_sec);
+ 	time.tv_nsec = _READ((inode->i_ctime_nsec);
+ #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+-	time = _READ(inode->__i_ctime);
++	time.tv_sec = _READ(inode->i_ctime_sec); time.tv_nsec = _READ(inode->i_ctime_nsec);
+ #else
+-	time = _READ(inode->i_ctime);
++	time.tv_sec = _READ(inode->i_ctime_sec); time.tv_nsec = _READ(inode->i_ctime_nsec);
+ #endif
+ 	res = bpf_push_u64_to_ring(data, bpf_epoch_ns_from_time(time));
+ 	CHECK_RES(res);
+@@ -6566,9 +6566,9 @@
+ 	time.tv_sec = _READ(inode->i_mtime_sec);
+ 	time.tv_nsec = _READ(inode->i_mtime_nsec);
+ #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+-	time = _READ(inode->__i_mtime);
++	time.tv_sec = _READ(inode->i_mtime_sec); time.tv_nsec = _READ(inode->i_mtime_nsec);
+ #else
+-	time = _READ(inode->i_mtime);
++	time.tv_sec = _READ(inode->i_mtime_sec); time.tv_nsec = _READ(inode->i_mtime_nsec);
+ #endif
+ 	res = bpf_push_u64_to_ring(data, bpf_epoch_ns_from_time(time));
+ 	CHECK_RES(res);
+--- a/driver/bpf/maps.h
++++ b/driver/bpf/maps.h
+@@ -21,91 +21,94 @@
+ };
+ 
+ #ifdef __KERNEL__
+-struct bpf_map_def __bpf_section("maps") perf_map = {
+-        .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(uint32_t),
+-        .max_entries = 0,
+-};
++#ifndef __uint
++#define __uint(name, val) int(*name)[val]
++#endif
++struct {
++	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(uint32_t));
++	__uint(max_entries, 0);
++} perf_map __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") tail_map = {
+-        .type = BPF_MAP_TYPE_PROG_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(uint32_t),
+-        .max_entries = PPM_FILLER_MAX,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(uint32_t));
++	__uint(max_entries, PPM_FILLER_MAX);
++} tail_map __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") syscall_table = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(struct syscall_evt_pair),
+-        .max_entries = SYSCALL_TABLE_SIZE,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(struct syscall_evt_pair));
++	__uint(max_entries, SYSCALL_TABLE_SIZE);
++} syscall_table __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") event_info_table = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(struct ppm_event_info),
+-        .max_entries = PPM_EVENT_MAX,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(struct ppm_event_info));
++	__uint(max_entries, PPM_EVENT_MAX);
++} event_info_table __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") fillers_table = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(struct ppm_event_entry),
+-        .max_entries = PPM_EVENT_MAX,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(struct ppm_event_entry));
++	__uint(max_entries, PPM_EVENT_MAX);
++} fillers_table __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") frame_scratch_map = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = SCRATCH_SIZE,
+-        .max_entries = 0,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, SCRATCH_SIZE);
++	__uint(max_entries, 0);
++} frame_scratch_map __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") tmp_scratch_map = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = SCRATCH_SIZE,
+-        .max_entries = 0,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, SCRATCH_SIZE);
++	__uint(max_entries, 0);
++} tmp_scratch_map __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") settings_map = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(struct scap_bpf_settings),
+-        .max_entries = 1,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(struct scap_bpf_settings));
++	__uint(max_entries, 1);
++} settings_map __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") local_state_map = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(struct scap_bpf_per_cpu_state),
+-        .max_entries = 0,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(struct scap_bpf_per_cpu_state));
++	__uint(max_entries, 0);
++} local_state_map __bpf_section(".maps");
+ 
+-struct bpf_map_def __bpf_section("maps") interesting_syscalls_table = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(bool),
+-        .max_entries = SYSCALL_TABLE_SIZE,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(bool));
++	__uint(max_entries, SYSCALL_TABLE_SIZE);
++} interesting_syscalls_table __bpf_section(".maps");
+ 
+ // The key is the 32-bit syscall code while the value is 64-bit one
+-struct bpf_map_def __bpf_section("maps") ia32_64_map = {
+-        .type = BPF_MAP_TYPE_ARRAY,
+-        .key_size = sizeof(uint32_t),
+-        .value_size = sizeof(uint32_t),
+-        .max_entries = SYSCALL_TABLE_SIZE,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(uint32_t));
++	__uint(value_size, sizeof(uint32_t));
++	__uint(max_entries, SYSCALL_TABLE_SIZE);
++} ia32_64_map __bpf_section(".maps");
+ 
+ #ifndef BPF_SUPPORTS_RAW_TRACEPOINTS
+-struct bpf_map_def __bpf_section("maps") stash_map = {
+-        .type = BPF_MAP_TYPE_HASH,
+-        .key_size = sizeof(uint64_t),
+-        .value_size = sizeof(struct sys_stash_args),
+-        .max_entries = 65535,
+-};
++struct {
++	__uint(type, BPF_MAP_TYPE_HASH);
++	__uint(key_size, sizeof(uint64_t));
++	__uint(value_size, sizeof(struct sys_stash_args));
++	__uint(max_entries, 65535);
++} stash_map __bpf_section(".maps");
+ #endif
+ 
+ #endif  // __KERNEL__
+Not in the upstream tree: driver/driver_config.h
+--- a/driver/modern_bpf/maps/maps.h
++++ b/driver/modern_bpf/maps/maps.h
+@@ -179,7 +179,7 @@
+  * (`ringbuf_maps`)
+  */
+ struct ringbuf_map {
+-	__uint(type, BPF_MAP_TYPE_RINGBUF);
++	__uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 8388608);
+ };
+ 
+ /**

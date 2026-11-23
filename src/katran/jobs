@@ -1,0 +1,36 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -DDEBUG -D__KERNEL__ -I. -Ikatran/lib/linux_includes -DDECAP_TPR_STATS -DINLINE_DECAP_GUE -DKDE_GUE_PORT=6080
+F1 = $F -Ikatran/decap/tc_bpf -Ikatran/decap -Ikatran -Ikatran/tpr/bpf -I../../include
+F2 = $F -Ikatran/lib/bpf -Ikatran/lib -Ikatran -Ikatran/tpr/bpf -I../../include
+
+decap: katran/decap/bpf/decap.bpf.c | $F -Ikatran/decap/bpf -Ikatran/decap -Ikatran -Ikatran/tpr/bpf -I../../include
+tc_decap: katran/decap/tc_bpf/tc_decap.bpf.c | $F1
+tc_decap_info: katran/decap/tc_bpf/tc_decap_info.bpf.c | $F1
+tc_decap_stats: katran/decap/tc_bpf/tc_decap_stats.bpf.c | $F1
+tc_srcmatch: katran/decap/tc_bpf/tc_srcmatch.bpf.c | $F1
+balancer: katran/lib/bpf/balancer.bpf.c | $F2
+healthchecking: katran/lib/bpf/healthchecking.bpf.c | $F2
+healthchecking_ipip: katran/lib/bpf/healthchecking_ipip.c | $F2
+xdp_pktcntr: katran/lib/bpf/xdp_pktcntr.c | $F2
+xdp_root: katran/lib/bpf/xdp_root.c | $F2
+
+# options that katran/lib/bpf/balancer_consts.h documents
+G = -D__TARGET_ARCH_x86 -D__x86_64__ -DDEBUG -D__KERNEL__ -I. -Ikatran/lib/linux_includes \
+    -I../../include
+GUE = -DGUE_ENCAP -DINLINE_DECAP_GUE
+balancer+plain: katran/lib/bpf/balancer.bpf.c | $G
+balancer+ipip: katran/lib/bpf/balancer.bpf.c | $G -DINLINE_DECAP_IPIP
+balancer+gue: katran/lib/bpf/balancer.bpf.c | $G $GUE
+balancer+full: katran/lib/bpf/balancer.bpf.c | $G $GUE -DLPM_SRC_LOOKUP -DTCP_SERVER_ID_ROUTING \
+    -DUDP_STABLE_ROUTING -DGLOBAL_LRU_LOOKUP -DKATRAN_INTROSPECTION -DLOCAL_DELIVERY_OPTIMIZATION \
+    -DCIDR_VIP -DRECORD_FLOW_INFO -DCOPY_INNER_PACKET_TOS -DDECAP_STRICT_DESTINATION
+healthchecking+gue: katran/lib/bpf/healthchecking.bpf.c | $G -DGUE_ENCAP
+healthchecking+full: katran/lib/bpf/healthchecking.bpf.c | $G -DGUE_ENCAP -DHC_SRC_MATCH \
+    -DHC_DST_MATCH -DMANGLE_HC_SRC
+decap+plain: katran/decap/bpf/decap.bpf.c | $G -DDECAP_TPR_STATS
+decap+full: katran/decap/bpf/decap.bpf.c | $G -DDECAP_TPR_STATS -DINLINE_DECAP_GUE \
+    -DDECAP_STRICT_DESTINATION
+tc_decap+full: katran/decap/tc_bpf/tc_decap.bpf.c | $G -DINLINE_DECAP_GUE -DENABLE_DECAP_MARK
+tc_decap_stats+full: katran/decap/tc_bpf/tc_decap_stats.bpf.c | $G -DDECAP_TPR_STATS \
+    -DDECAP_VIP_STATS
+tcp_pkt_router: katran/tpr/bpf/tcp_pkt_router.bpf.c | -D__TARGET_ARCH_x86 -fms-extensions -I. \
+    -Ikatran/tpr/bpf -I../../include

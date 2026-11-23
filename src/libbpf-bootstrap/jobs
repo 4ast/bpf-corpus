@@ -1,0 +1,15 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Iexamples/c -I../../include/vmlinux -I../../include
+
+bootstrap: examples/c/bootstrap.bpf.c | $F
+bootstrap_legacy: examples/c/bootstrap_legacy.bpf.c | $F
+ksyscall: examples/c/ksyscall.bpf.c | $F
+lsm: examples/c/lsm.bpf.c | $F
+minimal: examples/c/minimal.bpf.c | $F
+minimal_legacy: examples/c/minimal_legacy.bpf.c | $F
+minimal_ns: examples/c/minimal_ns.bpf.c | $F
+profile: examples/c/profile.bpf.c | $F
+sockfilter: examples/c/sockfilter.bpf.c | $F
+task_iter: examples/c/task_iter.bpf.c | $F
+tc: examples/c/tc.bpf.c | $F
+uprobe: examples/c/uprobe.bpf.c | $F
+usdt: examples/c/usdt.bpf.c | $F

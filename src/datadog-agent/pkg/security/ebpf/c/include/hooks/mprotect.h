@@ -1,0 +1,91 @@
+#ifndef _HOOKS_MPROTECT_H_
+#define _HOOKS_MPROTECT_H_
+
+#include "constants/syscall_macro.h"
+#include "helpers/approvers.h"
+#include "helpers/discarders.h"
+#include "helpers/span_fill.h"
+#include "helpers/syscalls.h"
+
+HOOK_SYSCALL_ENTRY0(mprotect) {
+    if (is_discarded_by_pid()) {
+        return 0;
+    }
+
+    struct policy_t policy = fetch_policy(EVENT_MPROTECT);
+    struct syscall_cache_t syscall = {
+        .type = EVENT_MPROTECT,
+        .policy = policy,
+    };
+
+    cache_syscall_update_cgroup(ctx, &syscall);
+    return 0;
+}
+
+HOOK_ENTRY("security_file_mprotect")
+int hook_security_file_mprotect(ctx_t *ctx) {
+    struct syscall_cache_t *syscall = peek_syscall(EVENT_MPROTECT);
+    if (!syscall) {
+        return 0;
+    }
+
+    u64 flags_offset;
+    LOAD_CONSTANT("vm_area_struct_flags_offset", flags_offset);
+    u64 vm_start_offset;
+    LOAD_CONSTANT("vm_area_struct_vm_start_offset", vm_start_offset);
+    u64 vm_end_offset;
+    LOAD_CONSTANT("vm_area_struct_vm_end_offset", vm_end_offset);
+
+    // Retrieve vma information
+    struct vm_area_struct *vma = (struct vm_area_struct *)CTX_PARM1(ctx);
+    bpf_probe_read(&syscall->mprotect.vm_protection, sizeof(syscall->mprotect.vm_protection), (char *)vma + flags_offset);
+    bpf_probe_read(&syscall->mprotect.vm_start, sizeof(syscall->mprotect.vm_start), (char *)vma + vm_start_offset);
+    bpf_probe_read(&syscall->mprotect.vm_end, sizeof(syscall->mprotect.vm_end), (char *)vma + vm_end_offset);
+    syscall->mprotect.req_protection = (u64)CTX_PARM2(ctx);
+    return 0;
+}
+
+static __always_inline int sys_mprotect_ret_impl(void *ctx, int retval, enum TAIL_CALL_PROG_TYPE prog_type) {
+    struct syscall_cache_t *syscall = peek_syscall(EVENT_MPROTECT);
+    if (!syscall) {
+        return 0;
+    }
+
+    if (approve_syscall(syscall, mprotect_approvers) == DISCARDED) {
+        goto pop_and_exit;
+    }
+
+    struct mprotect_event_t *event = SPAN_FILL_EVENT(struct mprotect_event_t, EVENT_MPROTECT);
+    if (!event) {
+        goto pop_and_exit;
+    }
+    event->vm_protection = syscall->mprotect.vm_protection;
+    event->req_protection = syscall->mprotect.req_protection;
+    event->vm_start = syscall->mprotect.vm_start;
+    event->vm_end = syscall->mprotect.vm_end;
+
+    pop_syscall(EVENT_MPROTECT);
+
+    struct proc_cache_t *entry = fill_process_context(&event->process);
+    fill_cgroup_context(entry, &event->cgroup);
+
+    span_fill_tail_call(ctx, prog_type);
+
+pop_and_exit:
+    pop_syscall(EVENT_MPROTECT);
+    return 0;
+}
+
+static __always_inline int sys_mprotect_ret(void *ctx, int retval) {
+    return sys_mprotect_ret_impl(ctx, retval, KPROBE_OR_FENTRY_TYPE);
+}
+
+HOOK_SYSCALL_EXIT(mprotect) {
+    return sys_mprotect_ret(ctx, (int)SYSCALL_PARMRET(ctx));
+}
+
+TAIL_CALL_TRACEPOINT_FNC(handle_sys_mprotect_exit, struct tracepoint_raw_syscalls_sys_exit_t *args) {
+    return sys_mprotect_ret_impl(args, args->ret, TRACEPOINT_TYPE);
+}
+
+#endif

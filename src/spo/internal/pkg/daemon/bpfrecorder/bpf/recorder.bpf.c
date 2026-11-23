@@ -1,0 +1,1627 @@
+#include <vmlinux.h>
+
+#include <linux/limits.h>
+
+#include "bpf_d_path_tetragon.h"
+#include <asm-generic/errno.h>
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+#define MAX_ENTRIES 8 * 1024
+#define MAX_SYSCALLS 1024
+#define MAX_CHILD_PIDS 1024
+// The per workload bookkeeping maps are larger than the data maps, so that
+// they keep track of excluded workloads well past the recorded ones.
+#define MAX_TRACKED_KEYS 32 * 1024
+
+// We don't have TASK_COMM_LEN in userspace, so we define
+// a static MAX_COMM_LEN which is supposed to be >= TASK_COMM_LEN
+#define MAX_COMM_LEN 1024
+
+#define EVENT_TYPE_NEWPID 0
+#define EVENT_TYPE_EXIT 1
+#define EVENT_TYPE_APPARMOR_FILE 2
+#define EVENT_TYPE_APPARMOR_SOCKET 3
+#define EVENT_TYPE_APPARMOR_CAP 4
+#define EVENT_TYPE_CLEAR_MNTNS 5
+#define EVENT_TYPE_EXEC 6
+
+#define FLAG_READ 0x1
+#define FLAG_WRITE 0x2
+#define FLAG_EXEC 0x4
+#define FLAG_SPAWN 0x8
+// The file got its attributes read. AppArmor checks read access for it, which
+// does not need a rule of its own, see classifyFileAccess.
+#define FLAG_STAT 0x10
+
+#define FMODE_READ 0x1
+#define FMODE_WRITE 0x2
+#define FMODE_EXEC 0x20
+
+#define PROT_READ 0x1  /* Page can be read.  */
+#define PROT_WRITE 0x2 /* Page can be written.  */
+#define PROT_EXEC 0x4  /* Page can be executed.  */
+#define PROT_NONE 0x0
+
+#define MAP_PRIVATE 0x02 /* Changes are private.  */
+
+#define VM_SHARED 0x00000008
+
+#define S_IFMT 0170000
+#define S_IFIFO 0010000
+#define S_IFCHR 0020000
+#define S_IFDIR 0040000
+#define S_IFBLK 0060000
+#define S_IFSOCK 0140000
+
+#define CAP_OPT_NOAUDIT 0b10
+
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630
+#define PIPEFS_MAGIC 0x50495045
+
+#define AF_UNIX 1
+#define AF_INET 2
+#define AF_INET6 10
+
+// The syscalls the container start is detected with, see is_container_init.
+// Their numbers are not part of vmlinux.h.
+#if defined(__TARGET_ARCH_x86)
+#define NR_EXECVE 59
+#define NR_EXECVEAT 322
+#define NR_PRCTL 157
+#define NR_SECCOMP 317
+#elif defined(__TARGET_ARCH_arm64)
+#define NR_EXECVE 221
+#define NR_EXECVEAT 281
+#define NR_PRCTL 167
+#define NR_SECCOMP 277
+#else
+#define NR_EXECVE -1
+#define NR_EXECVEAT -1
+#define NR_PRCTL -1
+#define NR_SECCOMP -1
+#endif
+
+#define PR_GET_PDEATHSIG 2
+#define PR_SET_SECCOMP 22
+#define SECCOMP_SET_MODE_STRICT 0
+#define SECCOMP_SET_MODE_FILTER 1
+#define SECCOMP_MODE_STRICT 1
+#define SECCOMP_MODE_FILTER 2
+
+// The number of container init process names the userspace can pass.
+#define MAX_INIT_COMMS 4
+// The length of the executable name prefix of container init processes the
+// userspace can pass, including the terminating NUL byte.
+#define INIT_EXE_PREFIX_LEN 32
+
+// A 32 bit task on a 64 bit kernel, see is_compat_task.
+#define TS_COMPAT 0x0002
+#define TIF_32BIT 22
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+#ifndef READ_ONCE
+#define READ_ONCE(x) (*(volatile typeof(x) *)&(x))
+#endif
+
+#ifndef likely
+#define likely(x) __builtin_expect((x), 1)
+#endif
+#ifndef unlikely
+#define unlikely(x) __builtin_expect((x), 0)
+#endif
+
+// toggle this for additional debug output
+#define trace_hook(...)
+// #define trace_hook(...) \
+//     { u64 k; if (get_mntns_key(&k)) { bpf_printk(__VA_ARGS__); } }
+
+// are we currently recording?
+// If yes, the only map element is set to true.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, bool);
+} is_recording SEC(".maps");
+
+static volatile bool _is_recording_cached = false;
+
+// The mount namespaces which are not recorded. When running in Kubernetes,
+// the mount namespace of the host is excluded, see exclude_keys for the
+// excluded workloads.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u32);
+    __type(value, u8);
+} exclude_mntns SEC(".maps");
+
+// Track syscalls per recording key, see get_key.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);                 // recording key
+    __type(value, u8[MAX_SYSCALLS]);  // syscall IDs
+} recorded_syscalls SEC(".maps");
+
+// Keys of workloads which are not recorded, see get_mntns_key. Only used with
+// keys which are never reused, see unique_keys.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_TRACKED_KEYS);
+    __type(key, u64);
+    __type(value, u8);
+} exclude_keys SEC(".maps");
+
+// A process together with the key it records under. The threads of a process
+// can record under different keys, for example after one of them unshared its
+// mount namespace.
+struct pid_key {
+    u32 pid;
+    u32 pad;
+    u64 key;
+};
+
+// Track active (known) processes and the keys they recorded under. This is an
+// LRU map, because the userspace only clears it when a recording starts or
+// stops: a full map must evict stale entries instead of failing every insert.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, struct pid_key);
+    __type(value, u8);
+} active_pids SEC(".maps");
+
+// Keys whose container initialization has been seen. The runtime init process
+// also runs for every exec into a running container, which must not clear the
+// data recorded for it so far.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_TRACKED_KEYS);
+    __type(key, u64);
+    __type(value, u8);
+} seccomp_initialized SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_TRACKED_KEYS);
+    __type(key, u64);
+    __type(value, u8);
+} apparmor_initialized SEC(".maps");
+
+// The capabilities reported per recording key, as a bitmask of the capability
+// numbers. A workload checks the same capability over and over again, which
+// only has to be reported once. The entries are dropped when the recorded
+// data of the key is cleared, so that the following uses get reported again.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);
+    __type(value, u64);
+} recorded_caps SEC(".maps");
+
+// The sockets reported per recording key, as a bitmask, see socket_bit.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);
+    __type(value, u64);
+} recorded_sockets SEC(".maps");
+
+// Keep track of all child PIDs when observing
+// a particular program name.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_CHILD_PIDS);
+    __type(key, u32);
+    __type(value, bool);
+} child_pids SEC(".maps");
+
+// send events to userland
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);
+} events SEC(".maps");
+
+// Counts recorded data the kernel side had to drop, per reason. The userspace
+// sums the per CPU values and reports them.
+#define LOST_RINGBUF 0
+#define LOST_SYSCALLS_MAP_FULL 1
+#define LOST_FILE_EVENT_BUSY 2
+#define LOST_COMPAT_SYSCALL 3
+#define LOST_UNRESOLVED_PATH 4
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 5);
+    __type(key, u32);
+    __type(value, u64);
+} lost_events SEC(".maps");
+
+// How much of the arguments and of the environment of an exec is sent. Of a
+// longer environment, its start and its end are sent, see submit_exec_event.
+#define MAX_EXEC_ARGS_LEN 4096
+#define MAX_EXEC_ENV_LEN 8192
+#define MAX_EXEC_ENV_PART_LEN (MAX_EXEC_ENV_LEN / 2)
+
+// Every event starts with this header. Events which carry no data are sent as
+// the header alone, so that they only take a few bytes of the ring buffer.
+typedef struct __attribute__((__packed__)) event_header {
+    u32 pid;
+    u32 mntns;
+    u64 key;
+    u8 type;
+    u64 flags;
+} event_header_t;
+
+// File events are sent with the header and as much of data as the path needs.
+typedef struct __attribute__((__packed__)) event_data {
+    event_header_t hdr;
+    char data[PATH_MAX];
+} event_data_t;
+
+// The exec event is only used by the process cache, see sched_exec_args.
+// data holds args_len bytes of arguments followed by env_len bytes of
+// environment, both NUL separated strings like /proc/<pid>/cmdline, and is
+// only sent as far as it is in use. env_gap is the offset in the environment
+// where its middle got left out, 0 if it is complete.
+typedef struct __attribute__((__packed__)) exec_event_data {
+    event_header_t hdr;
+    u32 args_len;
+    u32 env_len;
+    u32 env_gap;
+    char data[MAX_EXEC_ARGS_LEN + MAX_EXEC_ENV_LEN];
+} exec_event_data_t;
+
+// Exec events are assembled here, they are too large for the stack. The
+// tracepoint runs with preemption disabled, so no other exec on the CPU can
+// use the buffer meanwhile.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, exec_event_data_t);
+} exec_event_scratch SEC(".maps");
+
+// File events are assembled here before they are copied into the ring buffer
+// with their actual size.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, event_data_t);
+} file_event_scratch SEC(".maps");
+
+// The last file event sent per thread, used to discard repeated accesses.
+// Keeping it per thread makes the result independent of the CPUs a process
+// runs on, and a thread cannot preempt itself in the middle of an update.
+// The key tells the data the event got recorded for, a thread which moves to
+// another key has to report its files again.
+struct file_event_state {
+    u64 key;
+    u64 inode;
+    u64 flags;
+    // dentry and mnt tell the path of the file apart from another one of the
+    // same inode, like a hard link or a bind mount.
+    u64 dentry;
+    u64 mnt;
+    u32 dev;
+    // overlay is set if the file is on an overlay file system.
+    u32 overlay;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u32);  // thread ID
+    __type(value, struct file_event_state);
+} last_file_event SEC(".maps");
+
+// The LSM hooks run with migration disabled, but can be preempted by another
+// task running the same hook on this CPU. busy makes sure that only one of
+// them uses the per CPU scratch buffer at a time.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} file_event_busy SEC(".maps");
+
+const volatile char filter_name[MAX_COMM_LEN] = {};
+
+// Identify the recorded workload by its cgroup instead of its mount namespace.
+// Set by the userspace on cgroup v2 hosts: cgroup IDs are never reused, while
+// mount namespace inode numbers are handed out again as soon as they are free.
+const volatile bool use_cgroup_id = false;
+
+// Identify the recorded workload by the sequence number of its mount
+// namespace, which is never reused either. Set by the userspace for hosts
+// without cgroup v2.
+const volatile bool use_mntns_seq = false;
+
+// Set by the userspace if it waits for processes to exit, which only spoc
+// does. In-cluster, the exits of the recorded workloads are not reported.
+const volatile bool report_exits = false;
+
+// The names of the processes the container runtimes start a container with,
+// like runc:[2:INIT] or crun, set by the userspace. Their first exec under a
+// key is the start of the container, see is_container_init. They are matched
+// exactly. Unused entries are empty.
+const volatile char init_comms[MAX_INIT_COMMS][TASK_COMM_LEN] = {};
+
+// The prefix of the name of the executable file of a container init process
+// whose name is a number, set by the userspace, see is_container_init. Empty
+// if unused.
+const volatile char init_exe_prefix[INIT_EXE_PREFIX_LEN] = {};
+
+static const char FORWARD_SLASH[] = "/";
+static const bool TRUE = true;
+static inline bool has_filter();
+static inline bool matches_filter(char * comm);
+
+// The unique mount namespace ID moved between kernel versions: older ones
+// have a sequence number in the mount namespace, newer ones an ID in the
+// common namespace structure.
+struct mnt_namespace___seq {
+    u64 seq;
+} __attribute__((preserve_access_index));
+
+struct ns_common___id {
+    u64 ns_id;
+} __attribute__((preserve_access_index));
+
+struct mnt_namespace___id {
+    struct ns_common___id ns;
+} __attribute__((preserve_access_index));
+
+// get_mntns_id returns the ID of the current mount namespace, which is never
+// reused, unlike its inode number. It falls back to the inode number if the
+// kernel has neither.
+static __always_inline u64 get_mntns_id(u32 mntns)
+{
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+    struct mnt_namespace * ns = BPF_CORE_READ(task, nsproxy, mnt_ns);
+
+    if (bpf_core_field_exists(struct mnt_namespace___seq, seq)) {
+        return BPF_CORE_READ((struct mnt_namespace___seq *)ns, seq);
+    }
+    if (bpf_core_field_exists(struct mnt_namespace___id, ns.ns_id)) {
+        return BPF_CORE_READ((struct mnt_namespace___id *)ns, ns.ns_id);
+    }
+    return mntns;
+}
+
+// get_start_time returns when the current process started, in nanoseconds
+// since boot like the start time in /proc/<pid>/stat. Together with the PID it
+// identifies the process, which the userspace verifies before it looks up the
+// container by PID. Every kernel with the ring buffer of the events, 5.8 and
+// later, has start_boottime.
+static __always_inline u64 get_start_time()
+{
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+
+    return BPF_CORE_READ(task, group_leader, start_boottime);
+}
+
+/**
+ * get_key returns the key the recorded data of the current process is stored
+ * under. This is the cgroup ID or the mount namespace sequence number if
+ * selected, and the mount namespace otherwise.
+ */
+static __always_inline u64 get_key(u32 mntns)
+{
+    if (use_cgroup_id) {
+        return bpf_get_current_cgroup_id();
+    }
+    if (use_mntns_seq) {
+        return get_mntns_id(mntns);
+    }
+    return mntns;
+}
+
+// unique_keys reports whether a key is never used for another workload.
+static __always_inline bool unique_keys()
+{
+    return use_cgroup_id || use_mntns_seq;
+}
+
+/**
+ * get_mntns_key returns the mntns in case the call should be taken into
+ * account, and sets key to the key of the process, see get_key. 0 is returned
+ * when the process should not be processed. The following criteria are used:
+ *   - host processes are excluded (if system mntns is set)
+ *   - child processes are included
+ *   - program name if filter is active
+ */
+static __always_inline u32 get_mntns_key(u64 * key)
+{
+    // Get the current mntns
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+    u32 mntns = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
+    if (mntns == 0) {
+        return 0;
+    }
+
+    // When running in a Kubernetes context:
+    // Filter out mntns of the host PID to exclude host processes
+    if (bpf_map_lookup_elem(&exclude_mntns, &mntns) != NULL) {
+        return 0;
+    }
+
+    // Filter out the workloads the userspace found not to be recorded. The
+    // key is the mntns otherwise, see get_key.
+    u64 k = mntns;
+    if (unique_keys()) {
+        k = get_key(mntns);
+        if (bpf_map_lookup_elem(&exclude_keys, &k) != NULL) {
+            return 0;
+        }
+    }
+
+    // Filter per program name if requested
+    if (has_filter()) {
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        bool is_child = bpf_map_lookup_elem(&child_pids, &pid) != NULL;
+        char comm[TASK_COMM_LEN] = {};
+        bpf_get_current_comm(comm, sizeof(comm));
+
+        if (!is_child && !matches_filter(comm)) {
+            return 0;
+        }
+    }
+
+    *key = k;
+    return mntns;
+}
+
+static __always_inline void count_lost(u32 reason)
+{
+    u64 * lost = bpf_map_lookup_elem(&lost_events, &reason);
+    if (lost) {
+        *lost += 1;
+    }
+}
+
+// Send an event which carries no data besides its header.
+static __always_inline int submit_event(u8 type, u32 mntns, u64 key, u64 flags)
+{
+    event_header_t * event =
+        bpf_ringbuf_reserve(&events, sizeof(event_header_t), 0);
+    if (!event) {
+        count_lost(LOST_RINGBUF);
+        return -1;
+    }
+    event->pid = bpf_get_current_pid_tgid() >> 32;
+    event->mntns = mntns;
+    event->key = key;
+    event->type = type;
+    event->flags = flags;
+    bpf_ringbuf_submit(event, 0);
+    return 0;
+}
+
+// submit_new_pid reports the current process to the userspace, with when it
+// started as the flags.
+static __always_inline int submit_new_pid(u32 mntns, u64 key)
+{
+    return submit_event(EVENT_TYPE_NEWPID, mntns, key, get_start_time());
+}
+
+// clear_seccomp drops the syscalls recorded during the container
+// initialization. Only the first initialization of a key is the container
+// start, the later ones are execs into the running container.
+static __always_inline u32 clear_seccomp(u64 key)
+{
+    // A reused key belongs to another workload, which has to be cleared on
+    // its start again.
+    static const u8 one = 1;
+    if (unique_keys() && bpf_map_update_elem(&seccomp_initialized, &key, &one,
+                                             BPF_NOEXIST) != 0) {
+        return 0;
+    }
+    trace_hook("clear_seccomp key=%llu", key);
+    bpf_map_delete_elem(&recorded_syscalls, &key);
+    return 0;
+}
+
+// clear_apparmor is clear_seccomp for the AppArmor data, which the userspace
+// holds.
+static __always_inline u32 clear_apparmor(u32 mntns, u64 key)
+{
+    static const u8 one = 1;
+    if (unique_keys() && bpf_map_update_elem(&apparmor_initialized, &key, &one,
+                                             BPF_NOEXIST) != 0) {
+        return 0;
+    }
+    trace_hook("clear_apparmor key=%llu", key);
+    if (submit_event(EVENT_TYPE_CLEAR_MNTNS, mntns, key, 0) != 0) {
+        // The exec goes ahead, and the init process does not exec again, so
+        // the files of the runtime setup stay in the recorded data. The loss
+        // is counted. The key stays marked as initialized: a later exec into
+        // the running container must not drop what got recorded since.
+        return -1;
+    }
+    // The userspace drops what it recorded, so the capabilities, sockets and
+    // the last file of the thread, the only one of a starting container,
+    // have to be reported again.
+    bpf_map_delete_elem(&recorded_caps, &key);
+    bpf_map_delete_elem(&recorded_sockets, &key);
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    bpf_map_delete_elem(&last_file_event, &tid);
+    return 0;
+}
+
+// is_exec_syscall reports whether the syscall replaces the program of the
+// calling process.
+static __always_inline bool is_exec_syscall(u32 syscall_id)
+{
+    return syscall_id == NR_EXECVE || syscall_id == NR_EXECVEAT;
+}
+
+// is_seccomp_install reports whether the syscall installs a seccomp filter.
+// Only what a container does once its filter is installed has to be in its
+// profile, everything the runtime did before is setup.
+//
+// A profile is usually recorded without any filter, so the prctl runc issues
+// right before it would install one is taken as well, see
+// https://github.com/opencontainers/runc/blob/v1.3.0/libcontainer/standard_init_linux.go#L146
+// crun and youki have no such marker, their setup stays in the profile when
+// no filter is installed while recording.
+//
+// libseccomp, which runc uses, probes the kernel with calls the kernel
+// rejects during the setup, which are no install: a strict mode with flags,
+// see sys_chk_seccomp_syscall, and a filter without a filter program, see
+// sys_chk_seccomp_flag in libseccomp.
+static __always_inline bool is_seccomp_install(
+    u32 syscall_id, struct trace_event_raw_sys_enter * args)
+{
+    if (syscall_id == NR_SECCOMP) {
+        u64 operation = args->args[0];
+        if (operation == SECCOMP_SET_MODE_STRICT) {
+            return args->args[1] == 0 && args->args[2] == 0;
+        }
+        return operation == SECCOMP_SET_MODE_FILTER && args->args[2] != 0;
+    }
+    if (syscall_id == NR_PRCTL) {
+        u64 option = args->args[0];
+        if (option == PR_SET_SECCOMP) {
+            return args->args[1] == SECCOMP_MODE_STRICT ||
+                   (args->args[1] == SECCOMP_MODE_FILTER && args->args[2] != 0);
+        }
+        return option == PR_GET_PDEATHSIG;
+    }
+    return false;
+}
+
+// already_recorded marks bit in the bitmask of key and reports whether it
+// was set before. An event is reported if the mask cannot be tracked, which
+// only costs the userspace a repeated event.
+static __always_inline bool already_recorded(void * mask_map, u64 key, u64 bit)
+{
+    u64 * mask = bpf_map_lookup_elem(mask_map, &key);
+    if (!mask) {
+        static const u64 zero = 0;
+        bpf_map_update_elem(mask_map, &key, &zero, BPF_NOEXIST);
+        mask = bpf_map_lookup_elem(mask_map, &key);
+        if (!mask) {
+            return false;
+        }
+    }
+    return (__sync_fetch_and_or(mask, bit) & bit) != 0;
+}
+
+// report_again clears bit in the bitmask of key, so that the next use is
+// reported again after the event got lost.
+static __always_inline void report_again(void * mask_map, u64 key, u64 bit)
+{
+    u64 * mask = bpf_map_lookup_elem(mask_map, &key);
+    if (mask) {
+        __sync_fetch_and_and(mask, ~bit);
+    }
+}
+
+// is_compat_task reports whether the current task uses the 32 bit syscall ABI.
+// Its syscall numbers are the ones of that ABI, which the userspace would
+// record as the native syscalls with the same numbers.
+static __always_inline bool is_compat_task()
+{
+#if defined(__TARGET_ARCH_x86)
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+    return (BPF_CORE_READ(task, thread_info.status) & TS_COMPAT) != 0;
+#elif defined(__TARGET_ARCH_arm64)
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+    return (BPF_CORE_READ(task, thread_info.flags) & (1UL << TIF_32BIT)) != 0;
+#else
+    return false;
+#endif
+}
+
+// is_number reports whether comm is a non-negative decimal number.
+static __always_inline bool is_number(const char * comm)
+{
+    if (comm[0] == 0) {
+        return false;
+    }
+    for (int i = 0; i < TASK_COMM_LEN; i++) {
+        if (comm[i] == 0) {
+            return true;
+        }
+        if (comm[i] < '0' || comm[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// exe_has_init_prefix reports whether the name of the executable file of the
+// current process starts with init_exe_prefix.
+static __always_inline bool exe_has_init_prefix()
+{
+    if (init_exe_prefix[0] == 0) {
+        return false;
+    }
+
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+    const unsigned char * name =
+        BPF_CORE_READ(task, mm, exe_file, f_path.dentry, d_name.name);
+    if (!name) {
+        return false;
+    }
+
+    char exe[INIT_EXE_PREFIX_LEN] = {};
+    if (bpf_probe_read_kernel_str(exe, sizeof(exe), name) < 0) {
+        return false;
+    }
+
+    for (int i = 0; i < INIT_EXE_PREFIX_LEN; i++) {
+        if (init_exe_prefix[i] == 0) {
+            return true;
+        }
+        if (exe[i] != init_exe_prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// is_container_init reports whether the current process is the one a
+// container runtime starts a container with. Its exec of the entrypoint is
+// the container start, and the syscalls, files and capabilities of the
+// runtime setup before it are not part of the workload.
+//
+// runc and youki name the process, crun keeps the name of its executable.
+// Unless its binary is on a read-only file system, crun executes a copy of
+// itself from a memfd, see ensure_cloned_binary in crun. Since Linux 6.14 the
+// process is named after the memfd then, memfd:crun_cloned:/proc/self/exe cut
+// to memfd:crun_clon. Older kernels name it after the number of the file
+// descriptor it got executed from, which is recognized by the name of the
+// memfd, init_exe_prefix.
+static __always_inline bool is_container_init()
+{
+    char comm[TASK_COMM_LEN] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    for (int n = 0; n < MAX_INIT_COMMS; n++) {
+        if (init_comms[n][0] == 0) {
+            // The entries are filled from the start.
+            break;
+        }
+        bool matches = true;
+        for (int i = 0; i < TASK_COMM_LEN; i++) {
+            if (comm[i] != init_comms[n][i]) {
+                matches = false;
+                break;
+            }
+            if (comm[i] == 0) {
+                break;
+            }
+        }
+        if (matches) {
+            return true;
+        }
+    }
+
+    // Only a process named after a number is looked at further, as reading
+    // the name of its executable costs more than comparing its name.
+    return is_number(comm) && exe_has_init_prefix();
+}
+
+// Create a struct path for a given dentry by combining it with the mount point
+// of its parent path. Note that the returned path does not work with the
+// kernel's bpf_d_path, as it does not like stack pointers.
+static __always_inline struct path make_path(struct dentry * dentry,
+                                             struct path * path)
+{
+    struct path ret = {
+        .mnt = BPF_CORE_READ(path, mnt),
+        .dentry = dentry,
+    };
+    return ret;
+}
+
+static __always_inline int bpf_d_path_tetragon(struct path * path, char * buf,
+                                               size_t sz)
+{
+    int size = 0, error = 0;
+    char * fullpath = d_path_local(path, &size, &error);
+    if (!fullpath) {
+        count_lost(LOST_UNRESOLVED_PATH);
+        return -1;
+    }
+    // A path which does not fit into the buffer, or which has more components
+    // than d_path_local walks, is cut at its start. The rest still starts with
+    // a slash, it would be taken for another absolute path.
+    if (error != 0 || size < 0 || size >= (int)sz) {
+        count_lost(LOST_UNRESOLVED_PATH);
+        return -1;
+    }
+    // make the ebpf verifier happy
+    asm volatile("%[size] &= 0xfff;\n" : [size] "+r"(size));
+    probe_read(buf, size, fullpath);
+    // d_path_local does not null-terminate.
+    buf[size] = '\0';
+    size++;
+    return size;
+}
+
+// register_fs_event_locked sends a file event. The caller owns the per CPU
+// state last and event.
+static __always_inline void register_fs_event_locked(
+    struct path * filename, umode_t i_mode, u64 flags, bool custom_bpf_d_path,
+    u32 mntns, u64 key, u32 pid, u64 inode_number, u32 dev, bool overlay,
+    event_data_t * event)
+{
+    // Discard repeated calls of the same thread. Inode numbers are only
+    // unique per file system, so the device is part of the comparison, and
+    // so is the path: the hard links of a file, like the applets of busybox,
+    // and its bind mounts have the inode of the file, but need rules of
+    // their own.
+    //
+    // Opening a file on overlayfs opens the file of the layer beneath it
+    // right away, with the same inode number on another device. Its path is
+    // the one within the layer, which the workload never uses, so it is
+    // discarded as well.
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    struct file_event_state * last =
+        bpf_map_lookup_elem(&last_file_event, &tid);
+    u64 dentry = (u64)BPF_CORE_READ(filename, dentry);
+    u64 mnt = (u64)BPF_CORE_READ(filename, mnt);
+    bool same_file =
+        last && inode_number && key == last->key &&
+        inode_number == last->inode &&
+        ((dev == last->dev && dentry == last->dentry && mnt == last->mnt) ||
+         (last->overlay && !overlay));
+    if (same_file && (flags | last->flags) == last->flags) {
+        // very noisy
+        // trace_hook("register_file_event skipped");
+        return;
+    }
+
+    int pathlen;
+    // Some BPF hooks cannot use bpf_d_path, for these cases we swap in our own
+    // implementation.
+    if (custom_bpf_d_path) {
+        pathlen =
+            bpf_d_path_tetragon(filename, event->data, sizeof(event->data));
+    } else {
+        pathlen = bpf_d_path(filename, event->data, sizeof(event->data));
+    }
+    // bpf_d_path_tetragon counts its failures itself. A bpf_printk here
+    // would turn on the trace pipe of the whole node.
+    if (pathlen < 0) {
+        if (!custom_bpf_d_path) {
+            count_lost(LOST_UNRESOLVED_PATH);
+        }
+        return;
+    }
+
+    if ((i_mode & S_IFMT) == S_IFDIR) {
+        // The barrier keeps the compiler from folding the bounds check into
+        // what it knows about pathlen, which the verifier cannot follow.
+        u16 idx = pathlen - 1;
+        barrier_var(idx);
+        if (idx < sizeof(event->data) - sizeof(FORWARD_SLASH)) {
+            bpf_core_read(event->data + idx, sizeof(FORWARD_SLASH),
+                          &FORWARD_SLASH);
+            pathlen++;
+        } else {
+            // pathlen is close to PATH_MAX.
+            count_lost(LOST_UNRESOLVED_PATH);
+            return;
+        }
+    }
+
+    event->hdr.pid = pid;
+    event->hdr.mntns = mntns;
+    event->hdr.key = key;
+    event->hdr.type = EVENT_TYPE_APPARMOR_FILE;
+    event->hdr.flags = flags;
+
+    trace_hook("register_file_event: %s with flags=%d, i_mode=%d", event->data,
+               flags, i_mode);
+
+    // Only send the part of the path buffer which is in use.
+    u64 size = sizeof(event_header_t) + pathlen;
+    asm volatile("%[size] &= 0x1fff;\n" : [size] "+r"(size));
+    if (size > sizeof(event_data_t)) {
+        size = sizeof(event_data_t);
+    }
+    if (bpf_ringbuf_output(&events, event, size, 0) != 0) {
+        count_lost(LOST_RINGBUF);
+        return;
+    }
+
+    if (!inode_number) {
+        return;
+    }
+
+    if (last) {
+        last->flags = same_file ? (flags | last->flags) : flags;
+        last->key = key;
+        last->inode = inode_number;
+        last->dentry = dentry;
+        last->mnt = mnt;
+        last->dev = dev;
+        last->overlay = overlay;
+        return;
+    }
+
+    struct file_event_state state = {
+        .key = key,
+        .inode = inode_number,
+        .flags = flags,
+        .dentry = dentry,
+        .mnt = mnt,
+        .dev = dev,
+        .overlay = overlay,
+    };
+    bpf_map_update_elem(&last_file_event, &tid, &state, BPF_ANY);
+}
+
+// is_anonymous_pipe returns true for the files of anonymous pipes, which live
+// on pipefs and whose paths AppArmor does not mediate. Named pipes live on the
+// file system they got created on and need rules like any other file.
+static __always_inline bool is_anonymous_pipe(struct path * filename)
+{
+    return BPF_CORE_READ(filename, dentry, d_inode, i_sb, s_magic) ==
+           PIPEFS_MAGIC;
+}
+
+// register_fs_event_of sends a file event of a process which records under
+// mntns and key, see get_mntns_key.
+static __always_inline int register_fs_event_of(struct path * filename,
+                                                umode_t i_mode, u64 flags,
+                                                bool custom_bpf_d_path,
+                                                u32 mntns, u64 key)
+{
+    if (is_anonymous_pipe(filename)) {
+        return 0;
+    }
+
+    // The files of the runtime setup are not part of the workload, like its
+    // capabilities, see cap_capable. The ones of the first init get dropped
+    // with the exec of the entrypoint, but an exec into the running
+    // container, like a probe or kubectl exec, runs another init, whose data
+    // cannot be told apart from the one of the workload afterwards. Only the
+    // exec of the init and the files it maps for it are part of the workload.
+    if (!(flags & (FLAG_EXEC | FLAG_SPAWN)) && is_container_init()) {
+        return 0;
+    }
+
+    struct inode * inode = BPF_CORE_READ(filename, dentry, d_inode);
+    u64 inode_number = BPF_CORE_READ(inode, i_ino);
+    u32 dev = BPF_CORE_READ(inode, i_sb, s_dev);
+    bool overlay = BPF_CORE_READ(inode, i_sb, s_magic) == OVERLAYFS_SUPER_MAGIC;
+
+    u32 zero = 0;
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u32 * busy = bpf_map_lookup_elem(&file_event_busy, &zero);
+    event_data_t * event = bpf_map_lookup_elem(&file_event_scratch, &zero);
+    if (!busy || !event) {
+        return 0;
+    }
+
+    // Another task preempted on this CPU is using the scratch buffer. The
+    // counter is only changed with atomic adds, which need no newer BPF
+    // instruction set than the fetching ones. At most one task reads 1 after
+    // its increment, the others back off until it is done.
+    __sync_fetch_and_add(busy, 1);
+    if (READ_ONCE(*busy) != 1) {
+        __sync_fetch_and_add(busy, -1);
+        count_lost(LOST_FILE_EVENT_BUSY);
+        return 0;
+    }
+
+    register_fs_event_locked(filename, i_mode, flags, custom_bpf_d_path, mntns,
+                             key, pid, inode_number, dev, overlay, event);
+
+    __sync_fetch_and_add(busy, -1);
+    return 0;
+}
+
+// register_fs_event filters out the processes which are not recorded first,
+// as the file hooks run for every process of the node.
+static __always_inline int register_fs_event(struct path * filename,
+                                             umode_t i_mode, u64 flags,
+                                             bool custom_bpf_d_path)
+{
+    u64 key;
+    u32 mntns = get_mntns_key(&key);
+    if (!mntns)
+        return 0;
+
+    return register_fs_event_of(filename, i_mode, flags, custom_bpf_d_path,
+                                mntns, key);
+}
+
+static __always_inline int register_file_event(struct file * file, u64 flags)
+{
+    if (file == NULL) {
+        return 0;
+    }
+    return register_fs_event(&file->f_path, file->f_inode->i_mode, flags,
+                             false);
+}
+
+SEC("lsm/file_open")
+int BPF_PROG(file_open, struct file * file)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("file_open");
+    u64 flags = 0;
+    if (file->f_mode & FMODE_READ) {
+        flags |= FLAG_READ;
+    }
+    if (file->f_mode & FMODE_WRITE) {
+        flags |= FLAG_WRITE;
+    }
+    if (file->f_mode & FMODE_EXEC) {
+        flags |= FLAG_EXEC;
+    }
+    return register_file_event(file, flags);
+}
+
+SEC("lsm/file_lock")
+int BPF_PROG(file_lock, struct file * file)
+{
+    if (!_is_recording_cached)
+        return 0;
+    // very noisy
+    // trace_hook("file_lock");
+    return register_file_event(file, FLAG_WRITE);
+}
+
+// The hook gets the protection the caller requested and the one the kernel
+// applies, which can add PROT_EXEC. AppArmor checks the latter, see
+// common_mmap in security/apparmor/lsm.c.
+SEC("lsm/mmap_file")
+int BPF_PROG(mmap_file, struct file * file, unsigned long reqprot,
+             unsigned long prot, unsigned long flags)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("mmap_file");
+    u64 file_flags = 0;
+    if (prot & PROT_READ) {
+        file_flags |= FLAG_READ;
+    }
+    // A private mapping never writes to the file, like the copy on write
+    // data segments the loader maps. AppArmor only requires write access
+    // for shared writable mappings.
+    if ((prot & PROT_WRITE) && !(flags & MAP_PRIVATE)) {
+        file_flags |= FLAG_WRITE;
+    }
+    if (prot & PROT_EXEC) {
+        file_flags |= FLAG_EXEC;
+    }
+    return register_file_event(file, file_flags);
+}
+
+SEC("lsm/bprm_check_security")
+int BPF_PROG(bprm_check_security, struct linux_binprm * bprm)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("bprm_check_security");
+    return register_file_event(bprm->file, FLAG_SPAWN);
+}
+
+SEC("lsm/path_mkdir")
+int BPF_PROG(path_mkdir, struct path * dir, struct dentry * dentry,
+             umode_t mode)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_mkdir");
+    struct path filename = make_path(dentry, dir);
+    return register_fs_event(&filename, mode | S_IFDIR, FLAG_READ | FLAG_WRITE,
+                             true);
+}
+
+SEC("lsm/path_mknod")
+int BPF_PROG(path_mknod, struct path * dir, struct dentry * dentry,
+             umode_t mode, unsigned int dev)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_mknod %d", mode);
+    umode_t filetype = mode & S_IFMT;
+    bool not_a_regular_file = (filetype == S_IFCHR || filetype == S_IFBLK ||
+                               filetype == S_IFIFO || filetype == S_IFSOCK);
+    umode_t file_flags = FLAG_WRITE;
+    if (not_a_regular_file) {
+        file_flags |= FLAG_READ;
+    }
+    struct path path = make_path(dentry, dir);
+    return register_fs_event(&path, 0, file_flags, true);
+}
+
+SEC("lsm/path_unlink")
+int BPF_PROG(path_unlink, struct path * dir, struct dentry * dentry)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_unlink");
+    struct path path = make_path(dentry, dir);
+    return register_fs_event(&path, 0, FLAG_READ | FLAG_WRITE, true);
+}
+
+SEC("lsm/path_rmdir")
+int BPF_PROG(path_rmdir, struct path * dir, struct dentry * dentry)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_rmdir");
+    struct path path = make_path(dentry, dir);
+    return register_fs_event(&path, S_IFDIR, FLAG_READ | FLAG_WRITE, true);
+}
+
+// AppArmor checks read and write access on the old path, which goes away, and
+// write access on the new one, see apparmor_path_rename. An exchange, see
+// RENAME_EXCHANGE, checks read and write access on the new path as well. Not
+// every supported kernel passes the rename flags to the hook, so the new path
+// is recorded with write access alone: an exchanged file is usually read
+// through its new path afterwards, which records the read.
+SEC("lsm/path_rename")
+int BPF_PROG(path_rename, struct path * old_dir, struct dentry * old_dentry,
+             struct path * new_dir, struct dentry * new_dentry)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_rename");
+    umode_t mode = BPF_CORE_READ(old_dentry, d_inode, i_mode) & S_IFMT;
+    struct path old_path = make_path(old_dentry, old_dir);
+    register_fs_event(&old_path, mode, FLAG_READ | FLAG_WRITE, true);
+    struct path new_path = make_path(new_dentry, new_dir);
+    return register_fs_event(&new_path, mode, FLAG_WRITE, true);
+}
+
+// AppArmor allows a hard link only if the permissions of the link are a subset
+// of the ones of its target, see aa_path_link. The link gets read and write
+// access to the file it names, and the target the same, it is on the same
+// mount.
+SEC("lsm/path_link")
+int BPF_PROG(path_link, struct dentry * old_dentry, struct path * new_dir,
+             struct dentry * new_dentry)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_link");
+    struct path target = make_path(old_dentry, new_dir);
+    register_fs_event(&target, 0, FLAG_READ | FLAG_WRITE, true);
+    struct path path = make_path(new_dentry, new_dir);
+    return register_fs_event(&path, 0, FLAG_READ | FLAG_WRITE, true);
+}
+
+SEC("lsm/path_symlink")
+int BPF_PROG(path_symlink, struct path * dir, struct dentry * dentry)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_symlink");
+    struct path path = make_path(dentry, dir);
+    return register_fs_event(&path, 0, FLAG_WRITE, true);
+}
+
+// register_path_event sends a file event for a path the hook got, which,
+// unlike the path of an open file, cannot be resolved with bpf_d_path in
+// every hook. The processes which are not recorded are filtered out first,
+// some of the hooks run very often.
+static __always_inline int register_path_event(struct path * path, u64 flags)
+{
+    u64 key;
+    u32 mntns = get_mntns_key(&key);
+    if (!mntns)
+        return 0;
+
+    struct path copy = {
+        .mnt = BPF_CORE_READ(path, mnt),
+        .dentry = BPF_CORE_READ(path, dentry),
+    };
+    umode_t mode = BPF_CORE_READ(path, dentry, d_inode, i_mode);
+    return register_fs_event_of(&copy, mode, flags, true, mntns, key);
+}
+
+SEC("lsm/path_truncate")
+int BPF_PROG(path_truncate, struct path * path)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_truncate");
+    return register_path_event(path, FLAG_WRITE);
+}
+
+SEC("lsm/path_chmod")
+int BPF_PROG(path_chmod, struct path * path)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_chmod");
+    return register_path_event(path, FLAG_WRITE);
+}
+
+SEC("lsm/path_chown")
+int BPF_PROG(path_chown, struct path * path)
+{
+    if (!_is_recording_cached)
+        return 0;
+    trace_hook("path_chown");
+    return register_path_event(path, FLAG_WRITE);
+}
+
+// AppArmor checks read access for a stat of a file, including the stat of an
+// open file. It runs very often, the repeated stats of a thread are discarded
+// along with the other repeated accesses, see register_fs_event_locked.
+SEC("lsm/inode_getattr")
+int BPF_PROG(inode_getattr, struct path * path)
+{
+    if (!_is_recording_cached)
+        return 0;
+    // very noisy
+    // trace_hook("inode_getattr");
+    return register_path_event(path, FLAG_STAT);
+}
+
+// mprotect checks the mapped file like mmap_file, see apparmor_file_mprotect.
+SEC("lsm/file_mprotect")
+int BPF_PROG(file_mprotect, struct vm_area_struct * vma, unsigned long reqprot,
+             unsigned long prot)
+{
+    if (!_is_recording_cached)
+        return 0;
+    struct file * file = BPF_CORE_READ(vma, vm_file);
+    if (!file)
+        return 0;
+    trace_hook("file_mprotect");
+    u64 file_flags = 0;
+    if (prot & PROT_READ) {
+        file_flags |= FLAG_READ;
+    }
+    // vm_flags is const in newer kernels, which BPF_CORE_READ cannot read
+    // into, and next to the writable __vm_flags in a union. A kernel which
+    // has only one of them still loads the program.
+    unsigned long vm_flags = 0;
+    if (bpf_core_field_exists(vma->vm_flags)) {
+        bpf_core_read(&vm_flags, sizeof(vm_flags), &vma->vm_flags);
+    } else if (bpf_core_field_exists(vma->__vm_flags)) {
+        bpf_core_read(&vm_flags, sizeof(vm_flags), &vma->__vm_flags);
+    }
+    if ((prot & PROT_WRITE) && (vm_flags & VM_SHARED)) {
+        file_flags |= FLAG_WRITE;
+    }
+    if (prot & PROT_EXEC) {
+        file_flags |= FLAG_EXEC;
+    }
+    if (!file_flags)
+        return 0;
+    return register_path_event(&file->f_path, file_flags);
+}
+
+// The per syscall tracepoints, like syscalls/sys_enter_socket, pass a struct
+// syscall_trace_enter instead of the struct trace_event_raw_sys_enter of
+// raw_syscalls/sys_enter. Its syscall number is an int instead of a long, so
+// the arguments follow at another offset if the common fields do not end on
+// an 8 byte boundary, like on PREEMPT_RT kernels. CO-RE relocates the
+// arguments against the kernel layout of the struct.
+SEC("tracepoint/syscalls/sys_enter_socket")
+int sys_enter_socket(struct syscall_trace_enter * ctx)
+{
+    if (!_is_recording_cached)
+        return 0;
+    u64 key;
+    u32 mntns = get_mntns_key(&key);
+    if (!mntns)
+        return 0;
+    trace_hook("sys_enter_socket");
+
+    u64 domain, type;
+    if (bpf_core_read(&domain, sizeof(domain), &ctx->args[0]) != 0) {
+        return 0;
+    }
+    // The userspace does not record unix sockets, see socketUse.
+    if (domain == AF_UNIX) {
+        return 0;
+    }
+    if (bpf_core_read(&type, sizeof(type), &ctx->args[1]) != 0) {
+        return 0;
+    }
+
+    trace_hook("requesting socket domain %llu type %llu", domain, type);
+
+    // Report every kind of socket once per key. The userspace only tells the
+    // internet domains apart, and the socket type without its SOCK_NONBLOCK
+    // and SOCK_CLOEXEC flags, so the bitmask groups the sockets the same way.
+    u64 group;
+    if (domain == AF_INET) {
+        group = 0;
+    } else if (domain == AF_INET6) {
+        group = 1;
+    } else {
+        group = 2;
+    }
+    u64 bit = 1ULL << (group * 16 + (type & 0xf));
+    if (already_recorded(&recorded_sockets, key, bit)) {
+        return 0;
+    }
+
+    // The domain goes into the upper half of the flags, the type together
+    // with its SOCK_NONBLOCK and SOCK_CLOEXEC flags into the lower one.
+    if (submit_event(EVENT_TYPE_APPARMOR_SOCKET, mntns, key,
+                     (domain << 32) | (type & 0xffffffff)) != 0) {
+        report_again(&recorded_sockets, key, bit);
+    }
+
+    return 0;
+}
+
+// The capability checks are recorded on their return: AppArmor only checks a
+// capability which the task has, so a check which failed needs no rule, like
+// the checks for CAP_DAC_OVERRIDE of a task without it which got EACCES.
+SEC("fexit/cap_capable")
+int BPF_PROG(cap_capable, const struct cred * cred,
+             struct user_namespace * targ_ns, int cap, unsigned int cap_opt,
+             int ret)
+{
+    if (!_is_recording_cached)
+        return 0;
+
+    // The program runs on every capability check of the node, so the checks
+    // of the arguments come first.
+    if (ret != 0)
+        return 0;
+    if (cap_opt & CAP_OPT_NOAUDIT)
+        return 0;
+    // The bitmask holds the capabilities the kernel has.
+    if (cap < 0 || cap >= 64)
+        return 0;
+
+    u64 key;
+    u32 mntns = get_mntns_key(&key);
+    if (!mntns)
+        return 0;
+    trace_hook("requesting capability: cap=%i cap_opt=%i", cap, cap_opt);
+
+    // Report every capability once per key. Most checks of a recorded
+    // workload are of a capability which got reported already, which needs
+    // none of the checks below.
+    u64 bit = 1ULL << cap;
+    u64 * mask = bpf_map_lookup_elem(&recorded_caps, &key);
+    if (mask && (READ_ONCE(*mask) & bit)) {
+        return 0;
+    }
+
+    if (is_container_init())  // there are some SYS_ADMIN privileges exercised
+                              // by the runtime after the exec of the container
+        return 0;
+
+    if (already_recorded(&recorded_caps, key, bit)) {
+        return 0;
+    }
+
+    if (submit_event(EVENT_TYPE_APPARMOR_CAP, mntns, key, cap) != 0) {
+        report_again(&recorded_caps, key, bit);
+    }
+
+    return 0;
+}
+
+// submit_exec_event sends the arguments and the environment of the program the
+// current process just executed, from the memory of the new program which the
+// kernel copied them into. sched_process_exec fires for every exec, the
+// syscall tracepoints do not on all kernels.
+static __always_inline void submit_exec_event(u32 mntns, u64 key)
+{
+    u32 zero = 0;
+    exec_event_data_t * event = bpf_map_lookup_elem(&exec_event_scratch, &zero);
+    if (!event) {
+        return;
+    }
+
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+    struct mm_struct * mm = BPF_CORE_READ(task, mm);
+    u64 arg_start = BPF_CORE_READ(mm, arg_start);
+    u64 env_start = BPF_CORE_READ(mm, env_start);
+    u64 env_end = BPF_CORE_READ(mm, env_end);
+    u64 args_len = BPF_CORE_READ(mm, arg_end) - arg_start;
+    u64 env_len = env_end - env_start;
+    u32 env_gap = 0;
+
+    // Longer arguments get truncated.
+    if (args_len > MAX_EXEC_ARGS_LEN) {
+        args_len = MAX_EXEC_ARGS_LEN;
+    }
+    if (bpf_probe_read_user(event->data, args_len, (void *)arg_start) != 0) {
+        args_len = 0;
+    }
+
+    char * env = event->data + args_len;
+    if (env_len <= MAX_EXEC_ENV_LEN) {
+        if (bpf_probe_read_user(env, env_len, (void *)env_start) != 0) {
+            env_len = 0;
+        }
+    } else {
+        // The exec metadata webhook adds the request UID to the end of the
+        // environment with an env command, or to the variables of the pod
+        // spec, which the kubelet puts before the service links. The end
+        // starts with the byte before it, a NUL tells that its first variable
+        // is complete.
+        env_len = MAX_EXEC_ENV_LEN;
+        env_gap = MAX_EXEC_ENV_PART_LEN - 1;
+        if (bpf_probe_read_user(env, MAX_EXEC_ENV_PART_LEN - 1,
+                                (void *)env_start) != 0 ||
+            bpf_probe_read_user(
+                env + MAX_EXEC_ENV_PART_LEN - 1, MAX_EXEC_ENV_PART_LEN + 1,
+                (void *)(env_end - MAX_EXEC_ENV_PART_LEN - 1)) != 0) {
+            env_len = 0;
+            env_gap = 0;
+        }
+    }
+
+    event->hdr.pid = bpf_get_current_pid_tgid() >> 32;
+    event->hdr.mntns = mntns;
+    event->hdr.key = key;
+    event->hdr.type = EVENT_TYPE_EXEC;
+    // When the process started, which tells it apart from a later process
+    // with the same PID, see submit_new_pid.
+    event->hdr.flags = get_start_time();
+    event->args_len = args_len;
+    event->env_len = env_len;
+    event->env_gap = env_gap;
+
+    u64 size = offsetof(exec_event_data_t, data) + args_len + env_len;
+    if (bpf_ringbuf_output(&events, event, size, 0) != 0) {
+        count_lost(LOST_RINGBUF);
+    }
+}
+
+// sched_exec_args sends the arguments and the environment of every exec to
+// the userspace. Only the process cache loads it, so that the recorder neither
+// wastes ring buffer space on them nor needs exec_event_scratch.
+SEC("tracepoint/sched/sched_process_exec")
+int sched_exec_args(struct trace_event_raw_sched_process_exec * ctx)
+{
+    if (!_is_recording_cached)
+        return 0;
+
+    u64 key;
+    u32 mntns = get_mntns_key(&key);
+    if (mntns) {
+        trace_hook("sched_exec_args");
+        submit_exec_event(mntns, key);
+    }
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exec")
+int sched_process_exec(struct trace_event_raw_sched_process_exec * ctx)
+{
+    if (!_is_recording_cached)
+        return 0;
+    if (!has_filter()) {
+        return 0;
+    }
+
+    // child_pids holds thread group IDs, so the parent has to be looked up by
+    // its thread group as well: a child can be spawned from any of its threads.
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+    u32 parent_tgid = BPF_CORE_READ(task, real_parent, tgid);
+    bool is_child = bpf_map_lookup_elem(&child_pids, &parent_tgid) != NULL;
+
+    char comm[TASK_COMM_LEN] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    if (is_child || matches_filter(comm)) {
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        trace_hook("adding child pid: %u", pid);
+        bpf_map_update_elem(&child_pids, &pid, &TRUE, BPF_ANY);
+    }
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int sched_process_exit(void * ctx)
+{
+    if (!_is_recording_cached)
+        return 0;
+
+    // The tracepoint fires for every exiting thread, but the maps are keyed by
+    // the thread group. Only the last thread to exit ends the process.
+    struct task_struct * task = (struct task_struct *)bpf_get_current_task();
+    if (BPF_CORE_READ(task, signal, live.counter) != 0)
+        return 0;
+
+    u64 key;
+    u32 mntns = get_mntns_key(&key);
+    if (!mntns)
+        return 0;
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pid_key active = {.pid = pid, .key = key};
+    if (bpf_map_delete_elem(&active_pids, &active) != 0) {
+        return 0;  // key not found
+    }
+    trace_hook("removing child pid: %u", pid);
+    bpf_map_delete_elem(&child_pids, &pid);
+
+    if (report_exits) {
+        submit_event(EVENT_TYPE_EXIT, mntns, key, 0);
+    }
+    return 0;
+}
+
+// Add the processes forked by processes in child_pids to the map. Threads are
+// left out, child_pids is keyed by thread group and they share the one of
+// their process.
+SEC("tp_btf/sched_process_fork")
+int BPF_PROG(sched_process_fork, struct task_struct * parent,
+             struct task_struct * child)
+{
+    if (!_is_recording_cached)
+        return 0;
+    if (!has_filter())
+        return 0;
+
+    u32 child_pid = BPF_CORE_READ(child, pid);
+    if (child_pid != BPF_CORE_READ(child, tgid))
+        return 0;
+
+    u32 parent_tgid = BPF_CORE_READ(parent, tgid);
+    if (bpf_map_lookup_elem(&child_pids, &parent_tgid) != NULL) {
+        trace_hook("adding child pid from fork: %u", child_pid);
+        bpf_map_update_elem(&child_pids, &child_pid, &TRUE, BPF_ANY);
+    }
+    return 0;
+}
+
+SEC("tracepoint/raw_syscalls/sys_enter")
+int sys_enter(struct trace_event_raw_sys_enter * args)
+{
+    if (!_is_recording_cached)
+        return 0;
+    // Sanity check for syscall ID range, an invalid syscall of -1 wraps
+    // around.
+    u32 syscall_id = args->id;
+    if (syscall_id >= MAX_SYSCALLS) {
+        return 0;
+    }
+
+    u64 key;
+    u32 mntns = get_mntns_key(&key);
+    if (mntns == 0) {
+        return 0;
+    }
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    // Notify the userspace when a new process is found. This will allow
+    // the userspace to look up the container ID from cgroups of the
+    // process. And using the container ID, it will search further the
+    // security profile assigned to this container in the cluster.
+    //
+    // Every key a process records under is reported, as a process can move
+    // to another key after its first syscall, for example into a nested
+    // cgroup or an unshared mount namespace, and its threads can record
+    // under different keys. The lookup comes first, as it takes no lock
+    // while updating the map does and this runs for every syscall.
+    struct pid_key active = {.pid = pid, .key = key};
+    bool reported = false;
+    if (bpf_map_lookup_elem(&active_pids, &active) == NULL &&
+        bpf_map_update_elem(&active_pids, &active, &TRUE, BPF_NOEXIST) == 0) {
+        trace_hook("new pid observed: %u, mntns: %u", pid, mntns);
+        if (submit_new_pid(mntns, key) != 0) {
+            // Report the process with its next syscall instead of never.
+            bpf_map_delete_elem(&active_pids, &active);
+        } else {
+            reported = true;
+        }
+    }
+
+    // Syscalls of the 32 bit ABI would be recorded as the native ones with
+    // the same numbers.
+    if (is_compat_task()) {
+        count_lost(LOST_COMPAT_SYSCALL);
+        return 0;
+    }
+
+    // The container runtimes start a container with an init process which
+    // sets up the container and then execs its entrypoint. The seccomp
+    // profile only has to allow what runs once the filter is installed, and
+    // the AppArmor profile only applies from the exec on, so what got
+    // recorded before is dropped. Only the first time per key, later inits
+    // are execs into the running container, see clear_seccomp.
+    if ((is_exec_syscall(syscall_id) || is_seccomp_install(syscall_id, args)) &&
+        is_container_init()) {
+        if (is_exec_syscall(syscall_id)) {
+            clear_apparmor(mntns, key);
+        } else {
+            clear_seccomp(key);
+        }
+    }
+
+    // Record the syscall for this key
+    u8 * value = bpf_map_lookup_elem(&recorded_syscalls, &key);
+    if (!value) {
+        // Initialise the syscalls recording buffer. Another CPU may have done
+        // so concurrently, which is why an existing entry is not overwritten.
+        static const char init[MAX_SYSCALLS];
+        long err =
+            bpf_map_update_elem(&recorded_syscalls, &key, &init, BPF_NOEXIST);
+        if (err != 0 && err != -EEXIST) {
+            count_lost(LOST_SYSCALLS_MAP_FULL);
+            return 0;
+        }
+        // A new key of a known process is reported as well, so that the
+        // userspace can exclude it again after its exclusion got evicted.
+        if (err == 0 && !reported) {
+            submit_new_pid(mntns, key);
+        }
+        value = bpf_map_lookup_elem(&recorded_syscalls, &key);
+        if (!value) {
+            // Removed again in between, e.g. by the runc init hook.
+            return 0;
+        }
+    }
+    value[syscall_id] = 1;
+
+    return 0;
+}
+
+// Hooking a rarely used syscall to refresh `_is_recording_cached`.
+// This is (hopefully) more efficient than calling `bpf_map_lookup_elem` on
+// every hook.
+SEC("tracepoint/syscalls/sys_enter_getgid")
+int sys_enter_getgid(struct syscall_trace_enter * ctx)
+{
+    const int key = 0;
+    bool * value = bpf_map_lookup_elem(&is_recording, &key);
+    _is_recording_cached = value && *value;
+    return 0;
+}
+
+static inline bool has_filter()
+{
+    return filter_name[0] != 0;
+}
+
+static inline bool matches_filter(char * comm)
+{
+    // We cannot use __builtin_memcmp() until llvm bug
+    // https://llvm.org/bugs/show_bug.cgi?id=26218 got resolved
+    // Use TASK_COMM_LEN - 1 because the last byte is a null byte due to
+    // truncation and MAX_COMM_LEN is potentially longer.
+    for (int i = 0; i < TASK_COMM_LEN - 1; i++) {
+        if (comm[i] != filter_name[i]) {
+            return false;
+        }
+
+        // Stop searching when comm is done
+        if (comm[i] == 0) {
+            break;
+        }
+    }
+
+    return true;
+}

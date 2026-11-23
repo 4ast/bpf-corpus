@@ -1,0 +1,4 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Isrc/bpf -Isrc -I. -I../../include
+
+features: src/bpf/features.bpf.c | $F
+rbperf: src/bpf/rbperf.bpf.c | $F | !nc?set:use_ringbuf=1

@@ -1,0 +1,159 @@
+#pragma once
+
+// clang-format off
+#include "types.h"
+
+#include "vmlinux.h"
+
+#include <bpf/bpf_helpers.h>
+
+/**
+ * Helper struct with buffers for various operations
+ */
+struct helper_t {
+  char buf[PATH_MAX * 2];
+  const unsigned char* array[16];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, struct helper_t);
+  __uint(max_entries, 1);
+} helper_map SEC(".maps");
+
+__always_inline static struct helper_t* get_helper() {
+  unsigned int zero = 0;
+  return bpf_map_lookup_elem(&helper_map, &zero);
+}
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __type(key, struct path_prefix_t);
+  __type(value, char);
+  __uint(max_entries, 256);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} path_prefix SEC(".maps");
+
+/**
+ * Helper struct holding a path in a buffer and its current length.
+ *
+ * The memory layout of this type is compliant with the requirements for
+ * BPF_MAP_TYPE_LPM_TRIE lookups.
+ *
+ * We don't need access from userspace to this type, so we don't need
+ * to define it in types.h.
+ *
+ * On some hooks the path might need to be handcrafted from multiple
+ * sources, like a struct path* and a struct dentry*. In those cases the
+ * verifier will think we can copy PATH_MAX bytes for each operation, so
+ * the buffer here is (PATH_MAX * 2) in size to keep the verifier happy.
+ */
+struct bound_path_t {
+  unsigned int len;
+  char path[PATH_MAX * 2];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, struct bound_path_t);
+  __uint(max_entries, 2);
+} bound_path_heap SEC(".maps");
+
+typedef enum {
+  BOUND_PATH_MAIN = 0,
+  BOUND_PATH_ALTERNATE = 1,
+} bound_path_buffer_t;
+
+__always_inline static struct bound_path_t* get_bound_path(bound_path_buffer_t key) {
+  return bpf_map_lookup_elem(&bound_path_heap, &key);
+}
+
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 8 * 1024 * 1024);
+} rb SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, inode_key_t);
+  __type(value, inode_value_t);
+  __uint(max_entries, 65536);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} inode_map SEC(".maps");
+
+// Context for correlating operations in d_instantiate
+struct d_instantiate_ctx_t {
+  struct bound_path_t path;
+  inode_key_t parent_inode;
+  monitored_t monitored;
+  file_activity_type_t event_type;
+  char symlink_target[PATH_MAX];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, __u64);
+  __type(value, struct d_instantiate_ctx_t);
+  __uint(max_entries, 512);
+} d_instantiate_ctx SEC(".maps");
+
+__always_inline static struct d_instantiate_ctx_t* get_d_instantiate_ctx() {
+  __u64 pid = bpf_get_current_pid_tgid();
+  return bpf_map_lookup_elem(&d_instantiate_ctx, &pid);
+}
+
+__always_inline static long delete_d_instantiate_ctx() {
+  __u64 pid = bpf_get_current_pid_tgid();
+  return bpf_map_delete_elem(&d_instantiate_ctx, &pid);
+}
+
+__always_inline static struct d_instantiate_ctx_t* get_or_insert_d_instantiate_ctx() {
+  static const struct d_instantiate_ctx_t empty_ctx = {
+    .event_type = FILE_ACTIVITY_INIT,
+  };
+
+  __u64 pid = bpf_get_current_pid_tgid();
+  struct d_instantiate_ctx_t* ctx = bpf_map_lookup_elem(&d_instantiate_ctx, &pid);
+  if (ctx != NULL) {
+    // Clear the event type so `d_instantiate` doesn't trigger by accident
+    ctx->event_type = FILE_ACTIVITY_INIT;
+    return ctx;
+  }
+
+  if (bpf_map_update_elem(&d_instantiate_ctx, &pid, &empty_ctx, BPF_NOEXIST) != 0) {
+    return NULL;
+  }
+
+  ctx = bpf_map_lookup_elem(&d_instantiate_ctx, &pid);
+  if (ctx == NULL) {
+    return NULL;
+  }
+  return ctx;
+}
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, struct metrics_t);
+  __uint(max_entries, 1);
+} metrics SEC(".maps");
+
+// Track pid_tgid of overlayfs file_open events so we can skip the
+// duplicate underlying filesystem event that follows immediately.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, __u64);
+  __type(value, char);
+  __uint(max_entries, 256);
+} overlayfs_dedup SEC(".maps");
+
+__always_inline static struct metrics_t* get_metrics() {
+  unsigned int zero = 0;
+  return bpf_map_lookup_elem(&metrics, &zero);
+}
+
+uint64_t host_mount_ns;
+
+// clang-format on

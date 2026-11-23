@@ -1,0 +1,4 @@
+op = 1
+init_capacity = 8
+key = 5
+val = 55

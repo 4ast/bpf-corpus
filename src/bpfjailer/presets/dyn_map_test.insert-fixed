@@ -1,0 +1,7 @@
+op = 6
+init_capacity = 8
+seed_count = 1
+seed_keys[0] = 1
+seed_vals[0] = 10
+key = 2
+val = 20

@@ -1,0 +1,9 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Isrc -I. -Iinclude -I../../include/vmlinux -I../../include
+
+net_buffer_tuner: src/net_buffer_tuner.bpf.c | $F
+netns_tuner: src/netns_tuner.bpf.c | $F
+probe: src/probe.bpf.c | $F
+route_table_tuner: src/route_table_tuner.bpf.c | $F
+sysctl_tuner: src/sysctl_tuner.bpf.c | $F
+tcp_conn_tuner: src/tcp_conn_tuner.bpf.c | $F
+udp_buffer_tuner: src/udp_buffer_tuner.bpf.c | $F

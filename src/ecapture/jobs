@@ -1,0 +1,8 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -DKERNEL_LESS_5_2=0 -Ikern -Ikern/bpf/x86 -I../../include
+
+bash_kern: kern/bash_kern.c | $F
+gotls_kern: kern/gotls_kern.c | $F
+mysqld_kern: kern/mysqld_kern.c | $F
+nspr_kern: kern/nspr_kern.c | $F
+postgres_kern: kern/postgres_kern.c | $F
+zsh_kern: kern/zsh_kern.c | $F

@@ -1,0 +1,16 @@
+# What the archives in obj/ have. The first line that matches PROJECT/OBJECT counts.
+# PROJECT/OBJECT        COMPILER-CPU[-FLAVOUR] ..
+
+# options of a project: debug, no jump tables, ..
+*/*+*                   clang-18-v3 clang-23-v3 clang-23-v4
+
+# old releases
+datadog-agent-7.*/*usm*  clang-15-v2 clang-17-v2 clang-18-v[34] clang-20-v[34] clang-23-v4 gcc-16-v3
+datadog-agent-7.*       clang-15-v2 clang-17-v2 clang-18-v3 clang-20-v3 clang-23-v4 gcc-16-v3
+falco-libs-0.*          clang-14-v2 clang-16-v2 clang-18-v3 clang-20-v3 clang-23-v4 gcc-16-v3
+*-v[0-9]*/*             clang-14-v2 clang-16-v2 clang-18-v3 clang-20-v3 clang-23-v4 gcc-16-v3
+
+linux/selftests-*       clang-19-v3 clang-21-v? clang-23-v? gcc-15-v3 gcc-16-v?
+
+# the latest sources
+*                       clang-??-v? gcc-14-v3 gcc-1[5-9]-v? clang-18-v3-* clang-23-v3-*

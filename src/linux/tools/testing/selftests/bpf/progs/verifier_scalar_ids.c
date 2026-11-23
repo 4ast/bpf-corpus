@@ -1,0 +1,796 @@
+// SPDX-License-Identifier: GPL-2.0
+
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+#include "bpf_misc.h"
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, long long);
+	__type(value, long long);
+} map_hash_8b SEC(".maps");
+
+/* scalar in [0, max], as it is in the log. @id: the registers that hold copies of one value. */
+#define ALONE(max, mask) \
+	"scalar(smin=smin32=0,smax=umax=smax32=umax32=" #max ",var_off=(0x0; " #mask "))"
+#define LINKED(id, max, mask) ALONE(max, mask)
+
+/*
+ * Registers r{0,1,2} have the same scalar ID.
+ * Range information is propagated for scalars sharing same ID
+ * for 'if <reg> <op> <const>' insn.
+ * The registers share the ID in the join of both branches too.
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("4: (25) if r1 > 0x7 goto pc+0         ; R0=" LINKED("1", 7, 0x7) " R1=" LINKED("1", 7, 0x7) " R2=" LINKED("1", 7, 0x7))
+__msg("5: R0=" LINKED("1", 255, 0xff) " R1=" LINKED("1", 255, 0xff) " R2=" LINKED("1", 255, 0xff))
+__naked void linked_regs_bpf_k(void)
+{
+	asm volatile (
+	/* r0 = random number up to 0xff */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* tie r0.id == r1.id == r2.id */
+	"r1 = r0;"
+	"r2 = r0;"
+	"if r1 > 7 goto +0;"
+	"r3 = r10;"
+	"r3 += r0;"
+	/* Mark r1 and r2 as alive. */
+	"r1 = r1;"
+	"r2 = r2;"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/*
+ * Registers r{0,1,2} share same ID when 'if r1 > r3' insn is processed,
+ * check that range information is propagated to all of them.
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("5: (2d) if r1 > r3 goto pc+0          ; R0=" LINKED("1", 7, 0x7) " R1=" LINKED("1", 7, 0x7) " R2=" LINKED("1", 7, 0x7))
+__msg("6: R0=" LINKED("1", 255, 0xff) " R1=" LINKED("1", 255, 0xff) " R2=" LINKED("1", 255, 0xff))
+__naked void linked_regs_bpf_x_src(void)
+{
+	asm volatile (
+	/* r0 = random number up to 0xff */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* tie r0.id == r1.id == r2.id */
+	"r1 = r0;"
+	"r2 = r0;"
+	"r3 = 7;"
+	"if r1 > r3 goto +0;"
+	"r4 = r10;"
+	"r4 += r0;"
+	/* Mark r1 and r2 as alive. */
+	"r1 = r1;"
+	"r2 = r2;"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/* Same as linked_regs_bpf_x_src(), r3 is what is used after the jump. */
+SEC("socket")
+__success __log_level(2)
+__msg("5: (2d) if r1 > r3 goto pc+0          ; R0=" LINKED("1", 7, 0x7) " R1=" LINKED("1", 7, 0x7) " R2=" LINKED("1", 7, 0x7))
+__msg("7: (0f) r4 += r3                      ; R3=7 R4=fp7")
+__naked void linked_regs_bpf_x_dst(void)
+{
+	asm volatile (
+	/* r0 = random number up to 0xff */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* tie r0.id == r1.id == r2.id */
+	"r1 = r0;"
+	"r2 = r0;"
+	"r3 = 7;"
+	"if r1 > r3 goto +0;"
+	"r4 = r10;"
+	"r4 += r3;"
+	/* Mark r1 and r2 as alive. */
+	"r0 = r0;"
+	"r1 = r1;"
+	"r2 = r2;"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/* Same as linked_regs_bpf_k, but break one of the
+ * links, note that r1 is absent from the first __msg below.
+ */
+SEC("socket")
+__success __log_level(2)
+/* r1 is not there */
+__msg("5: (25) if r0 > 0x7 goto pc+0         ; R0=" LINKED("1", 7, 0x7) " R2=" LINKED("1", 7, 0x7) "{{$}}")
+__msg("8: (bf) r1 = r1                       ; R1=0")
+__naked void linked_regs_broken_link(void)
+{
+	asm volatile (
+	/* r0 = random number up to 0xff */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* tie r0.id == r1.id == r2.id */
+	"r1 = r0;"
+	"r2 = r0;"
+	/* break link for r1, this is the only line that differs
+	 * compared to the previous test
+	 */
+	"r1 = 0;"
+	"if r0 > 7 goto +0;"
+	"r3 = r10;"
+	"r3 += r0;"
+	/* Mark r1 and r2 as alive. */
+	"r1 = r1;"
+	"r2 = r2;"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/*
+ * Use the same scalar ID in multiple stack frames. A static function is verified
+ * on its own: registers of the callers are not there when r1 is compared, so it has no ID.
+ * They share their IDs after the calls like before, if there is more than one left.
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("13: (25) if r1 > 0x7 goto pc+0        ; R1=" ALONE(7, 0x7))
+__msg("10: R0=0 R6=scalar({{.*}}umax32=255,{{.*}} R7=scalar({{.*}}umax32=255,")
+__msg("5: R0=0 R6=" ALONE(255, 0xff))
+__naked void precision_many_frames(void)
+{
+	asm volatile (
+	/* r0 = random number up to 0xff */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* tie r0.id == r1.id == r6.id */
+	"r1 = r0;"
+	"r6 = r0;"
+	"call precision_many_frames__foo;"
+	"r6 = r6;" /* mark r6 as live */
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+static __naked __noinline __used
+void precision_many_frames__foo(void)
+{
+	asm volatile (
+	/* conflate one of the register numbers (r6) with outer frame,
+	 * to verify that those are tracked independently
+	 */
+	"r6 = r1;"
+	"r7 = r1;"
+	"call precision_many_frames__bar;"
+	"r6 = r6;" /* mark r6 as live */
+	"r7 = r7;" /* mark r7 as live */
+	"exit"
+	::: __clobber_all);
+}
+
+static __naked __noinline __used
+void precision_many_frames__bar(void)
+{
+	asm volatile (
+	"if r1 > 7 goto +0;"
+	"r6 = 0;" /* mark r6 as live */
+	"r7 = 0;" /* mark r7 as live */
+	"r2 = r10;"
+	"r2 += r1;"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/*
+ * Check that range information is propagated to scalars with the same IDs on stack as
+ * well as in registers.
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("10: (25) if r1 > 0x7 goto pc+0        ; R1=scalar({{.*}}umax32=7,{{.*}} fp-8=scalar({{.*}}umax32=7,{{.*}} fp-16=scalar({{.*}}umax32=7,")
+__naked void precision_stack(void)
+{
+	asm volatile (
+	/* r0 = random number up to 0xff */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* tie r0.id == r1.id == fp[-8].id */
+	"r1 = r0;"
+	"*(u64*)(r10 - 8) = r1;"
+	"call precision_stack__foo;"
+	"r0 = *(u64*)(r10 - 8);"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+static __naked __noinline __used
+void precision_stack__foo(void)
+{
+	asm volatile (
+	/* conflate one of the register numbers (r6) with outer frame,
+	 * to verify that those are tracked independently
+	 */
+	"*(u64*)(r10 - 8) = r1;"
+	"*(u64*)(r10 - 16) = r1;"
+	"if r1 > 7 goto +0;"
+	"r2 = r10;"
+	"r2 += r1;"
+	"r0 = *(u64*)(r10 - 8);"
+	"r0 = *(u64*)(r10 - 16);"
+	"exit"
+	::: __clobber_all);
+}
+
+/* Use two separate scalar IDs to check that these are propagated
+ * independently.
+ */
+SEC("socket")
+__success __log_level(2)
+/* r{6,7} */
+__msg("9: (25) if r7 > 0x7 goto pc+0         ; R6=" LINKED("1", 7, 0x7) " R7=" LINKED("1", 7, 0x7) "{{$}}")
+/* r{8,9} */
+__msg("10: (25) if r9 > 0x7 goto pc+0        ; R8=" LINKED("2", 7, 0x7) " R9=" LINKED("2", 7, 0x7) "{{$}}")
+__naked void precision_two_ids(void)
+{
+	asm volatile (
+	/* r6 = random number up to 0xff
+	 * r6.id == r7.id
+	 */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	"r6 = r0;"
+	"r7 = r0;"
+	/* same, but for r{8,9} */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	"r8 = r0;"
+	"r9 = r0;"
+	/* clear r0 id */
+	"r0 = 0;"
+	/* propagate range information to equal scalars */
+	"if r7 > 7 goto +0;"
+	"if r9 > 7 goto +0;"
+	"r3 = r10;"
+	"r3 += r7;"
+	"r3 += r9;"
+	"r6 = r6;" /* mark r6 as live */
+	"r8 = r8;" /* mark r8 as live */
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+SEC("socket")
+__success __log_level(2)
+/* there is no limit of 5 registers for a single insn */
+__msg("7: (25) if r5 > 0x7 goto pc+0         ; R0=" LINKED("1", 7, 0x7) " R1=" LINKED("1", 7, 0x7) " R2=" LINKED("1", 7, 0x7) " R3=" LINKED("1", 7, 0x7) " R4=" LINKED("1", 7, 0x7) " R5=" LINKED("1", 7, 0x7))
+__naked void linked_regs_too_many_regs(void)
+{
+	asm volatile (
+	/* r0 = random number up to 0xff */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* tie r{0-5} IDs */
+	"r1 = r0;"
+	"r2 = r0;"
+	"r3 = r0;"
+	"r4 = r0;"
+	"r5 = r0;"
+	"if r5 > 7 goto +0;"
+	/* keep r{1-5} live */
+	"r1 = r1;"
+	"r2 = r2;"
+	"r3 = r3;"
+	"r4 = r4;"
+	"r5 = r5;"
+	"r7 = r10;"
+	"r7 += r0;"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+SEC("socket")
+__failure __log_level(2)
+__msg("5: (3d) if r8 >= r0 goto pc+3         ; R0=scalar(umin=1) R7=scalar(umax=0xfffffffffffffffe) R8=scalar(umax=0xfffffffffffffffe)")
+__msg("div by zero")
+__naked void linked_regs_broken_link_2(void)
+{
+	asm volatile (
+	"call %[bpf_get_prandom_u32];"
+	"r7 = r0;"
+	"r8 = r0;"
+	"call %[bpf_get_prandom_u32];"
+	"if r0 > 1 goto +0;"
+	/* r7.id == r8.id,
+	 * thus what is learned about r8 is learned about r7
+	 */
+	"if r8 >= r0 goto 1f;"
+	/* break id relation between r7 and r8 */
+	"r8 += r8;"
+	"if r7 == 0 goto 1f;"
+	"r0 /= 0;"
+"1:"
+	"r0 = 42;"
+	"exit;"
+	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/* A conditional jump that is predicted says nothing new about its operands. */
+SEC("socket")
+__success __log_level(2)
+__msg("3: (25) if r1 > 0x100 goto pc+0       ; R1=" LINKED("1", 255, 0xff) "{{$}}")
+__msg("processed 6 insns")
+__naked void cjmp_no_linked_regs_trigger(void)
+{
+	asm volatile (
+	/* r0 = random number up to 0xff */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* tie r0.id == r1.id */
+	"r1 = r0;"
+	/* the jump below is predicted */
+	"if r1 > 256 goto +0;"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/* Verify that check_ids() is used by regsafe() for scalars.
+ *
+ * r9 = ... some pointer with range X ...
+ * r6 = ... unbound scalar ID=a ...
+ * r7 = ... unbound scalar ID=b ...
+ * if (r6 > r7) goto +1
+ * r7 = r6
+ * if (r7 > X) goto exit
+ * r9 += r6
+ * ... access memory using r9 ...
+ *
+ * The memory access is safe only if r7 is bounded,
+ * which is true for one branch and not true for another.
+ */
+SEC("socket")
+__failure __msg("register with unbounded min value")
+__naked void check_ids_in_regsafe(void)
+{
+	asm volatile (
+	/* Bump allocated stack */
+	"r1 = 0;"
+	"*(u64*)(r10 - 8) = r1;"
+	/* r9 = pointer to stack */
+	"r9 = r10;"
+	"r9 += -8;"
+	/* r7 = ktime_get_ns() */
+	"call %[bpf_ktime_get_ns];"
+	"r7 = r0;"
+	/* r6 = ktime_get_ns() */
+	"call %[bpf_ktime_get_ns];"
+	"r6 = r0;"
+	/* if r6 > r7 is an unpredictable jump */
+	"if r6 > r7 goto l1_%=;"
+	"r7 = r6;"
+"l1_%=:"
+	/* if r7 > 4 ...; transfers range to r6 on one execution path
+	 * but does not transfer on another
+	 */
+	"if r7 > 4 goto l2_%=;"
+	/* Access memory at r9[r6], r6 is not always bounded */
+	"r9 += r6;"
+	"r0 = *(u8*)(r9 + 0);"
+"l2_%=:"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/* Similar to check_ids_in_regsafe.
+ * The l0 could be reached in two states:
+ *
+ *   (1) r6{.id=A}, r7{.id=A}, r8{.id=B}
+ *   (2) r6{.id=B}, r7{.id=A}, r8{.id=B}
+ *
+ * Where (2) is not safe, as "r7 > 4" check won't propagate range for it.
+ */
+SEC("socket")
+__failure __msg("register with unbounded min value")
+__naked void check_ids_in_regsafe_2(void)
+{
+	asm volatile (
+	/* Bump allocated stack */
+	"r1 = 0;"
+	"*(u64*)(r10 - 8) = r1;"
+	/* r9 = pointer to stack */
+	"r9 = r10;"
+	"r9 += -16;"
+	/* r8 = ktime_get_ns() */
+	"call %[bpf_ktime_get_ns];"
+	"r8 = r0;"
+	/* r7 = ktime_get_ns() */
+	"call %[bpf_ktime_get_ns];"
+	"r7 = r0;"
+	/* r6 = ktime_get_ns() */
+	"call %[bpf_ktime_get_ns];"
+	"r6 = r0;"
+	/* scratch .id from r0 */
+	"r0 = 0;"
+	/* if r6 > r7 is an unpredictable jump */
+	"if r6 > r7 goto l1_%=;"
+	/* tie r6 and r7 .id */
+	"r6 = r7;"
+"l0_%=:"
+	/* if r7 > 4 exit(0) */
+	"if r7 > 4 goto l2_%=;"
+	/* Access memory at r9[r6] */
+	"r9 += r6;"
+	"r9 += r7;"
+	"r9 += r8;"
+	"r0 = *(u8*)(r9 + 0);"
+"l2_%=:"
+	"r0 = 0;"
+	"exit;"
+"l1_%=:"
+	/* tie r6 and r8 .id */
+	"r6 = r8;"
+	"goto l0_%=;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/* Check that scalar IDs *are not* generated on register to register
+ * assignments if source register is a constant.
+ *
+ * If such IDs *are* generated the 'l1' below would be reached in
+ * two states:
+ *
+ *   (1) r3{.id=A}, r4{.id=A}, which is there first
+ *   (2) r3{.id=B}, r4{.id=C}
+ *
+ * and (2) is not within (1).
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("from 14 to 15: pruned")
+__msg("from 8 to 15: R3=0 R4=0")
+__msg("15: (1d) if r3 == r4 goto pc+0        ; R3=0 R4=0")
+__msg("processed 18 insns")
+__naked void no_scalar_id_for_const(void)
+{
+	asm volatile (
+	"call %[bpf_ktime_get_ns];"
+	/* unpredictable jump */
+	"if r0 <= 7 goto l2_%=;"
+	"goto l0_%=;"
+"l2_%=:"
+	/* possibly generate same scalar ids for r3 and r4 */
+	"r1 = 0;"
+	"r1 ^= r1;" /* prevent bpf_prune_dead_branches from folding the branch */
+	"r1 = r1;"
+	"r3 = r1;"
+	"r4 = r1;"
+	"goto l1_%=;"
+"l0_%=:"
+	/* possibly generate different scalar ids for r3 and r4 */
+	"r1 = 0;"
+	"r1 ^= r1;"
+	"r2 = 0;"
+	"r2 ^= r2;"
+	"r3 = r1;"
+	"r4 = r2;"
+"l1_%=:"
+	/* predictable jump */
+	"if r3 == r4 goto +0;"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/* Same as no_scalar_id_for_const() but for 32-bit values */
+SEC("socket")
+__success __log_level(2)
+__msg("from 14 to 15: pruned")
+__msg("from 8 to 15: R3=0 R4=0")
+__msg("15: (1e) if w3 == w4 goto pc+0        ; R3=0 R4=0")
+__msg("processed 18 insns")
+__naked void no_scalar_id_for_const32(void)
+{
+	asm volatile (
+	"call %[bpf_ktime_get_ns];"
+	/* unpredictable jump */
+	"if r0 <= 7 goto l2_%=;"
+	"goto l0_%=;"
+"l2_%=:"
+	/* possibly generate same scalar ids for r3 and r4 */
+	"w1 = 0;"
+	"w1 ^= w1;" /* prevent bpf_prune_dead_branches from folding the branch */
+	"w1 = w1;"
+	"w3 = w1;"
+	"w4 = w1;"
+	"goto l1_%=;"
+"l0_%=:"
+	/* possibly generate different scalar ids for r3 and r4 */
+	"w1 = 0;"
+	"w1 ^= w1;"
+	"w2 = 0;"
+	"w2 ^= w2;"
+	"w3 = w1;"
+	"w4 = w2;"
+"l1_%=:"
+	/* predictable jump */
+	"if w3 == w4 goto +0;"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/*
+ * Check that unique scalar IDs are ignored when a verifier state is
+ * compared to the state that is there. For this test:
+ * - the state that is there had a unique id on r1
+ * - the state that arrives has no id on r1
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("6: (25) if r6 > 0x7 goto pc+1")
+__msg("7: (57) r1 &= 255")
+__msg("from 7 to 8: pruned")
+__msg("8: R0=0 R1=" ALONE(255, 0xff))
+__msg("processed 11 insns")
+__naked void ignore_unique_scalar_ids_old(void)
+{
+	asm volatile (
+	"call %[bpf_ktime_get_ns];"
+	"r6 = r0;"
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* r1.id == r0.id */
+	"r1 = r0;"
+	/* make r1.id unique */
+	"r0 = 0;"
+	"if r6 > 7 goto l0_%=;"
+	/* clear r1 id, but keep the range compatible */
+	"r1 &= 0xff;"
+"l0_%=:"
+	/* get here in two states:
+	 * - first: r1 has a unique id
+	 * - second: r1 has no id (should be considered to be within the first)
+	 */
+	"r2 = r10;"
+	"r2 += r1;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/*
+ * Check that unique scalar IDs are ignored when a verifier state is
+ * compared to the state that is there. For this test:
+ * - the state that is there has no id on r1
+ * - the state that arrives has a unique id on r1
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("6: (25) if r6 > 0x7 goto pc+1")
+__msg("7: (05) goto pc+1")
+__msg("from 7 to 9: pruned")
+__msg("9: R0=0 R1=scalar(smin=smin32=0,smax=umax=smax32=umax32=255,var_off=(0x0; 0xff)) R10=fp0")
+__msg("processed 12 insns")
+__naked void ignore_unique_scalar_ids_cur(void)
+{
+	asm volatile (
+	"call %[bpf_ktime_get_ns];"
+	"r6 = r0;"
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	/* r1.id == r0.id */
+	"r1 = r0;"
+	/* make r1.id unique */
+	"r0 = 0;"
+	"if r6 > 7 goto l1_%=;"
+	"goto l0_%=;"
+"l1_%=:"
+	/* clear r1 id, but keep the range compatible */
+	"r1 &= 0xff;"
+"l0_%=:"
+	/* get here in two states:
+	 * - first: r1 has no id
+	 * - second: r1 has a unique id (should be considered to be within the first)
+	 */
+	"r2 = r10;"
+	"r2 += r1;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/*
+ * Check that two registers with 0 scalar IDs in the state that is there can be mapped
+ * to the same scalar ID in the state that arrives.
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("from 10 to 11: pruned")
+__msg("processed 15 insns")
+__naked void two_nil_old_ids_one_cur_id(void)
+{
+	asm volatile (
+	/* Give unique scalar IDs to r{6,7} */
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	"r6 = r0;"
+	"r6 *= 1;"
+	"call %[bpf_ktime_get_ns];"
+	"r0 &= 0xff;"
+	"r7 = r0;"
+	"r7 *= 1;"
+	"r0 = 0;"
+	/* Maybe make r{6,7} IDs identical */
+	"if r6 <= r7 goto l1_%=;"
+	"r6 = r7;"
+"l1_%=:"
+	/*
+	 * Get here in two states:
+	 * - first:  r6{.id=0}, r7{.id=0}
+	 * - second: r6{.id=A}, r7{.id=A}
+	 * Verifier considers the second one to be within the first one.
+	 * Thus "exit;" would be verified only once.
+	 */
+	"r2 = r10;"
+	"r2 += r6;"
+	"r2 += r7;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+SEC("socket")
+/* Note the flag, see verifier.c:opt_subreg_zext_lo32_rnd_hi32() */
+__flag(BPF_F_TEST_RND_HI32)
+__success
+/* This test was added because of a bug in verifier.c:sync_linked_regs(),
+ * upon range propagation it destroyed subreg_def marks for registers.
+ * The subreg_def mark is used to decide whether zero extension instructions
+ * are needed when register is read. When BPF_F_TEST_RND_HI32 is set it
+ * also causes generation of statements to randomize upper halves of
+ * read registers.
+ *
+ * The test is written in a way to return an upper half of a register
+ * that is affected by range propagation and must have it's subreg_def
+ * preserved. This gives a return value of 0 and leads to undefined
+ * return value if subreg_def mark is not preserved.
+ */
+__retval(0)
+/* Check that verifier believes r1/r0 are zero at exit */
+__log_level(2)
+__msg("4: (77) r1 >>= 32                     ; R1=0")
+__msg("5: (bf) r0 = r1                       ; R0=0 R1=0")
+__msg("6: (95) exit")
+/* Verify that statements to randomize upper half of r1 had not been
+ * generated.
+ */
+__xlated("call unknown")
+__xlated("r0 &= 2147483647")
+__xlated("w1 = w0")
+/* This is how disasm.c prints BPF_ZEXT_REG at the moment, x86 and arm
+ * are the only CI archs that do not need zero extension for subregs.
+ */
+#if !defined(__TARGET_ARCH_x86) && !defined(__TARGET_ARCH_arm64)
+__xlated("w1 = w1")
+#endif
+__xlated("if w0 < 0xa goto pc+0")
+__xlated("r1 >>= 32")
+__xlated("r0 = r1")
+__xlated("exit")
+__naked void linked_regs_and_subreg_def(void)
+{
+	asm volatile (
+	"call %[bpf_ktime_get_ns];"
+	/* make sure r0 is in 32-bit range, otherwise w1 = w0 won't
+	 * assign same IDs to registers.
+	 */
+	"r0 &= 0x7fffffff;"
+	/* link w1 and w0 via ID */
+	"w1 = w0;"
+	/* 'if' statement propagates range info from w0 to w1,
+	 * but should not affect w1->subreg_def property.
+	 */
+	"if w0 < 10 goto +0;"
+	/* r1 is read here, on archs that require subreg zero
+	 * extension this would cause zext patch generation.
+	 */
+	"r1 >>= 32;"
+	"r0 = r1;"
+	"exit;"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/*
+ * A scalar is spilled to the stack and then filled twice: once via a
+ * sign-extending load (BPF_MEMSX) into r4 and once via a zero-extending
+ * load (BPF_MEM) into r5. coerce_scalar_to_size_sx() gives r4 a different
+ * value than the spilled/zero-extended siblings, so r4 must not keep the
+ * shared scalar id. Otherwise the later 'if r5 == 0x80000000' refines r4
+ * through sync_linked_regs() to a known 0x80000000, while at runtime r4
+ * is the sign-extended 0xffffffff80000000. The test turns that discrepancy
+ * into an out-of-bounds map value access (r4 >> 63 is believed 0 but is 1
+ * at runtime), which must be rejected.
+ */
+SEC("socket")
+__failure __msg("invalid access to map value, value_size=8 off=8 size=1")
+__naked void ldsx_fill_scalar_id_not_shared(void)
+{
+	asm volatile ("					\
+	r1 = 0;						\
+	*(u64*)(r10 - 8) = r1;				\
+	r2 = r10;					\
+	r2 += -8;					\
+	r1 = %[map_hash_8b] ll;				\
+	call %[bpf_map_lookup_elem];			\
+	if r0 == 0 goto l0_%=;				\
+	/* r7 = unknown u32, keep only bit 31 */	\
+	r7 = *(u32*)(r0 + 0);				\
+	r2 = 0x80000000 ll;				\
+	r7 &= r2;					\
+	/* link r6 and r7 via a fresh scalar id */	\
+	r6 = r7;					\
+	/* spill r7 (u32) to the stack */		\
+	*(u32*)(r10 - 8) = r7;				\
+	/* sign-extending fill: must drop the id */	\
+	r4 = *(s32*)(r10 - 8);				\
+	/* zero-extending fill: keeps the id */		\
+	r5 = *(u32*)(r10 - 8);				\
+	/* r5 becomes known 0x80000000 on fall-through */\
+	if r5 != r2 goto l0_%=;				\
+	/* verifier believes r4 == 0 here, runtime is 1 */\
+	r4 >>= 63;					\
+	r0 += r4;					\
+	r0 = *(u8*)(r0 + 7);				\
+l0_%=:	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_hash_8b)
+	: __clobber_all);
+}
+
+char _license[] SEC("license") = "GPL";

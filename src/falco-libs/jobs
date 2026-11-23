@@ -1,0 +1,5 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -D__RELEASE__ -D__USE_VMLINUX__ -Idriver/modern_bpf -I. -Idriver/modern_bpf/definitions/x86_64 -I../../include
+
+modern: driver/modern_bpf/**/*.bpf.c | $F
+modern+nj: driver/modern_bpf/**/*.bpf.c | $F -fno-jump-tables
+modern+dbg: driver/modern_bpf/**/*.bpf.c | $F -U__RELEASE__ -D__MODERN_BPF_DEBUG__

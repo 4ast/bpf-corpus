@@ -1,0 +1,11 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__ -Ikernel -I. -I../../include/vmlinux -I../../include
+
+llb_ebpf_emain: kernel/llb_ebpf_emain.c | $F
+llb_ebpf_main: kernel/llb_ebpf_main.c | $F
+llb_kern_entry: kernel/llb_kern_entry.c | $F
+llb_kern_mon: kernel/llb_kern_mon.c | $F
+llb_kern_sock: kernel/llb_kern_sock.c | $F
+llb_kern_sockdirect: kernel/llb_kern_sockdirect.c | $F
+llb_kern_sockmap: kernel/llb_kern_sockmap.c | $F
+llb_kern_sockstream: kernel/llb_kern_sockstream.c | $F
+llb_xdp_main: kernel/llb_xdp_main.c | $F

@@ -1,0 +1,15 @@
+--- a/pkg/security/ebpf/c/include/maps.h
++++ b/pkg/security/ebpf/c/include/maps.h
+@@ -143,7 +143,11 @@
+ BPF_PROG_ARRAY(flush_network_stats_progs, 2)
+ BPF_PROG_ARRAY(open_ret_progs, 1)
+ 
+-BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#ifdef CORPUS_MODERN_MAPS
++struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 33554432); } events SEC(".maps");
++#else
++ BPF_PERF_EVENT_ARRAY_MAP(events, u32)
++#endif
+ BPF_PERCPU_ARRAY_MAP(events_stats, struct perf_map_stats_t, EVENT_MAX)
+ 
+ #if USE_RING_BUFFER == 1

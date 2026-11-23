@@ -1,0 +1,1 @@
+tracee: pkg/ebpf/c/tracee.bpf.c | -D__TARGET_ARCH_x86 -D__BPF_TRACING__ -Ipkg/ebpf/c -I../../include -DCORE -DCOMMON_BUILD

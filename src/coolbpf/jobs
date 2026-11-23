@@ -1,0 +1,19 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+F1 = $F -Isrc/agentsight/src/bpf -Isrc/agentsight/src -Isrc/agentsight -Isrc -I. -Iarch/x86_64 -Ithird/libbpf/include -I../../include
+F2 = $F -Isrc/profiler/src/bpf -Isrc/profiler/src -Isrc/profiler -Isrc -I. -Iarch/x86_64 -Ithird/libbpf/include -I../../include
+
+process: src/agentsight/crates/ebpf-ifc-engine/process.bpf.c | $F -Isrc/agentsight/crates/ebpf-ifc-engine -Isrc/agentsight/crates -Isrc/agentsight -Isrc -I. -Iarch/x86_64 -Ithird/libbpf/include -I../../include
+filewatch: src/agentsight/src/bpf/filewatch.bpf.c | $F1
+filewrite: src/agentsight/src/bpf/filewrite.bpf.c | $F1
+procmon: src/agentsight/src/bpf/procmon.bpf.c | $F1
+proctrace: src/agentsight/src/bpf/proctrace.bpf.c | $F1
+sslsniff: src/agentsight/src/bpf/sslsniff.bpf.c | $F1
+tcpsniff: src/agentsight/src/bpf/tcpsniff.bpf.c | $F1
+udpdns: src/agentsight/src/bpf/udpdns.bpf.c | $F1
+hotspot: src/profiler/src/bpf/hotspot.bpf.c | $F2
+interpreter_dispatcher: src/profiler/src/bpf/interpreter_dispatcher.bpf.c | $F2
+native_stack: src/profiler/src/bpf/native_stack.bpf.c | $F2
+nspid_pid: src/profiler/src/bpf/nspid_pid.bpf.c | $F2
+python: src/profiler/src/bpf/python.bpf.c | $F2
+sched_monitor: src/profiler/src/bpf/sched_monitor.bpf.c | $F2
+system_config: src/profiler/src/bpf/system_config.bpf.c | $F2

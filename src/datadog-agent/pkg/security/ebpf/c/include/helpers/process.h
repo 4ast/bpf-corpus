@@ -1,0 +1,221 @@
+#ifndef _HELPERS_PROCESS_H_
+#define _HELPERS_PROCESS_H_
+
+#include "constants/custom.h"
+#include "constants/enums.h"
+#include "constants/offsets/process.h"
+#include "cgroup.h"
+#include "maps.h"
+#include "events_definition.h"
+
+static __attribute__((always_inline)) void send_signal(u32 pid) {
+    if (is_send_signal_available()) {
+        u32 *sig = bpf_map_lookup_elem(&kill_list, &pid);
+        if ((sig != NULL && *sig != 0)) {
+#if defined(DEBUG_SEND_SIGNAL)
+            bpf_printk("Sending signal %d to pid %d\n", *sig, pid);
+#endif
+            bpf_send_signal(*sig);
+            bpf_map_delete_elem(&kill_list, &pid);
+        }
+    }
+}
+
+static __attribute__((always_inline)) u32 copy_tty_name(const char src[TTY_NAME_LEN], char dst[TTY_NAME_LEN]) {
+    if (src[0] == 0) {
+        return 0;
+    }
+
+    bpf_probe_read(dst, TTY_NAME_LEN, (void *)src);
+    return TTY_NAME_LEN;
+}
+
+static __always_inline void copy_proc_entry(struct process_entry_t *src, struct process_entry_t *dst) {
+    dst->executable = src->executable;
+    dst->exec_timestamp = src->exec_timestamp;
+    copy_tty_name(src->tty_name, dst->tty_name);
+    bpf_probe_read(dst->comm, TASK_COMM_LEN, src->comm);
+    dst->file_capabilities = src->file_capabilities;
+}
+
+static __always_inline void copy_pid_cache_except_exit_ts(struct pid_cache_t *src, struct pid_cache_t *dst) {
+    dst->cookie = src->cookie;
+    dst->user_session_id = src->user_session_id;
+    dst->fork_timestamp = src->fork_timestamp;
+    dst->fork_flags = src->fork_flags;
+    dst->sid = src->sid;
+    dst->credentials = src->credentials;
+}
+
+static __always_inline struct proc_cache_t *get_proc_from_cookie(u64 cookie) {
+    if (!cookie) {
+        return NULL;
+    }
+
+    return bpf_map_lookup_elem(&proc_cache, &cookie);
+}
+
+static __always_inline struct pid_cache_t *get_pid_cache(u32 tgid) {
+    return (struct pid_cache_t *)bpf_map_lookup_elem(&pid_cache, &tgid);
+}
+
+static __always_inline struct proc_cache_t *get_proc_cache(u32 tgid) {
+    struct pid_cache_t *pid_entry = get_pid_cache(tgid);
+    if (!pid_entry) {
+        return NULL;
+    }
+
+    // Select the cache entry
+    return get_proc_from_cookie(pid_entry->cookie);
+}
+
+// update_proc_cache_cgroup refreshes the cached cgroup inode of the current task inline,
+// for hook points that cannot use the tail-call variant because they already chain to a
+// different tail call (e.g. resolve_dentry).
+static __attribute__((always_inline)) void update_proc_cache_cgroup() {
+    u64 cgroup_id = get_current_cgroup_id();
+    if (cgroup_id) {
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        struct proc_cache_t *entry = get_proc_cache(pid);
+        if (entry) {
+            entry->cgroup.path_key.ino = cgroup_id;
+        }
+    }
+}
+
+static u32 __attribute__((always_inline)) get_current_ppid(void) {
+    u32 ppid = 0;
+    u64 real_parent_offset = get_task_struct_real_parent_offset();
+    u64 tgid_offset = get_task_struct_tgid_offset();
+    if (real_parent_offset > 0 && tgid_offset > 0) {
+        struct task_struct *cur_task = (struct task_struct *)bpf_get_current_task();
+        struct task_struct *parent = NULL;
+        bpf_probe_read_kernel(&parent, sizeof(parent), (void *)cur_task + real_parent_offset);
+        if (parent) {
+            bpf_probe_read_kernel(&ppid, sizeof(ppid), (void *)parent + tgid_offset);
+        }
+    }
+    return ppid;
+}
+
+static struct proc_cache_t *__attribute__((always_inline)) fill_process_context_with_pid_tgid(struct process_context_t *data, u64 pid_tgid) {
+    u32 tgid = pid_tgid >> 32;
+
+    // https://github.com/iovisor/bcc/blob/master/docs/reference_guide.md#4-bpf_get_current_pid_tgid
+    data->pid = tgid;
+    data->tid = pid_tgid;
+
+    u32 tid = data->tid; // This looks unnecessary but it actually is to address this issue https://github.com/iovisor/bcc/issues/347 in at least Ubuntu 4.15.
+    u32 *netns = bpf_map_lookup_elem(&netns_cache, &tid);
+    if (netns != NULL) {
+        data->netns = *netns;
+    }
+
+    u32 pid = data->pid;
+    u32 *mntns = bpf_map_lookup_elem(&mntns_cache, &pid);
+    if (mntns != NULL) {
+        data->mntns = *mntns;
+    }
+    if (IS_KERNEL_THREAD(pid)) {
+        data->is_kworker = 1;
+    }
+
+    // Read the live ppid from real_parent->tgid. Only valid when called
+    // from the actual task context (not for stored pid_tgid from io_uring).
+    if (pid_tgid == bpf_get_current_pid_tgid()) {
+        data->ppid = get_current_ppid();
+    }
+
+    struct pid_cache_t *pid_entry = get_pid_cache(tgid);
+    if (!pid_entry) {
+        return NULL;
+    }
+
+    // copy user session id and sid
+    data->user_session_id = pid_entry->user_session_id;
+    data->sid = pid_entry->sid;
+
+    struct proc_cache_t *pc = get_proc_from_cookie(pid_entry->cookie);
+    if (pc) {
+        data->inode = pc->entry.executable.path_key.ino;
+    }
+
+    return pc;
+}
+
+static struct proc_cache_t *__attribute__((always_inline)) fill_process_context(struct process_context_t *data) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    return fill_process_context_with_pid_tgid(data, pid_tgid);
+}
+
+static __always_inline void fill_args_envs(struct process_event_t *event, struct syscall_cache_t *syscall) {
+    event->args_id = syscall->exec.args.id;
+    event->args_truncated = syscall->exec.args.truncated;
+    event->envs_id = syscall->exec.envs.id;
+    event->envs_truncated = syscall->exec.envs.truncated;
+}
+
+static __always_inline u32 get_root_nr_from_pid_struct(struct pid *pid) {
+    // read the root pid namespace nr from &pid->numbers[0].nr
+    u32 root_nr = 0;
+    bpf_probe_read(&root_nr, sizeof(root_nr), (void *)pid + get_pid_numbers_offset());
+    return root_nr;
+}
+
+static __always_inline u32 get_root_nr_from_task_struct(struct task_struct *task) {
+    struct pid *pid = NULL;
+    bpf_probe_read(&pid, sizeof(pid), (void *)task + get_task_struct_pid_offset());
+    return get_root_nr_from_pid_struct(pid);
+}
+
+static __always_inline u32 get_namespace_nr_from_task_struct(struct task_struct *task) {
+    struct pid *pid = NULL;
+    bpf_probe_read_kernel(&pid, sizeof(pid), (void *)task + get_task_struct_pid_offset());
+
+    u32 pid_level = 0;
+    bpf_probe_read_kernel(&pid_level, sizeof(pid_level), (void *)pid + get_pid_level_offset());
+
+    // read the namespace nr from &pid->numbers[pid_level].nr
+    u32 namespace_nr = 0;
+    u64 namespace_numbers_offset = pid_level * get_sizeof_upid();
+    bpf_probe_read_kernel(&namespace_nr, sizeof(namespace_nr), (void *)pid + get_pid_numbers_offset() + namespace_numbers_offset);
+
+    return namespace_nr;
+}
+
+static __always_inline struct process_event_t *new_process_event(u8 is_fork) {
+    u32 key = bpf_get_current_pid_tgid() % EVENT_GEN_SIZE;
+    struct process_event_t *evt = bpf_map_lookup_elem(&process_event_gen, &key);
+
+    if (evt) {
+        __builtin_memset(evt, 0, sizeof(*evt));
+        if (!is_fork) {
+            evt->event.flags |= EVENT_FLAGS_ACTIVITY_DUMP_SAMPLE;
+        }
+    }
+
+    return evt;
+}
+
+static __always_inline bool is_current_kworker_dying() {
+    char comm[16];
+    bpf_get_current_comm(comm, sizeof(comm));
+    return comm[0] == 'k' && comm[1] == 'w' && comm[2] == 'o' && comm[3] == 'r' && comm[4] == 'k' && comm[5] == 'e' && comm[6] == 'r' && comm[7] == '/' && comm[8] == 'd' && comm[9] == 'y' && comm[10] == 'i' && comm[11] == 'n' && comm[12] == 'g';
+}
+
+static void __attribute__((always_inline)) fill_cgroup_context(struct proc_cache_t *entry, struct cgroup_context_t *cgroup) {
+    if (entry) {
+        cgroup->path_key = entry->cgroup.path_key;
+    } else {
+        cgroup->path_key.mount_id = 0;
+        cgroup->path_key.path_id = 0;
+        cgroup->path_key.ino = 0;
+    }
+}
+
+static __always_inline u64 get_cgroup_id(u32 tgid) {
+    struct proc_cache_t *entry = get_proc_cache(tgid);
+    return entry ? entry->cgroup.path_key.ino : 0;
+}
+
+#endif

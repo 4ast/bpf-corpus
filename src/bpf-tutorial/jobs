@@ -1,0 +1,54 @@
+F = -D__TARGET_ARCH_x86 -D__x86_64__
+
+minimal: src/1-helloworld/minimal.bpf.c | $F -Isrc/1-helloworld -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+hardirqs: src/10-hardirqs/hardirqs.bpf.c | $F -Isrc/10-hardirqs -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+softirqs: src/10-hardirqs/softirqs.bpf.c | $F -Isrc/10-hardirqs -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+bootstrap: src/11-bootstrap/bootstrap.bpf.c | $F -Isrc/11-bootstrap -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+src_12-profile_src_bpf-profile: src/12-profile/src/bpf/profile.bpf.c | $F -Isrc/12-profile/src/bpf -Isrc/12-profile/src -Isrc/12-profile -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+tcpconnlat: src/13-tcpconnlat/tcpconnlat.bpf.c | $F -Isrc/13-tcpconnlat -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+tcprtt: src/14-tcpstates/tcprtt.bpf.c | $F -Isrc/14-tcpstates -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+tcpstates: src/14-tcpstates/tcpstates.bpf.c | $F -Isrc/14-tcpstates -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+javagc: src/15-javagc/javagc.bpf.c | $F -Isrc/15-javagc -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+memleak: src/16-memleak/memleak.bpf.c | $F -Isrc/16-memleak -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+biopattern: src/17-biopattern/biopattern.bpf.c | $F -Isrc/17-biopattern -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+lsm-connect: src/19-lsm-connect/lsm-connect.bpf.c | $F -Isrc/19-lsm-connect -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+kprobe-link: src/2-kprobe-unlink/kprobe-link.bpf.c | $F -Isrc/2-kprobe-unlink -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+tc: src/20-tc/tc.bpf.c | $F -Isrc/20-tc -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+xdp: src/21-xdp/xdp.bpf.c | $F -Isrc/21-xdp -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+accept: src/23-http/accept.bpf.c | $F -Isrc/23-http -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+sockfilter: src/23-http/sockfilter.bpf.c | $F -Isrc/23-http -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+bpf_contrack: src/29-sockops/bpf_contrack.bpf.c | $F -Isrc/29-sockops -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+bpf_redirect: src/29-sockops/bpf_redirect.bpf.c | $F -Isrc/29-sockops -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+sslsniff: src/30-sslsniff/sslsniff.bpf.c | $F -Isrc/30-sslsniff -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+goroutine: src/31-goroutine/goroutine.bpf.c | $F -Isrc/31-goroutine -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+offcputime: src/32-wallclock-profiler/offcputime.bpf.c | $F -Isrc/32-wallclock-profiler -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+oncputime: src/32-wallclock-profiler/oncputime.bpf.c | $F -Isrc/32-wallclock-profiler -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+funclatency: src/33-funclatency/funclatency.bpf.c | $F -Isrc/33-funclatency -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include | sec:fentry/dummy_fentry=fentry/vfs_read sec:fexit/dummy_fexit=fexit/vfs_read
+open_modify: src/34-syscall/open_modify.bpf.c | $F -Isrc/34-syscall -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+user_ringbuf: src/35-user-ringbuf/user_ringbuf.bpf.c | $F -Isrc/35-user-ringbuf -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+src_38-btf-uprobe-uprobe: src/38-btf-uprobe/uprobe.bpf.c | $F -Isrc/38-btf-uprobe -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include | core-local:data,data.*
+src_38-btf-uprobe_test-verify_minimal-uprobe: src/38-btf-uprobe/test-verify/minimal/uprobe.bpf.c | $F -Isrc/38-btf-uprobe/test-verify/minimal -Isrc/38-btf-uprobe/test-verify -Isrc/38-btf-uprobe -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include | core-local:data,data.*
+src_38-btf-uprobe_test-verify_verify-failed-no-btf-uprobe: src/38-btf-uprobe/test-verify/verify-failed-no-btf/uprobe.bpf.c | $F -Isrc/38-btf-uprobe/test-verify/verify-failed-no-btf -Isrc/38-btf-uprobe/test-verify -Isrc/38-btf-uprobe -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include | core-local:data,data.*
+opensnoop: src/4-opensnoop/opensnoop.bpf.c | $F -Isrc/4-opensnoop -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+xdp-tcpdump: src/41-xdp-tcpdump/xdp-tcpdump.bpf.c | $F -Isrc/41-xdp-tcpdump -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+xdp_lb: src/42-xdp-loadbalancer/xdp_lb.bpf.c | $F -Isrc/42-xdp-loadbalancer -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+xdp_pass: src/42-xdp-loadbalancer/no-docker/xdp_pass.c | $F -Isrc/42-xdp-loadbalancer/no-docker -Isrc/42-xdp-loadbalancer -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+xdp-pktgen: src/46-xdp-test/xdp-pktgen.bpf.c | $F -Isrc/46-xdp-test -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+cuda_events: src/47-cuda-events/cuda_events.bpf.c | $F -Isrc/47-cuda-events -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+energy_monitor: src/48-energy/energy_monitor.bpf.c | $F -Isrc/48-energy -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+bashreadline: src/5-uprobe-bashreadline/bashreadline.bpf.c | $F -Isrc/5-uprobe-bashreadline -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+tcx_demo: src/50-tcx/tcx_demo.bpf.c | $F -Isrc/50-tcx -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+tcp_quarantine: src/51-tcp-quarantine/tcp_quarantine.bpf.c | $F -Isrc/51-tcp-quarantine -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+fsession_latency: src/52-fsession-latency/fsession_latency.bpf.c | $F -Isrc/52-fsession-latency -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+egress_pacer: src/53-egress-pacer/egress_pacer.bpf.c | $F -Isrc/53-egress-pacer -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+exec_image_inspector: src/54-exec-image-inspector/exec_image_inspector.bpf.c | $F -Isrc/54-exec-image-inspector -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+sigsnoop: src/6-sigsnoop/sigsnoop.bpf.c | $F -Isrc/6-sigsnoop -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+execsnoop: src/7-execsnoop/execsnoop.bpf.c | $F -Isrc/7-execsnoop -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+exitsnoop: src/8-exitsnoop/exitsnoop.bpf.c | $F -Isrc/8-exitsnoop -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+runqlat: src/9-runqlat/runqlat.bpf.c | $F -Isrc/9-runqlat -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+cgroup_guard: src/cgroup/cgroup_guard.bpf.c | $F -Isrc/cgroup -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+arena_list: src/features/bpf_arena/arena_list.bpf.c | $F -Isrc/features/bpf_arena -Isrc/features -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+task_stack: src/features/bpf_iters/task_stack.bpf.c | $F -Isrc/features/bpf_iters -Isrc/features -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+token_trace: src/features/bpf_token/token_trace.bpf.c | $F -Isrc/features/bpf_token -Isrc/features -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+dynptr_tc: src/features/dynptr/dynptr_tc.bpf.c | $F -Isrc/features/dynptr -Isrc/features -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
+src_xpu_flamegraph_profiler_src_bpf-profile: src/xpu/flamegraph/profiler/src/bpf/profile.bpf.c | $F -Isrc/xpu/flamegraph/profiler/src/bpf -Isrc/xpu/flamegraph/profiler/src -Isrc/xpu/flamegraph/profiler -Isrc/xpu/flamegraph -Isrc/xpu -Isrc -I. -Isrc/third_party/vmlinux/x86 -I../../include
